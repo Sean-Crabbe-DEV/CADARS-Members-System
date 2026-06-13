@@ -266,3 +266,16 @@ This build adds the requested programme/events improvements:
 - A dedicated attendance tracking page lists event signup and attendance totals.
 
 Note: routes remain permission-protected. The Committee dropdown is only visible to Committee/Admin roles, but access to sensitive pages such as the membership database, users and audit logs still depends on the existing permissions.
+
+## Latest attendance/programme update
+
+This build includes:
+
+- Fixed event creation redirect that could show `Page not found` after adding an event.
+- Attendance register now uses a checkbox list rather than a dropdown per member.
+- Committee/Admin users can add visitors/guests to an event register with comments.
+- Attendance tracking is split into upcoming and past events, with the closest upcoming and most recent past events at the top.
+- Added Attendance Stats page under the Committee menu.
+- Attendance stats show totals and averages by event type, month/year, and person.
+- Members can self sign up for events in advance, but only committee/admin users can view/modify attendance registers.
+- Dropdown menus have improved hover spacing so they do not disappear before the cursor reaches the menu.
