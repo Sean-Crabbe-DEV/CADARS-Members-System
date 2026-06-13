@@ -20,3 +20,17 @@ For Resend API:
 6. Save and send a test email.
 
 Bulk emails with more than one recipient are sent using BCC for member privacy.
+
+## User invites and password reset emails
+
+The Users page now supports:
+
+- Send invite to an existing user
+- Invite new user with secure password setup link
+- Send password reset email
+- Manual temporary password reset as a fallback
+
+Invite/reset links expire after 48 hours and ask the user to set their own password.
+Manual temporary passwords force the user to change password after login.
+
+Email delivery uses the configured mail method under Email system config.

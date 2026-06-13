@@ -25,6 +25,7 @@ function app_config(): array {
         'smtp_username' => '',
         'smtp_password' => '',
         'resend_api_key' => '',
+        'email_open_tracking_enabled' => '1',
     ];
     if (file_exists(CONFIG_PATH)) {
         $cfg = include CONFIG_PATH;
@@ -113,6 +114,43 @@ function send_configured_email(array $cfg, array $to, array $bcc, string $subjec
 
     $ok = @mail(implode(', ', $to), $subject, $html, $headers);
     return ['ok' => (bool)$ok, 'error' => $ok ? null : 'mail() failed or is not configured.'];
+}
+
+
+function app_base_url(): string {
+    $cfg = app_config();
+    if (!empty($cfg['base_url'])) return rtrim((string)$cfg['base_url'], '/');
+    $scheme = 'http';
+    if (!empty($_SERVER['HTTP_X_FORWARDED_PROTO'])) $scheme = strtolower(trim(explode(',', $_SERVER['HTTP_X_FORWARDED_PROTO'])[0]));
+    elseif (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') $scheme = 'https';
+    $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    $dir = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '/index.php')), '/');
+    if ($dir === '' || $dir === '.') $dir = '';
+    return rtrim($scheme . '://' . $host . $dir, '/');
+}
+function create_user_password_token(int $user_id, string $purpose, ?int $created_by_user_id=null, string $expiry='+48 hours'): string {
+    $token = bin2hex(random_bytes(32));
+    $hash = hash('sha256', $token);
+    exec_sql('UPDATE user_password_tokens SET used_at=datetime("now") WHERE user_id=? AND purpose=? AND used_at IS NULL', [$user_id, $purpose]);
+    exec_sql('INSERT INTO user_password_tokens (user_id, token_hash, purpose, expires_at, created_by_user_id, created_at) VALUES (?, ?, ?, datetime("now", ?), ?, datetime("now"))', [$user_id, $hash, $purpose, $expiry, $created_by_user_id]);
+    return $token;
+}
+function send_user_access_email(array $targetUser, string $purpose, ?int $created_by_user_id=null): array {
+    $cfg = app_config();
+    $token = create_user_password_token((int)$targetUser['id'], $purpose, $created_by_user_id);
+    $link = app_base_url() . '/?route=set_password&token=' . urlencode($token);
+    $fromAddress = trim($cfg['email_from_address'] ?: ('noreply@' . ($_SERVER['HTTP_HOST'] ?? 'localhost')));
+    $fromName = trim($cfg['email_from_name'] ?: ($cfg['society_name'] ?? 'Membership System'));
+    $replyTo = trim($cfg['email_reply_to'] ?: $fromAddress);
+    $society = e($cfg['society_name'] ?? 'Membership System');
+    $subject = $purpose === 'invite' ? 'Set up your membership system account' : 'Reset your membership system password';
+    $intro = $purpose === 'invite'
+        ? 'An account has been created for you on the society membership system.'
+        : 'A password reset has been requested for your society membership system account.';
+    $html = '<p>Hello,</p><p>' . e($intro) . '</p><p><a href="' . e($link) . '">Click here to set your password</a></p><p>This link expires in 48 hours. If the button does not work, copy this link into your browser:</p><p>' . e($link) . '</p><p>Kind regards,<br>' . $society . '</p>';
+    $send = send_configured_email($cfg, [$targetUser['email']], [], $subject, $html, $fromName, $fromAddress, $replyTo);
+    audit($purpose === 'invite' ? 'user.invite_email_sent' : 'user.password_reset_email_sent', 'user', (int)$targetUser['id'], !empty($send['ok']) ? 'success' : 'failed', $send['error'] ?? null, ['purpose'=>$purpose]);
+    return $send;
 }
 
 function db(): PDO {
@@ -489,6 +527,16 @@ CREATE TABLE IF NOT EXISTS users (
  last_login_at TEXT NULL,
  created_at TEXT NOT NULL,
  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_password_tokens (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ user_id INTEGER NOT NULL,
+ token_hash TEXT NOT NULL UNIQUE,
+ purpose TEXT NOT NULL,
+ expires_at TEXT NOT NULL,
+ used_at TEXT NULL,
+ created_by_user_id INTEGER NULL,
+ created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS roles (
  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1021,8 +1069,8 @@ if (route() === 'assets.css') {
     exit;
 }
 if (route() === 'email_open') {
-    $tid = $_GET['id'] ?? '';
-    if ($tid) {
+    $tid = preg_replace('/[^a-f0-9]/i', '', (string)($_GET['id'] ?? ''));
+    if ($tid !== '') {
         $r = first('SELECT * FROM email_recipients WHERE tracking_id=? AND tracking_enabled=1',[$tid]);
         if ($r) {
             exec_sql('UPDATE email_recipients SET open_count=open_count+1, opened_at=COALESCE(opened_at, datetime("now")), last_opened_at=datetime("now"), updated_at=datetime("now") WHERE id=?',[$r['id']]);
@@ -1030,10 +1078,13 @@ if (route() === 'email_open') {
         }
     }
     header('Content-Type: image/gif');
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    header('Pragma: no-cache');
     echo base64_decode('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=='); exit;
 }
 
 if (!installed() && route() !== 'install') redirect('install');
+if (installed()) { create_schema(); seed_roles_permissions(); seed_brickworks(); }
 
 if (route() === 'install') {
     if (installed()) redirect('login');
@@ -1065,6 +1116,36 @@ if (route() === 'install') {
     page_footer(); exit;
 }
 
+
+if (route() === 'set_password') {
+    if (!installed()) redirect('install');
+    $rawToken = preg_replace('/[^a-f0-9]/i', '', (string)($_GET['token'] ?? $_POST['token'] ?? ''));
+    $tokenHash = $rawToken ? hash('sha256', $rawToken) : '';
+    $tokenRow = $tokenHash ? first('SELECT t.*,u.email,u.status FROM user_password_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=? AND t.used_at IS NULL AND t.expires_at > datetime("now")', [$tokenHash]) : null;
+    if (!$tokenRow) {
+        page_header('Set password');
+        echo '<div class="card danger"><h1>Invalid or expired link</h1><p>This password setup/reset link is invalid, expired, or has already been used. Ask an admin to send another invite or reset email.</p><p><a class="btn secondary" href="?route=login">Back to login</a></p></div>';
+        page_footer(); exit;
+    }
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        require_csrf();
+        $pass = $_POST['password'] ?? ''; $confirm = $_POST['password_confirm'] ?? '';
+        if (strlen($pass) < 10 || $pass !== $confirm) {
+            flash('Passwords must match and be at least 10 characters.');
+            header('Location: ?route=set_password&token=' . urlencode($rawToken)); exit;
+        }
+        exec_sql('UPDATE users SET password_hash=?, force_password_change=0, status="active", updated_at=datetime("now") WHERE id=?', [password_hash($pass, PASSWORD_DEFAULT), (int)$tokenRow['user_id']]);
+        exec_sql('UPDATE user_password_tokens SET used_at=datetime("now") WHERE id=?', [(int)$tokenRow['id']]);
+        $_SESSION['user_id'] = (int)$tokenRow['user_id'];
+        audit($tokenRow['purpose'] === 'invite' ? 'user.invite_accepted' : 'user.password_reset_completed', 'user', (int)$tokenRow['user_id']);
+        flash('Password set. You are now logged in.'); redirect('dashboard');
+    }
+    page_header('Set password');
+    $title = $tokenRow['purpose'] === 'invite' ? 'Set up your account' : 'Reset your password';
+    echo '<div class="card"><h1>'.e($title).'</h1><p class="muted">Account: '.e($tokenRow['email']).'</p><form method="post">'.csrf_field().'<input type="hidden" name="token" value="'.e($rawToken).'"><label>New password</label><input type="password" name="password" required minlength="10"><label>Confirm password</label><input type="password" name="password_confirm" required minlength="10"><p><button>Save password and login</button></p></form></div>';
+    page_footer(); exit;
+}
+
 if (route() === 'login') {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         require_csrf();
@@ -1082,6 +1163,21 @@ if (route() === 'logout') { audit('logout'); session_destroy(); header('Location
 $u = require_login();
 create_schema();
 seed_roles_permissions();
+if ((int)($u['force_password_change'] ?? 0) === 1 && !in_array(route(), ['change_password','logout'], true)) redirect('change_password');
+
+if (route() === 'change_password') {
+    page_header('Change password');
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        require_csrf();
+        $pass = $_POST['password'] ?? ''; $confirm = $_POST['password_confirm'] ?? '';
+        if (strlen($pass) < 10 || $pass !== $confirm) { flash('Passwords must match and be at least 10 characters.'); redirect('change_password'); }
+        exec_sql('UPDATE users SET password_hash=?, force_password_change=0, updated_at=datetime("now") WHERE id=?', [password_hash($pass, PASSWORD_DEFAULT), (int)$u['id']]);
+        audit('user.force_password_changed','user',(int)$u['id']);
+        flash('Password changed.'); redirect('dashboard');
+    }
+    echo '<div class="card"><h1>Set your password</h1><p class="muted">You need to set a new password before continuing.</p><form method="post">'.csrf_field().'<label>New password</label><input type="password" name="password" required minlength="10"><label>Confirm password</label><input type="password" name="password_confirm" required minlength="10"><p><button>Save password</button></p></form></div>';
+    page_footer(); exit;
+}
 
 if (route() === 'dashboard') {
     audit('dashboard.view','user',(int)$u['id']); page_header('Dashboard');
@@ -1281,7 +1377,24 @@ if (route() === 'users') {
             if(strlen($new)<10){flash('Password must be at least 10 chars.');redirect('users');}
             exec_sql('UPDATE users SET password_hash=?, force_password_change=1, updated_at=datetime("now") WHERE id=?',[password_hash($new,PASSWORD_DEFAULT),(int)$_POST['user_id']]);
             audit('user.password_changed_by_admin','user',(int)$_POST['user_id']);
-            flash('Password reset.'); redirect('users');
+            flash('Password reset. User will need to change it after login.'); redirect('users');
+        }
+        if (isset($_POST['send_reset_email'])) {
+            require_permission('reset_passwords');
+            $target = first('SELECT * FROM users WHERE id=?',[(int)$_POST['user_id']]);
+            if (!$target) { flash('User not found.'); redirect('users'); }
+            $send = send_user_access_email($target, 'reset', (int)$u['id']);
+            flash(!empty($send['ok']) ? 'Password reset email sent.' : ('Password reset email failed: ' . ($send['error'] ?? 'unknown error')));
+            redirect('users');
+        }
+        if (isset($_POST['send_invite_existing'])) {
+            require_permission('manage_users');
+            $target = first('SELECT * FROM users WHERE id=?',[(int)$_POST['user_id']]);
+            if (!$target) { flash('User not found.'); redirect('users'); }
+            exec_sql('UPDATE users SET force_password_change=1, updated_at=datetime("now") WHERE id=?',[(int)$target['id']]);
+            $send = send_user_access_email($target, 'invite', (int)$u['id']);
+            flash(!empty($send['ok']) ? 'Invite email sent.' : ('Invite email failed: ' . ($send['error'] ?? 'unknown error')));
+            redirect('users');
         }
         if (isset($_POST['update_roles'])) {
             require_permission('manage_roles');
@@ -1295,45 +1408,75 @@ if (route() === 'users') {
         if (isset($_POST['create_user'])) {
             $member_id = null;
             if (!empty($_POST['member_id'])) $member_id=(int)$_POST['member_id'];
-            exec_sql('INSERT INTO users (member_id,email,password_hash,status,force_password_change,created_at,updated_at) VALUES (?,?,?,"active",1,datetime("now"),datetime("now"))',[$member_id,strtolower(trim($_POST['email'])),password_hash($_POST['password'],PASSWORD_DEFAULT)]);
+            $email = strtolower(trim($_POST['email']));
+            if (first('SELECT id FROM users WHERE email=?',[$email])) { flash('A user with that email already exists.'); redirect('users'); }
+            exec_sql('INSERT INTO users (member_id,email,password_hash,status,force_password_change,created_at,updated_at) VALUES (?,?,?,"active",1,datetime("now"),datetime("now"))',[$member_id,$email,password_hash($_POST['password'],PASSWORD_DEFAULT)]);
             $uid=(int)db()->lastInsertId(); assign_role($uid,'member',(int)$u['id'],'Admin created user');
             audit('user.created','user',$uid); flash('User created.'); redirect('users');
         }
+        if (isset($_POST['invite_user'])) {
+            $member_id = null;
+            if (!empty($_POST['member_id'])) $member_id=(int)$_POST['member_id'];
+            $email = strtolower(trim($_POST['email']));
+            if (!filter_var($email, FILTER_VALIDATE_EMAIL)) { flash('Enter a valid email address.'); redirect('users'); }
+            if (first('SELECT id FROM users WHERE email=?',[$email])) { flash('A user with that email already exists. Use Send invite on the existing user row.'); redirect('users'); }
+            $randomPassword = bin2hex(random_bytes(24));
+            exec_sql('INSERT INTO users (member_id,email,password_hash,status,force_password_change,created_at,updated_at) VALUES (?,?,?,"active",1,datetime("now"),datetime("now"))',[$member_id,$email,password_hash($randomPassword,PASSWORD_DEFAULT)]);
+            $uid=(int)db()->lastInsertId();
+            $selectedRoles = $_POST['roles'] ?? ['member'];
+            if (!is_array($selectedRoles)) $selectedRoles = ['member'];
+            if (!has_permission('manage_roles')) $selectedRoles = ['member'];
+            $result = set_user_roles($uid, array_map('strval', $selectedRoles), (int)$u['id'], 'Admin invited new user');
+            $target = first('SELECT * FROM users WHERE id=?',[$uid]);
+            $send = send_user_access_email($target, 'invite', (int)$u['id']);
+            audit('user.invited','user',$uid,!empty($send['ok'])?'success':'failed',$send['error'] ?? null,['roles'=>$result['final']]);
+            flash(!empty($send['ok']) ? 'User created and invite email sent.' : ('User created, but invite email failed: ' . ($send['error'] ?? 'unknown error')));
+            redirect('users');
+        }
     }
     $canRoles = has_permission('manage_roles');
+    $canReset = has_permission('reset_passwords');
     $allRoles = all('SELECT name, display_name, description FROM roles ORDER BY CASE name WHEN "member" THEN 1 WHEN "committee" THEN 2 WHEN "member_db" THEN 3 WHEN "brickworks_reviewer" THEN 4 WHEN "equipment_manager" THEN 5 WHEN "event_manager" THEN 6 WHEN "treasurer" THEN 7 WHEN "admin" THEN 99 ELSE 50 END, display_name');
     $users=all('SELECT u.*,m.first_name,m.last_name,m.callsign FROM users u LEFT JOIN members m ON m.id=u.member_id ORDER BY u.created_at DESC');
-    echo '<div class="card"><h1>Users</h1><p class="muted">Admins can create users, reset passwords and manage user roles. The Member role is kept as the base role for all active accounts.</p><table><tr><th>Email</th><th>Member</th><th>Status</th><th>Roles</th><th>Reset password</th></tr>';
+    echo '<div class="card"><h1>Users</h1><p class="muted">Admins can create users, send invites, send password reset emails and manage roles. Invite/reset links ask the user to set their own password.</p><table><tr><th>Email</th><th>Member</th><th>Status</th><th>Roles</th><th>Access emails / password</th></tr>';
     foreach($users as $usr){
         $currentRoles = user_roles((int)$usr['id']);
-        echo '<tr><td>'.e($usr['email']).'</td><td>'.e(trim(($usr['first_name']??'').' '.($usr['last_name']??'')).' '.($usr['callsign']?'('.$usr['callsign'].')':'')).'</td><td>'.e($usr['status']).'</td><td>'.e(implode(', ',$currentRoles));
+        $memberLabel = trim(($usr['first_name']??'').' '.($usr['last_name']??'')).($usr['callsign']?' ('.$usr['callsign'].')':'');
+        echo '<tr><td>'.e($usr['email']).'</td><td>'.e($memberLabel).'</td><td>'.e($usr['status']).($usr['force_password_change']?'<br><span class="pill">password setup required</span>':'').'</td><td>'.e(implode(', ',$currentRoles));
         if ($canRoles) {
             echo '<details class="role-editor"><summary>Change roles</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="update_roles" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><div class="role-grid">';
             foreach($allRoles as $role){
                 $checked = in_array($role['name'], $currentRoles, true) ? 'checked' : '';
                 $disabled = ($role['name']==='member') ? 'disabled' : '';
-                // Disabled checkboxes are not submitted, so add a hidden member role value.
-                if ($role['name']==='member') {
-                    echo '<input type="hidden" name="roles[]" value="member">';
-                }
+                if ($role['name']==='member') echo '<input type="hidden" name="roles[]" value="member">';
                 echo '<label class="check"><input type="checkbox" name="roles[]" value="'.e($role['name']).'" '.$checked.' '.$disabled.'> '.e($role['display_name']).'</label>';
             }
             echo '</div><label>Reason / note</label><input name="role_change_reason" placeholder="Optional reason for role change"><button>Save roles</button></form></details>';
         }
-        echo '</td><td><form method="post">'.csrf_field().'<input type="hidden" name="reset_password" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><input name="new_password" placeholder="New temp password"><button>Reset</button></form></td></tr>';
+        echo '</td><td><div class="toolbar">';
+        echo '<form method="post">'.csrf_field().'<input type="hidden" name="send_invite_existing" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><button class="secondary">Send invite</button></form>';
+        if ($canReset) echo '<form method="post">'.csrf_field().'<input type="hidden" name="send_reset_email" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><button>Send password reset email</button></form>';
+        if ($canReset) echo '<details><summary>Manual temp password</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="reset_password" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><input name="new_password" placeholder="New temp password"><button>Set temp password</button></form></details>';
+        echo '</div></td></tr>';
     }
     echo '</table></div>';
+
+    $members=all('SELECT id,first_name,last_name,callsign,email FROM members ORDER BY last_name,first_name');
+    echo '<div class="grid"><div class="card"><h2>Invite new user</h2><p class="muted">Creates the user account and emails a secure setup link. They choose their own password from the link.</p><form method="post">'.csrf_field().'<input type="hidden" name="invite_user" value="1"><label>Link to member</label><select name="member_id"><option value="">None</option>';
+    foreach($members as $m) echo '<option value="'.e($m['id']).'">'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'').' / '.$m['email']).'</option>';
+    echo '</select><label>Email</label><input type="email" name="email" required>';
+    if ($canRoles) { echo '<label>Initial roles</label><div class="role-grid">'; foreach($allRoles as $role){ $checked = $role['name']==='member' ? 'checked disabled' : ''; if($role['name']==='member') echo '<input type="hidden" name="roles[]" value="member">'; echo '<label class="check"><input type="checkbox" name="roles[]" value="'.e($role['name']).'" '.$checked.'> '.e($role['display_name']).'</label>'; } echo '</div>'; }
+    echo '<button>Send invite to new user</button></form></div>';
+
+    echo '<div class="card"><h2>Create user manually</h2><p class="muted">Use this only when you need to set a temporary password yourself. Email invites are better.</p><form method="post">'.csrf_field().'<input type="hidden" name="create_user" value="1"><label>Link to member</label><select name="member_id"><option value="">None</option>';
+    foreach($members as $m) echo '<option value="'.e($m['id']).'">'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'').' / '.$m['email']).'</option>';
+    echo '</select><label>Email</label><input type="email" name="email" required><label>Temporary password</label><input name="password" required minlength="10"><button>Create user</button></form></div></div>';
 
     if ($canRoles) {
         echo '<div class="card"><h2>Role guide</h2><table><tr><th>Role</th><th>Purpose</th></tr>';
         foreach($allRoles as $role){ echo '<tr><td>'.e($role['display_name']).'</td><td>'.e($role['description'] ?: $role['name']).'</td></tr>'; }
         echo '</table></div>';
     }
-
-    $members=all('SELECT id,first_name,last_name,callsign FROM members ORDER BY last_name');
-    echo '<div class="card"><h2>Create user</h2><form method="post">'.csrf_field().'<input type="hidden" name="create_user" value="1"><label>Link to member</label><select name="member_id"><option value="">None</option>';
-    foreach($members as $m) echo '<option value="'.e($m['id']).'">'.e($m['first_name'].' '.$m['last_name'].' '.$m['callsign']).'</option>';
-    echo '</select><label>Email</label><input type="email" name="email" required><label>Temporary password</label><input name="password" required minlength="10"><button>Create user</button></form></div>';
     page_footer(); exit;
 }
 
@@ -1821,8 +1964,11 @@ if (route() === 'emails') {
             exec_sql('INSERT INTO email_attachments (email_id,original_filename,stored_filename,mime_type,file_size,uploaded_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?,datetime("now"),datetime("now"))',[$email_id,$_FILES['attachment']['name'],$stored,mime_content_type($dest),(int)$_FILES['attachment']['size'],$u['id']]);
             audit('email.attachment_uploaded','email',$email_id);
         }
+        $trackingGloballyEnabledForEmail = (($cfg['email_open_tracking_enabled'] ?? '1') === '1');
         foreach($members as $m){
-            $track=(int)($m['allow_open_tracking']??0);
+            // Open/read tracking is controlled from Email system config.
+            // It records image loads only, not guaranteed human reads.
+            $track=$trackingGloballyEnabledForEmail ? 1 : 0;
             $tid=$track?bin2hex(random_bytes(24)):null;
             exec_sql('INSERT INTO email_recipients (email_id,member_id,email_address,recipient_name,tracking_enabled,tracking_id,status,created_at,updated_at) VALUES (?,?,?,?,?,?,"queued",datetime("now"),datetime("now"))',[$email_id,$m['id'],$m['email'],$m['first_name'].' '.$m['last_name'],$track,$tid]);
         }
@@ -1834,31 +1980,36 @@ if (route() === 'emails') {
             $safeFromName = str_replace(["\r","\n"], '', $fromName);
             $safeFromAddress = str_replace(["\r","\n"], '', $fromAddress);
             $safeReplyTo = str_replace(["\r","\n"], '', $replyTo);
-            $headers = "MIME-Version: 1.0\r\nContent-type: text/html; charset=UTF-8\r\n";
-            $headers .= 'From: ' . $safeFromName . ' <' . $safeFromAddress . ">\r\n";
-            $headers .= 'Reply-To: ' . $safeReplyTo . "\r\n";
             $body=$_POST['body_html'];
-            if (count($recips) === 1) {
-                $r=$recips[0];
-                $singleBody=$body;
-                if($r['tracking_enabled']){
-                    $base=rtrim($cfg['base_url'] ?: ((isset($_SERVER['HTTPS'])?'https':'http').'://'.($_SERVER['HTTP_HOST']??'' ).dirname($_SERVER['SCRIPT_NAME'])), '/');
-                    $singleBody.='<img src="'.$base.'/?route=email_open&id='.e($r['tracking_id']).'" width="1" height="1" alt="">';
+            $base=rtrim($cfg['base_url'] ?: (((($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https' || isset($_SERVER['HTTPS'])) ? 'https' : 'http').'://'.($_SERVER['HTTP_HOST']??'' ).dirname($_SERVER['SCRIPT_NAME'])), '/');
+            $trackingGloballyEnabled = (($cfg['email_open_tracking_enabled'] ?? '1') === '1');
+            $successCount = 0;
+            $failCount = 0;
+            $lastError = null;
+            foreach ($recips as $r) {
+                $recipientName = trim((string)($r['recipient_name'] ?? 'Member'));
+                $personalBody = str_replace(['{member_name}','{{member_name}}'], e($recipientName), $body);
+                if ($trackingGloballyEnabled && $r['tracking_enabled'] && $r['tracking_id']) {
+                    $personalBody .= '<img src="'.$base.'/?route=email_open&id='.e($r['tracking_id']).'" width="1" height="1" style="display:none" alt="">';
                 }
-                $send=send_configured_email($cfg, [$r['email_address']], [], $_POST['subject'], $singleBody, $safeFromName, $safeFromAddress, $safeReplyTo);
-                $ok=(bool)$send['ok']; $sendError=$send['error'] ?? null;
-                exec_sql('UPDATE email_recipients SET status=?, sent_at=CASE WHEN ?=1 THEN datetime("now") ELSE sent_at END, failed_at=CASE WHEN ?=0 THEN datetime("now") ELSE failed_at END, failure_reason=CASE WHEN ?=0 THEN ? ELSE NULL END, updated_at=datetime("now") WHERE id=?',[$ok?'sent':'failed',$ok?1:0,$ok?1:0,$ok?1:0,$sendError,$r['id']]);
-            } else {
-                $bcc = array_map(fn($r) => str_replace(["\r","\n"], '', $r['email_address']), $recips);
-                $send=send_configured_email($cfg, [$safeFromAddress], $bcc, $_POST['subject'], $body, $safeFromName, $safeFromAddress, $safeReplyTo);
-                $ok=(bool)$send['ok']; $sendError=$send['error'] ?? null;
-                foreach($recips as $r){
-                    exec_sql('UPDATE email_recipients SET status=?, sent_at=CASE WHEN ?=1 THEN datetime("now") ELSE sent_at END, failed_at=CASE WHEN ?=0 THEN datetime("now") ELSE failed_at END, failure_reason=CASE WHEN ?=0 THEN ? ELSE NULL END, tracking_enabled=0, tracking_id=NULL, updated_at=datetime("now") WHERE id=?',[$ok?'sent_bcc':'failed',$ok?1:0,$ok?1:0,$ok?1:0,$sendError,$r['id']]);
+                if (count($recips) === 1) {
+                    $send=send_configured_email($cfg, [$r['email_address']], [], $_POST['subject'], $personalBody, $safeFromName, $safeFromAddress, $safeReplyTo);
+                    $statusOk='sent';
+                } else {
+                    // Privacy rule: when multiple members are selected, each member is sent an individual BCC email.
+                    // This keeps recipient addresses hidden while still allowing a unique tracking pixel per recipient.
+                    $send=send_configured_email($cfg, [$safeFromAddress], [$r['email_address']], $_POST['subject'], $personalBody, $safeFromName, $safeFromAddress, $safeReplyTo);
+                    $statusOk='sent_bcc';
                 }
+                $sentOk=(bool)($send['ok'] ?? false);
+                $sendError=$send['error'] ?? null;
+                if ($sentOk) $successCount++; else { $failCount++; $lastError=$sendError; }
+                exec_sql('UPDATE email_recipients SET status=?, sent_at=CASE WHEN ?=1 THEN datetime("now") ELSE sent_at END, failed_at=CASE WHEN ?=0 THEN datetime("now") ELSE failed_at END, failure_reason=CASE WHEN ?=0 THEN ? ELSE NULL END, updated_at=datetime("now") WHERE id=?',[$sentOk?$statusOk:'failed',$sentOk?1:0,$sentOk?1:0,$sentOk?1:0,$sendError,$r['id']]);
             }
-            exec_sql('UPDATE emails SET status=?, sent_at=CASE WHEN ?=1 THEN datetime("now") ELSE sent_at END, updated_at=datetime("now") WHERE id=?',[$ok?'sent':'failed',$ok?1:0,$email_id]);
-            audit('email.sent','email',$email_id,'success',null,['recipient_count'=>count($recips),'bcc_used'=>count($recips)>1,'method'=>$cfg['email_method'] ?? 'php_mail']);
-            flash('Email created and send attempted using '.(($cfg['email_method'] ?? 'php_mail') === 'resend' ? 'Resend API' : 'PHP mail').'. If more than one recipient was selected, the email was sent using BCC.'); redirect('emails');
+            $overallStatus = $failCount === 0 ? 'sent' : ($successCount > 0 ? 'partial_failed' : 'failed');
+            exec_sql('UPDATE emails SET status=?, sent_at=CASE WHEN ?=1 THEN datetime("now") ELSE sent_at END, updated_at=datetime("now") WHERE id=?',[$overallStatus,$successCount>0?1:0,$email_id]);
+            audit('email.sent','email',$email_id,$successCount>0?'success':'failed',$lastError,['recipient_count'=>count($recips),'success_count'=>$successCount,'fail_count'=>$failCount,'bcc_used'=>count($recips)>1,'individual_bcc'=>count($recips)>1,'open_tracking_enabled'=>$trackingGloballyEnabled,'method'=>$cfg['email_method'] ?? 'php_mail']);
+            flash('Email send attempted using '.(($cfg['email_method'] ?? 'php_mail') === 'resend' ? 'Resend API' : 'PHP mail').'. Multiple-recipient sends are sent as individual BCC emails so recipient addresses stay private and open tracking can work per member.'); redirect('emails');
         }
         audit('email.draft_created','email',$email_id,'success',null,['recipient_count'=>count($members),'recipient_mode'=>$recipientMode]);
         flash('Email draft created with recipients.'); redirect('emails');
@@ -1963,10 +2114,11 @@ if (route() === 'email_config') {
             'smtp_username' => trim($_POST['smtp_username'] ?? ''),
             'smtp_password' => trim($_POST['smtp_password'] ?? ''),
             'resend_api_key' => trim($_POST['resend_api_key'] ?? ''),
+            'email_open_tracking_enabled' => isset($_POST['email_open_tracking_enabled']) ? '1' : '0',
         ]);
         audit('email.config.update'); flash('Email configuration saved.'); redirect('email_config');
     }
-    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Email system config</h1><a class="btn secondary" href="?route=emails">Back to emails</a></div><p class="muted">Choose how the system sends email. PHP mail uses the server mail setup. Resend API sends via Resend using the API key below. SMTP fields are stored for future SMTP wiring.</p><form method="post">'.csrf_field().'<div class="two"><div><label>From name</label><input name="email_from_name" value="'.e($cfg['email_from_name']).'"></div><div><label>From email address</label><input type="email" name="email_from_address" value="'.e($cfg['email_from_address']).'" placeholder="noreply@example.org"></div><div><label>Reply-to email</label><input type="email" name="email_reply_to" value="'.e($cfg['email_reply_to']).'"></div><div><label>Mail method</label><select name="email_method"><option value="php_mail" '.($cfg['email_method']==='php_mail'?'selected':'').'>PHP mail()</option><option value="resend" '.($cfg['email_method']==='resend'?'selected':'').'>Resend API</option><option value="smtp" '.($cfg['email_method']==='smtp'?'selected':'').'>SMTP settings stored</option></select></div><div class="full"><label>Resend API key</label><input type="password" name="resend_api_key" value="'.e($cfg['resend_api_key'] ?? '').'" placeholder="re_..."><p class="muted small">Used only when Mail method is set to Resend API. The From email must be allowed/verified in your Resend account.</p></div><div><label>SMTP host</label><input name="smtp_host" value="'.e($cfg['smtp_host']).'"></div><div><label>SMTP port</label><input name="smtp_port" value="'.e($cfg['smtp_port']).'"></div><div><label>SMTP security</label><select name="smtp_security"><option value="tls" '.($cfg['smtp_security']==='tls'?'selected':'').'>TLS</option><option value="ssl" '.($cfg['smtp_security']==='ssl'?'selected':'').'>SSL</option><option value="none" '.($cfg['smtp_security']==='none'?'selected':'').'>None</option></select></div><div><label>SMTP username</label><input name="smtp_username" value="'.e($cfg['smtp_username']).'"></div><div><label>SMTP password</label><input type="password" name="smtp_password" value="'.e($cfg['smtp_password']).'"></div></div><p><button>Save email config</button></p></form></div>';
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Email system config</h1><a class="btn secondary" href="?route=emails">Back to emails</a></div><p class="muted">Choose how the system sends email. PHP mail uses the server mail setup. Resend API sends via Resend using the API key below. SMTP fields are stored for future SMTP wiring.</p><form method="post">'.csrf_field().'<div class="two"><div><label>From name</label><input name="email_from_name" value="'.e($cfg['email_from_name']).'"></div><div><label>From email address</label><input type="email" name="email_from_address" value="'.e($cfg['email_from_address']).'" placeholder="noreply@example.org"></div><div><label>Reply-to email</label><input type="email" name="email_reply_to" value="'.e($cfg['email_reply_to']).'"></div><div><label>Mail method</label><select name="email_method"><option value="php_mail" '.($cfg['email_method']==='php_mail'?'selected':'').'>PHP mail()</option><option value="resend" '.($cfg['email_method']==='resend'?'selected':'').'>Resend API</option><option value="smtp" '.($cfg['email_method']==='smtp'?'selected':'').'>SMTP settings stored</option></select></div><div class="full"><label>Resend API key</label><input type="password" name="resend_api_key" value="'.e($cfg['resend_api_key'] ?? '').'" placeholder="re_..."><p class="muted small">Used only when Mail method is set to Resend API. The From email must be allowed/verified in your Resend account.</p></div><div class="full"><label><input type="checkbox" name="email_open_tracking_enabled" value="1" '.(($cfg['email_open_tracking_enabled'] ?? '1')==='1'?'checked':'').'> Enable open/read tracking pixels</label><p class="muted small">This records when a recipient loads the tiny tracking image. It is not guaranteed proof the email was read because some mail apps block or pre-load images.</p></div><div><label>SMTP host</label><input name="smtp_host" value="'.e($cfg['smtp_host']).'"></div><div><label>SMTP port</label><input name="smtp_port" value="'.e($cfg['smtp_port']).'"></div><div><label>SMTP security</label><select name="smtp_security"><option value="tls" '.($cfg['smtp_security']==='tls'?'selected':'').'>TLS</option><option value="ssl" '.($cfg['smtp_security']==='ssl'?'selected':'').'>SSL</option><option value="none" '.($cfg['smtp_security']==='none'?'selected':'').'>None</option></select></div><div><label>SMTP username</label><input name="smtp_username" value="'.e($cfg['smtp_username']).'"></div><div><label>SMTP password</label><input type="password" name="smtp_password" value="'.e($cfg['smtp_password']).'"></div></div><p><button>Save email config</button></p></form></div>';
     page_footer(); exit;
 }
 
