@@ -1014,7 +1014,7 @@ if (route() === 'members') {
         $mid=(int)db()->lastInsertId(); exec_sql('INSERT INTO member_directory_preferences (member_id, created_at, updated_at) VALUES (?,datetime("now"),datetime("now"))',[$mid]); exec_sql('INSERT INTO member_email_preferences (member_id, created_at, updated_at) VALUES (?,datetime("now"),datetime("now"))',[$mid]); save_consent_post($mid, (int)$u['id']); audit('member.create','member',$mid); flash('Member added.'); redirect('members');
     }
     $rows = all('SELECT * FROM members ORDER BY last_name, first_name');
-    echo '<div class="card"><h1>Membership database</h1><table><tr><th>No.</th><th>Name</th><th>Callsign</th><th>Status</th><th>Joined</th><th>Renewal</th><th>Attendance</th><th>Action</th></tr>';
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Membership database</h1><a class="btn" href="?route=member_export">Export all members spreadsheet</a></div><table><tr><th>No.</th><th>Name</th><th>Callsign</th><th>Status</th><th>Joined</th><th>Renewal</th><th>Attendance</th><th>Action</th></tr>';
     foreach($rows as $m){ $st=attendance_stats((int)$m['id']); echo '<tr><td>'.e($m['membership_number']).'</td><td>'.e($m['first_name'].' '.$m['last_name']).'</td><td>'.e($m['callsign']).'</td><td>'.e($m['membership_status']).'</td><td>'.e(member_joined_display($m)).'</td><td>'.e($m['renewal_date']).'</td><td>'.e($st['signup_percent']===null?'N/A':$st['signup_percent'].'%').'</td><td><a class="btn secondary" href="?route=member_view&id='.e($m['id']).'">Open</a></td></tr>'; }
     echo '</table></div><div class="card"><h2>Add member</h2><form method="post">'.csrf_field().'<div class="two">';
     if (can_edit_membership_number()) echo '<div><label>Membership number</label><input name="membership_number"></div>';
@@ -1025,36 +1025,93 @@ if (route() === 'members') {
 
 if (route() === 'member_export') {
     require_permission('export_member_data');
-    $id=(int)($_GET['id']??0);
-    $m=first('SELECT * FROM members WHERE id=?',[$id]);
-    if(!$m) redirect('members');
-    audit('member.export','member',$id);
-    $rows=[];
-    $rows[]=['Member details','Membership number',$m['membership_number'] ?? ''];
-    $rows[]=['Member details','Name',trim(($m['first_name']??'').' '.($m['last_name']??''))];
-    $rows[]=['Member details','Callsign',$m['callsign'] ?? ''];
-    $rows[]=['Member details','Licence level',$m['licence_level'] ?? ''];
-    $rows[]=['Member details','Email',$m['email'] ?? ''];
-    $rows[]=['Member details','Phone',decrypt_value($m['phone_encrypted'] ?? '') ?: ''];
-    $rows[]=['Member details','Address',decrypt_value($m['address_encrypted'] ?? '') ?: ''];
-    $rows[]=['Member details','Date joined',member_joined_display($m)];
-    $rows[]=['Member details','Renewal date',$m['renewal_date'] ?? ''];
-    $rows[]=['Member details','Membership status',$m['membership_status'] ?? ''];
-    $rows[]=['Member details','Membership type',$m['membership_type'] ?? ''];
-    $rows[]=['Emergency contact','Name',decrypt_value($m['emergency_contact_name_encrypted'] ?? '') ?: ''];
-    $rows[]=['Emergency contact','Relationship',decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '') ?: ''];
-    $rows[]=['Emergency contact','Phone',decrypt_value($m['emergency_contact_phone_encrypted'] ?? '') ?: ''];
-    foreach(consent_labels() as $type=>$label){ $rows[]=['Consent',$label,get_member_consent($id,$type)?'Yes':'No']; }
-    $stats=attendance_stats($id);
-    $rows[]=['Attendance','Events attended',$stats['attended'] ?? 0];
-    $rows[]=['Attendance','Events signed up',$stats['signed_up'] ?? 0];
-    $rows[]=['Attendance','Signup attendance %',$stats['signup_percent'] === null ? 'N/A' : $stats['signup_percent'].'%'];
-    $rows[]=['Attendance','Overall attendance %',$stats['overall_percent'] === null ? 'N/A' : $stats['overall_percent'].'%'];
-    $payments=all('SELECT * FROM subscription_payments WHERE member_id=? ORDER BY subscription_year DESC, payment_date DESC',[$id]);
-    foreach($payments as $p){
-        $rows[]=['Payment/subs',$p['subscription_year'].' '.$p['status'],'Due £'.number_format((float)$p['amount_due'],2).' / Paid £'.number_format((float)$p['amount_paid'],2).' / '.$p['payment_date'].' / '.$p['payment_method'].' / Ref '.$p['payment_reference'].' / Receipt '.$p['receipt_number']];
+    audit('member.export_all');
+
+    $headers = [
+        'Membership number',
+        'First name',
+        'Surname',
+        'Full name',
+        'Callsign',
+        'Licence level',
+        'Email',
+        'Phone',
+        'Address',
+        'Date joined',
+        'Joined before system / date not on record',
+        'Renewal date',
+        'Membership status',
+        'Membership type',
+        'Emergency contact name',
+        'Emergency contact relationship',
+        'Emergency contact phone',
+        'Email communications consent',
+        'Text messages consent',
+        'WhatsApp community consent',
+        'Current user roles',
+        'Events attended',
+        'Events signed up',
+        'Signup attendance %',
+        'Overall attendance %',
+        'Eligible events',
+        'Payment/subs history',
+        'Total paid',
+        'Latest payment date'
+    ];
+
+    $rows = [];
+    $members = all('SELECT * FROM members ORDER BY last_name, first_name, membership_number');
+    foreach ($members as $m) {
+        $mid = (int)$m['id'];
+        $stats = attendance_stats($mid);
+        $linkedUser = first('SELECT id FROM users WHERE member_id=? ORDER BY id LIMIT 1', [$mid]);
+        $roles = $linkedUser ? implode(', ', user_roles((int)$linkedUser['id'])) : '';
+
+        $payments = all('SELECT * FROM subscription_payments WHERE member_id=? ORDER BY subscription_year DESC, payment_date DESC, id DESC', [$mid]);
+        $paymentSummaryParts = [];
+        $totalPaid = 0.0;
+        $latestPaymentDate = '';
+        foreach ($payments as $p) {
+            $amountPaid = (float)($p['amount_paid'] ?? 0);
+            $totalPaid += $amountPaid;
+            if (!$latestPaymentDate && !empty($p['payment_date'])) $latestPaymentDate = $p['payment_date'];
+            $paymentSummaryParts[] = trim(($p['subscription_year'] ?? '') . ' ' . ($p['status'] ?? '') . ' - due £' . number_format((float)($p['amount_due'] ?? 0), 2) . ', paid £' . number_format($amountPaid, 2) . (!empty($p['payment_date']) ? ', date ' . $p['payment_date'] : '') . (!empty($p['payment_method']) ? ', method ' . $p['payment_method'] : '') . (!empty($p['payment_reference']) ? ', ref ' . $p['payment_reference'] : '') . (!empty($p['receipt_number']) ? ', receipt ' . $p['receipt_number'] : ''));
+        }
+
+        $rows[] = [
+            $m['membership_number'] ?? '',
+            $m['first_name'] ?? '',
+            $m['last_name'] ?? '',
+            trim(($m['first_name'] ?? '') . ' ' . ($m['last_name'] ?? '')),
+            $m['callsign'] ?? '',
+            $m['licence_level'] ?? '',
+            $m['email'] ?? '',
+            decrypt_value($m['phone_encrypted'] ?? '') ?: '',
+            decrypt_value($m['address_encrypted'] ?? '') ?: '',
+            member_joined_display($m),
+            !empty($m['joined_before_system']) ? 'Yes' : 'No',
+            $m['renewal_date'] ?? '',
+            $m['membership_status'] ?? '',
+            $m['membership_type'] ?? '',
+            decrypt_value($m['emergency_contact_name_encrypted'] ?? '') ?: '',
+            decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '') ?: '',
+            decrypt_value($m['emergency_contact_phone_encrypted'] ?? '') ?: '',
+            get_member_consent($mid, 'email_comms') ? 'Yes' : 'No',
+            get_member_consent($mid, 'text_comms') ? 'Yes' : 'No',
+            get_member_consent($mid, 'whatsapp_community') ? 'Yes' : 'No',
+            $roles,
+            $stats['attended'] ?? 0,
+            $stats['signed_up'] ?? 0,
+            $stats['signup_percent'] === null ? 'N/A' : $stats['signup_percent'],
+            $stats['overall_percent'] === null ? 'N/A' : $stats['overall_percent'],
+            $stats['eligible_events'] ?? 0,
+            implode(' | ', $paymentSummaryParts),
+            number_format($totalPaid, 2, '.', ''),
+            $latestPaymentDate
+        ];
     }
-    csv_download('member-'.($m['membership_number'] ?: $id).'-details.csv', ['Section','Field','Value'], $rows);
+
+    csv_download('members-full-export-' . date('Y-m-d') . '.csv', $headers, $rows);
 }
 
 if (route() === 'member_view') {
@@ -1071,7 +1128,7 @@ if (route() === 'member_view') {
         audit('member.update','member',$id,'success',null,['membership_number_changed'=>can_edit_membership_number()]); flash('Member updated.'); redirect('member_view&id='.$id);
     }
     page_header('Member record'); $stats=attendance_stats($id);
-    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">'.e($m['first_name'].' '.$m['last_name']).'</h1><a class="btn secondary" href="?route=member_export&id='.e($id).'">Export spreadsheet</a></div><form method="post">'.csrf_field().'<div class="two">';
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">'.e($m['first_name'].' '.$m['last_name']).'</h1><a class="btn secondary" href="?route=member_export">Export all members spreadsheet</a></div><form method="post">'.csrf_field().'<div class="two">';
     if (can_edit_membership_number()) echo '<div><label>Membership number</label><input name="membership_number" value="'.e($m['membership_number']).'"></div>'; else echo '<div><label>Membership number</label><p><strong>'.e($m['membership_number'] ?: 'Not set').'</strong><br><span class="muted">Only admin users can change this.</span></p></div>';
     echo '<div><label>Callsign</label><input name="callsign" value="'.e($m['callsign']).'"></div><div><label>First name</label><input name="first_name" value="'.e($m['first_name']).'"></div><div><label>Surname</label><input name="last_name" value="'.e($m['last_name']).'"></div><div><label>Email address</label><input type="email" name="email" value="'.e($m['email']).'"></div><div><label>Licence level</label><input name="licence_level" value="'.e($m['licence_level']).'"></div><div><label>Phone number</label><input name="phone" value="'.e(decrypt_value($m['phone_encrypted'])).'"></div><div class="full"><label>Address</label><textarea name="address">'.e(decrypt_value($m['address_encrypted'])).'</textarea></div><div class="full"><h2>Emergency contact</h2></div><div><label>Emergency contact name</label><input name="emergency_contact_name" value="'.e(decrypt_value($m['emergency_contact_name_encrypted'] ?? '')).'"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship" value="'.e(decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '')).'"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone" value="'.e(decrypt_value($m['emergency_contact_phone_encrypted'] ?? '')).'"></div><div><label>Membership type</label><input name="membership_type" value="'.e($m['membership_type']).'"></div><div><label>Date joined</label><input type="date" name="date_joined" value="'.e($m['date_joined']).'"><label class="small"><input type="checkbox" name="joined_before_system" '.(!empty($m['joined_before_system'])?'checked':'').'> Not on record / joined before system</label></div><div><label>Renewal date</label><input type="date" name="renewal_date" value="'.e($m['renewal_date']).'"></div><div><label>Membership status</label><select name="membership_status">'; foreach(['pending','active','expired','former','suspended','honorary','life_member'] as $s) echo '<option '.($m['membership_status']===$s?'selected':'').'>'.e($s).'</option>'; echo '</select></div></div><h2>Consents</h2><p class="muted">Visible and editable by Member DB users and admins.</p>'.render_consent_checkboxes($id).'<label>Private notes</label><textarea name="notes">'.e(decrypt_value($m['notes_encrypted'])).'</textarea><button>Save member</button></form></div>';
     echo '<div class="grid"><div class="card"><h2>Attendance</h2><p>Attended: '.e($stats['attended']).'</p><p>Signed up: '.e($stats['signed_up']).'</p><p>Signup attendance: '.e($stats['signup_percent']===null?'N/A':$stats['signup_percent'].'%').'</p><p>Overall attendance: '.e($stats['overall_percent']===null?'N/A':$stats['overall_percent'].'%').'</p></div>';
