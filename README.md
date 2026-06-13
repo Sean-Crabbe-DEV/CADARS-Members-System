@@ -5,123 +5,70 @@ Created and maintained by **Sean Crabbe** — <sean@defenderonfrequency.uk>
 
 A lightweight, self-hosted, web-based membership and club management system for a ham radio society.
 
-The system is designed for an Ubuntu CT/VPS with Nginx and PHP-FPM. It uses a simple PHP application with SQLite storage for easy deployment and low maintenance.
-
 ## Main features
 
-- First-time installer with admin account setup
-- No default admin account
-- Login system
-- Multi-role users
-- Admin role management
-- Member database
-- Member self-service profile
-- Emergency contact fields
+- First-time installer with admin setup
+- Multi-role users and admin role management
+- Member database and self-service profiles
 - GDPR/data consent fields
-- Internal member directory with opt-in
-- Programme/events calendar and list view
-- Attendance register
-- Guest/visitor attendance
-- Attendance statistics
-- Equipment/assets register
-- Maintenance tickets/history per asset
+- Internal member directory opt-in
+- Programme/events with attendance register
+- Guest attendance and attendance statistics
+- Equipment/assets and maintenance tickets
 - Committee action/task tickets
-- Brickworks Scheme tracking
-- Brickworks management matrix
-- Evidence uploads
+- Brickworks tracking and management
 - Spreadsheet exports
-- Email composer
-- Member recipient selection
-- Bulk BCC sending
-- Resend API support
-- Open/read tracking pixels
-- User invite links
-- Password reset links
+- Email composer with Resend API, BCC bulk sending and read/open tracking
+- User invite/password reset links
 - Audit logging with Cloudflare Tunnel IP support
 - Mobile usability improvements
-- Footer with policy links
+- Performance improvements for faster loading
 
 ## Requirements
 
-Recommended:
-
-- Ubuntu 22.04/24.04 CT or VM
+- Ubuntu 22.04/24.04
 - Nginx
 - PHP 8.1+
-- PHP extensions:
-  - sqlite3
-  - mbstring
-  - curl
-  - sodium
-- unzip
-- rsync
-- git
-
-Install packages:
+- php-fpm, php-sqlite3, php-mbstring, php-curl, php-cli
+- unzip, rsync, git
 
 ```bash
 apt update
 apt install nginx php-fpm php-sqlite3 php-mbstring php-curl php-cli unzip rsync git -y
 ```
 
-## Quick install
+## Web root
 
-Clone the repo:
-
-```bash
-cd /var/www/html
-git clone https://github.com/Sean-Crabbe-DEV/CADARS-Members-System.git
-chown -R www-data:www-data CADARS-Members-System
-find CADARS-Members-System -type d -exec chmod 750 {} \;
-find CADARS-Members-System -type f -exec chmod 640 {} \;
-```
-
-Nginx should point the web root to:
+Point Nginx to:
 
 ```text
 /var/www/html/CADARS-Members-System/public
 ```
 
-Then open the site in a browser and complete the first-time installer.
+Do not expose the repository root directly.
 
-## Important runtime files
-
-These are created on the live server and must **not** be committed to GitHub:
+## Runtime files not committed
 
 ```text
 /database/app.sqlite
 /storage/app_config.php
 /storage/installed.lock
+/storage/schema_version.txt
 /storage/private/*
 ```
 
-The `.gitignore` protects these files.
-
-## Updating live system
-
-Use the included script:
+## Updating
 
 ```bash
 chmod +x scripts/update-from-github.sh
 scripts/update-from-github.sh
 ```
 
-It preserves live `database/` and `storage/` while updating app files.
+The updater preserves live `database/` and `storage/`.
 
-## Documentation
+## Docs
 
-See the `docs/` folder:
-
-- [Installation](docs/INSTALL.md)
-- [Nginx config](docs/NGINX.md)
-- [Updating from GitHub](docs/UPDATE.md)
-- [Permissions and roles](docs/ROLES.md)
-- [Email setup](docs/EMAIL.md)
-- [Data protection notes](docs/DATA-PROTECTION.md)
-- [Backup and restore](docs/BACKUP-RESTORE.md)
-- [Security hardening](docs/SECURITY.md)
-- [Project structure](docs/PROJECT-STRUCTURE.md)
-- [Changelog](docs/CHANGELOG.md)
+See `docs/`.
 
 ## Licence
 

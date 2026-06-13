@@ -6,11 +6,17 @@ define('DB_PATH', BASE_PATH . '/database/app.sqlite');
 define('LOCK_PATH', BASE_PATH . '/storage/installed.lock');
 define('CONFIG_PATH', BASE_PATH . '/storage/app_config.php');
 define('PRIVATE_PATH', BASE_PATH . '/storage/private');
+define('SCHEMA_VERSION', '2026-06-14-performance-1');
+
+// Safe output compression where PHP/server allows it. This reduces transfer size without changing the UI.
+if (!headers_sent() && !ini_get('zlib.output_compression') && extension_loaded('zlib')) { @ini_set('zlib.output_compression', '1'); }
 
 if (!is_dir(BASE_PATH . '/database')) mkdir(BASE_PATH . '/database', 0750, true);
 if (!is_dir(PRIVATE_PATH)) mkdir(PRIVATE_PATH, 0750, true);
 
 function app_config(): array {
+    static $cached = null;
+    if ($cached !== null) return $cached;
     $defaults = [
         'app_key' => null,
         'society_name' => 'Ham Radio Society',
@@ -29,9 +35,9 @@ function app_config(): array {
     ];
     if (file_exists(CONFIG_PATH)) {
         $cfg = include CONFIG_PATH;
-        if (is_array($cfg)) return array_merge($defaults, $cfg);
+        if (is_array($cfg)) return $cached = array_merge($defaults, $cfg);
     }
-    return $defaults;
+    return $cached = $defaults;
 }
 function save_app_config(array $updates): void {
     $cfg = array_merge(app_config(), $updates);
@@ -158,7 +164,13 @@ function db(): PDO {
     if ($pdo) return $pdo;
     $pdo = new PDO('sqlite:' . DB_PATH);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
     $pdo->exec('PRAGMA foreign_keys = ON');
+    $pdo->exec('PRAGMA busy_timeout = 5000');
+    $pdo->exec('PRAGMA journal_mode = WAL');
+    $pdo->exec('PRAGMA synchronous = NORMAL');
+    $pdo->exec('PRAGMA temp_store = MEMORY');
+    $pdo->exec('PRAGMA cache_size = -20000');
     return $pdo;
 }
 
@@ -169,7 +181,7 @@ function redirect(string $route): void {
     else header('Location: ?route=' . urlencode($route));
     exit;
 }
-function route(): string { return $_GET['route'] ?? 'dashboard'; }
+function route(): string { static $r=null; if ($r !== null) return $r; return $r = ($_GET['route'] ?? 'dashboard'); }
 function installed(): bool { return file_exists(LOCK_PATH); }
 function csrf_token(): string { if (empty($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(32)); return $_SESSION['csrf']; }
 function csrf_field(): string { return '<input type="hidden" name="csrf" value="' . e(csrf_token()) . '">'; }
@@ -199,22 +211,29 @@ function decrypt_value(?string $cipher): ?string {
 }
 
 function current_user(): ?array {
+    static $cached = [];
     if (empty($_SESSION['user_id'])) return null;
+    $uid = (int)$_SESSION['user_id'];
+    if (array_key_exists($uid, $cached)) return $cached[$uid];
     $stmt = db()->prepare('SELECT * FROM users WHERE id = ? AND status = "active"');
-    $stmt->execute([$_SESSION['user_id']]);
+    $stmt->execute([$uid]);
     $u = $stmt->fetch(PDO::FETCH_ASSOC);
-    return $u ?: null;
+    return $cached[$uid] = ($u ?: null);
 }
 function require_login(): array { $u = current_user(); if (!$u) redirect('login'); return $u; }
 function user_roles(int $user_id): array {
+    static $cache = [];
+    if (isset($cache[$user_id])) return $cache[$user_id];
     $stmt = db()->prepare('SELECT r.name FROM roles r JOIN user_roles ur ON ur.role_id = r.id WHERE ur.user_id = ? AND (ur.expires_at IS NULL OR ur.expires_at > datetime("now"))');
     $stmt->execute([$user_id]);
-    return array_column($stmt->fetchAll(PDO::FETCH_ASSOC), 'name');
+    return $cache[$user_id] = array_column($stmt->fetchAll(PDO::FETCH_ASSOC), 'name');
 }
 function user_permissions(int $user_id): array {
+    static $cache = [];
+    if (isset($cache[$user_id])) return $cache[$user_id];
     $stmt = db()->prepare('SELECT DISTINCT p.name FROM permissions p JOIN role_permissions rp ON rp.permission_id = p.id JOIN user_roles ur ON ur.role_id = rp.role_id WHERE ur.user_id = ? AND (ur.expires_at IS NULL OR ur.expires_at > datetime("now"))');
     $stmt->execute([$user_id]);
-    return array_column($stmt->fetchAll(PDO::FETCH_ASSOC), 'name');
+    return $cache[$user_id] = array_column($stmt->fetchAll(PDO::FETCH_ASSOC), 'name');
 }
 function has_permission(string $permission): bool {
     $u = current_user(); if (!$u) return false;
@@ -421,6 +440,82 @@ function ensure_schema_updates(): void {
         created_at TEXT NOT NULL
     )');
 }
+
+function ensure_performance_indexes(): void {
+    $indexes = [
+        'CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)',
+        'CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)',
+        'CREATE INDEX IF NOT EXISTS idx_users_member_id ON users(member_id)',
+        'CREATE INDEX IF NOT EXISTS idx_user_password_tokens_hash ON user_password_tokens(token_hash)',
+        'CREATE INDEX IF NOT EXISTS idx_user_password_tokens_user_purpose ON user_password_tokens(user_id, purpose, used_at, expires_at)',
+        'CREATE INDEX IF NOT EXISTS idx_roles_name ON roles(name)',
+        'CREATE INDEX IF NOT EXISTS idx_permissions_name ON permissions(name)',
+        'CREATE INDEX IF NOT EXISTS idx_user_roles_user ON user_roles(user_id)',
+        'CREATE INDEX IF NOT EXISTS idx_user_roles_role ON user_roles(role_id)',
+        'CREATE INDEX IF NOT EXISTS idx_role_permissions_role ON role_permissions(role_id)',
+        'CREATE INDEX IF NOT EXISTS idx_role_permissions_permission ON role_permissions(permission_id)',
+        'CREATE INDEX IF NOT EXISTS idx_members_status_name ON members(membership_status, last_name, first_name)',
+        'CREATE INDEX IF NOT EXISTS idx_members_email ON members(email)',
+        'CREATE INDEX IF NOT EXISTS idx_members_callsign ON members(callsign)',
+        'CREATE INDEX IF NOT EXISTS idx_members_number ON members(membership_number)',
+        'CREATE INDEX IF NOT EXISTS idx_member_consents_member_type ON member_consents(member_id, consent_type)',
+        'CREATE INDEX IF NOT EXISTS idx_member_consents_type_granted ON member_consents(consent_type, granted)',
+        'CREATE INDEX IF NOT EXISTS idx_directory_show ON member_directory_preferences(show_callsign, member_id)',
+        'CREATE INDEX IF NOT EXISTS idx_member_email_preferences_member ON member_email_preferences(member_id)',
+        'CREATE INDEX IF NOT EXISTS idx_subs_member_year ON subscription_payments(member_id, subscription_year)',
+        'CREATE INDEX IF NOT EXISTS idx_subs_status ON subscription_payments(status)',
+        'CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_at)',
+        'CREATE INDEX IF NOT EXISTS idx_events_visibility_start ON events(visibility, start_at)',
+        'CREATE INDEX IF NOT EXISTS idx_events_type_start ON events(event_type, start_at)',
+        'CREATE INDEX IF NOT EXISTS idx_event_attendance_event ON event_attendance(event_id)',
+        'CREATE INDEX IF NOT EXISTS idx_event_attendance_member ON event_attendance(member_id)',
+        'CREATE INDEX IF NOT EXISTS idx_event_attendance_attended ON event_attendance(attended)',
+        'CREATE INDEX IF NOT EXISTS idx_event_guests_event ON event_guests(event_id)',
+        'CREATE INDEX IF NOT EXISTS idx_event_attachments_event ON event_attachments(event_id)',
+        'CREATE INDEX IF NOT EXISTS idx_equipment_asset ON equipment(asset_number)',
+        'CREATE INDEX IF NOT EXISTS idx_equipment_category ON equipment(category)',
+        'CREATE INDEX IF NOT EXISTS idx_equipment_tickets_equipment_status ON equipment_maintenance_tickets(equipment_id, status)',
+        'CREATE INDEX IF NOT EXISTS idx_equipment_loans_equipment ON equipment_loans(equipment_id)',
+        'CREATE INDEX IF NOT EXISTS idx_equipment_loans_member ON equipment_loans(member_id)',
+        'CREATE INDEX IF NOT EXISTS idx_committee_actions_status_due ON committee_actions(status, due_date)',
+        'CREATE INDEX IF NOT EXISTS idx_committee_actions_member ON committee_actions(assigned_member_id)',
+        'CREATE INDEX IF NOT EXISTS idx_committee_action_updates_action ON committee_action_updates(action_id, created_at)',
+        'CREATE INDEX IF NOT EXISTS idx_brickworks_participants_member ON brickworks_participants(member_id)',
+        'CREATE INDEX IF NOT EXISTS idx_brickworks_progress_participant ON brickworks_progress(participant_id)',
+        'CREATE INDEX IF NOT EXISTS idx_brickworks_progress_criterion ON brickworks_progress(criterion_id)',
+        'CREATE INDEX IF NOT EXISTS idx_brickworks_progress_status ON brickworks_progress(status)',
+        'CREATE INDEX IF NOT EXISTS idx_brickworks_evidence_progress ON brickworks_evidence(progress_id)',
+        'CREATE INDEX IF NOT EXISTS idx_emails_created ON emails(created_at)',
+        'CREATE INDEX IF NOT EXISTS idx_email_recipients_email ON email_recipients(email_id)',
+        'CREATE INDEX IF NOT EXISTS idx_email_recipients_member ON email_recipients(member_id)',
+        'CREATE INDEX IF NOT EXISTS idx_email_recipients_tracking ON email_recipients(tracking_id)',
+        'CREATE INDEX IF NOT EXISTS idx_email_opens_recipient ON email_opens(email_recipient_id)',
+        'CREATE INDEX IF NOT EXISTS idx_notifications_user_read ON notifications(user_id, read_at)',
+        'CREATE INDEX IF NOT EXISTS idx_notifications_member_read ON notifications(member_id, read_at)',
+        'CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at)',
+        'CREATE INDEX IF NOT EXISTS idx_audit_actor_created ON audit_logs(actor_user_id, created_at)',
+        'CREATE INDEX IF NOT EXISTS idx_audit_action_created ON audit_logs(action, created_at)',
+        'CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_logs(entity_type, entity_id)'
+    ];
+    foreach ($indexes as $sql) {
+        try { db()->exec($sql); } catch (Throwable $e) { /* never break the app for an index */ }
+    }
+}
+
+function schema_marker_path(): string { return BASE_PATH . '/storage/schema_version.txt'; }
+function app_schema_ready(): bool {
+    return file_exists(DB_PATH) && file_exists(schema_marker_path()) && trim((string)@file_get_contents(schema_marker_path())) === SCHEMA_VERSION;
+}
+function ensure_app_ready(): void {
+    if (app_schema_ready()) return;
+    create_schema();
+    seed_roles_permissions();
+    seed_brickworks();
+    ensure_performance_indexes();
+    try { db()->exec('PRAGMA optimize'); } catch (Throwable $e) {}
+    @file_put_contents(schema_marker_path(), SCHEMA_VERSION);
+}
+
 function is_admin_user(): bool { return has_role('admin'); }
 function user_is_admin(int $user_id): bool { return in_array('admin', user_roles($user_id), true); }
 function active_admin_count(): int {
@@ -464,7 +559,7 @@ function save_consent_post(int $member_id, ?int $by_user_id): void {
 
 function page_header(string $title): void {
     $u = current_user(); $cfg = app_config();
-    echo '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' . e($title) . '</title><link rel="stylesheet" href="?route=assets.css"></head><body>';
+    echo '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' . e($title) . '</title><link rel="stylesheet" href="?route=assets.css&amp;v=' . e(SCHEMA_VERSION) . '"></head><body>';
     echo '<header><div><strong>' . e($cfg['society_name'] ?? 'Ham Radio Society') . '</strong><span>Membership System</span></div>';
     if ($u) {
         $displayName = 'My account';
@@ -1192,7 +1287,11 @@ function brickworks_award(int $complete): ?string {
 }
 
 if (route() === 'assets.css') {
-    header('Content-Type: text/css');
+    $etag = '"css-' . SCHEMA_VERSION . '"';
+    header('Content-Type: text/css; charset=UTF-8');
+    header('Cache-Control: public, max-age=604800, immutable');
+    header('ETag: ' . $etag);
+    if (($_SERVER['HTTP_IF_NONE_MATCH'] ?? '') === $etag) { http_response_code(304); exit; }
     echo 'body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#f6f7fb;color:#18202a}header{background:#101827;color:white;padding:18px 24px}header div{display:flex;gap:12px;align-items:end}header span{opacity:.7}.main-nav{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center}.main-nav a,.nav-drop{color:white;background:#24324a;padding:8px 10px;border-radius:8px;text-decoration:none;border:0;font:inherit;cursor:pointer}.dropdown{position:relative;padding-bottom:14px;margin-bottom:-14px}.dropdown::after{content:"";position:absolute;left:0;right:0;top:100%;height:14px}.dropdown-menu{display:none;position:absolute;z-index:999;top:calc(100% - 6px);left:0;min-width:220px;background:white;border-radius:10px;box-shadow:0 10px 25px #0003;padding:8px;margin-top:0}.dropdown:hover .dropdown-menu,.dropdown:focus-within .dropdown-menu,.dropdown.open .dropdown-menu{display:block}.dropdown-menu a{display:block;color:#18202a;background:white;padding:10px;border-radius:8px}.dropdown-menu a:hover{background:#f1f5f9}main{max-width:1180px;margin:24px auto;padding:0 18px}.site-footer{max-width:1180px;margin:28px auto 0;padding:18px;color:#64748b;text-align:center;border-top:1px solid #e5e7eb}.site-footer a{color:#1d4ed8;text-decoration:none}.site-footer a:hover{text-decoration:underline}.footer-main,.footer-links,.footer-version{margin:5px 0}.footer-main{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}.footer-version{font-size:.92rem}.card{background:white;border-radius:14px;padding:18px;margin:16px 0;box-shadow:0 1px 4px #0001}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}label{display:block;margin:10px 0 4px;font-weight:600}input,select,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd3df;border-radius:8px}textarea{min-height:110px}button,.btn{background:#1d4ed8;color:white;border:0;border-radius:8px;padding:10px 14px;text-decoration:none;display:inline-block;cursor:pointer}button.secondary,.btn.secondary{background:#475569}.btn.danger,button.danger{background:#b91c1c}table{width:100%;border-collapse:collapse;background:white}th,td{border-bottom:1px solid #e5e7eb;padding:10px;text-align:left;vertical-align:top}th{background:#f1f5f9}.flash{background:#dcfce7;border:1px solid #86efac;padding:12px;border-radius:10px}.danger-box,.card.danger{background:#fee2e2;border:1px solid #fecaca}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#e0e7ff}.muted{color:#64748b}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.event-list{display:grid;gap:12px}.event-row{display:flex;gap:18px;justify-content:space-between;align-items:flex-start;border:1px solid #e5e7eb;border-radius:12px;padding:14px;background:#fff}.event-actions{white-space:nowrap}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}.calendar-head{font-weight:700;text-align:center;background:#e2e8f0;border-radius:8px;padding:8px}.calendar-day{min-height:110px;background:white;border:1px solid #e5e7eb;border-radius:10px;padding:8px}.calendar-day.muted-day{background:#f8fafc;color:#94a3b8}.calendar-date{font-weight:700;margin-bottom:6px}.calendar-event{display:block;background:#dbeafe;color:#1e3a8a;text-decoration:none;border-radius:8px;padding:5px;margin:4px 0;font-size:.88rem}.leaderboard{counter-reset:rank}.leaderboard-row{display:grid;grid-template-columns:42px 1fr auto;gap:10px;align-items:center;border-bottom:1px solid #e5e7eb;padding:10px 0}.leaderboard-row:before{counter-increment:rank;content:counter(rank);background:#e0e7ff;border-radius:999px;width:30px;height:30px;display:grid;place-items:center;font-weight:700}.progressbar{height:10px;background:#e5e7eb;border-radius:999px;overflow:hidden}.progressbar span{display:block;height:100%;background:#1d4ed8}.small{font-size:.9rem}.status-complete{background:#dcfce7}.status-pending{background:#fef3c7}.status-none{background:#f1f5f9}.user-menu{margin-left:auto}.dropdown-right{right:0;left:auto}.modal{border:0;border-radius:16px;padding:0;max-width:820px;width:calc(100% - 32px);box-shadow:0 24px 80px #0005}.modal::backdrop{background:#0f172acc}.modal .card{margin:0;box-shadow:none}.modal-head{display:flex;align-items:center;gap:12px}.modal-head h2{margin-right:auto}.icon-btn{background:#e2e8f0;color:#0f172a;border-radius:999px;padding:8px 12px}.category-pill{background:#eef2ff;color:#312e81}.attendance-tools{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.attendance-list{display:grid;gap:8px}.attendance-item{display:grid;grid-template-columns:32px 1fr 160px;gap:10px;align-items:center;border:1px solid #e5e7eb;border-radius:10px;padding:10px}.attendance-item input[type=checkbox]{width:auto}.attendance-modern{padding:0;overflow:hidden;border-radius:18px}.attendance-modern-head{display:grid;grid-template-columns:1fr auto;gap:18px;padding:28px 32px 18px;align-items:start}.attendance-modern-head h2{font-size:1.9rem;margin:.1rem 0 .35rem}.attendance-date{font-size:1.25rem;color:#64748b;font-weight:650}.attendance-counts{display:flex;gap:28px;text-align:center;align-items:start}.attendance-counts span{display:block;color:#64748b;font-weight:650}.attendance-counts strong{font-size:1.45rem}.attendance-counts .present{color:#16a34a}.attendance-counts .guest{color:#ea580c}.attendance-counts .absent{color:#dc2626}.attendance-modern-controls{display:grid;grid-template-columns:1fr 220px auto auto;gap:14px;padding:18px 32px 28px;align-items:center}.attendance-search-wrap{position:relative}.attendance-search-wrap:before{content:"⌕";position:absolute;left:14px;top:50%;transform:translateY(-50%);font-size:1.35rem;color:#94a3b8}.attendance-search{font-size:1.05rem;padding-left:46px}.attendance-filter,.attendance-search{height:44px;box-shadow:0 2px 7px #00000012}.attendance-modern-list{border-top:1px solid #e5e7eb}.attendance-modern-row{display:grid;grid-template-columns:44px 1fr auto;gap:14px;align-items:center;padding:18px 32px;border-bottom:1px solid #e5e7eb;background:#fff}.attendance-modern-row:hover{background:#f8fafc}.attendance-modern-row input[type=checkbox]{width:24px;height:24px;accent-color:#1d4ed8}.attendance-person strong{display:block;font-size:1.05rem}.attendance-person span{display:block;color:#64748b;margin-top:2px}.attendance-row-status{font-weight:700;color:#94a3b8}.attendance-row-status.present{color:#16a34a}.attendance-row-status.guest{color:#ea580c}.attendance-modern-footer{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;padding:18px 32px;align-items:end;background:#f8fafc}.attendance-modern-footer input{background:white}.attendance-savebar{padding:18px 32px;display:flex;gap:10px;justify-content:space-between;align-items:center;background:#fff}.attendance-empty{padding:22px 32px;color:#64748b}.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.stat-tile{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:12px}.full{grid-column:1/-1}.bw-hero{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center}.bw-score{font-size:2.2rem;font-weight:800}.bw-steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px}.bw-step{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:10px}.bw-grid{display:grid;gap:14px}.bw-card{border:1px solid #e5e7eb;border-radius:14px;padding:14px;background:#fff}.bw-card-head{display:flex;gap:10px;align-items:flex-start;justify-content:space-between}.bw-card h3{margin:.1rem 0 .35rem}.bw-theme{font-size:.85rem;color:#475569;font-weight:700;text-transform:uppercase;letter-spacing:.03em}.bw-status{display:inline-block;border-radius:999px;padding:5px 9px;font-weight:700;font-size:.85rem;white-space:nowrap}.bw-status.complete{background:#dcfce7;color:#166534}.bw-status.pending{background:#fef3c7;color:#92400e}.bw-status.none{background:#f1f5f9;color:#334155}.bw-form{display:grid;gap:8px;margin-top:12px;background:#f8fafc;border-radius:12px;padding:12px}.bw-comments{margin-top:10px;border-left:4px solid #e2e8f0;padding-left:10px}.bw-muted-line{color:#64748b;font-size:.92rem}.ticket{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fff;margin:10px 0}.ticket-head{display:flex;gap:10px;align-items:center;justify-content:space-between}.ticket.open{border-left:5px solid #2563eb}.ticket.in_progress{border-left:5px solid #f59e0b}.ticket.closed{border-left:5px solid #16a34a}.ticket.cancelled{border-left:5px solid #64748b}.matrix-wrap{overflow:auto;max-width:100%;border:1px solid #e5e7eb;border-radius:12px}.matrix{min-width:980px}.matrix th{position:sticky;top:0;z-index:3}.matrix th:first-child,.matrix td:first-child{position:sticky;left:0;background:#fff;z-index:2;box-shadow:2px 0 0 #e5e7eb}.matrix th:first-child{z-index:4;background:#f1f5f9}.matrix-cell{min-width:220px}.inline-form{display:grid;gap:6px}.inline-form select,.inline-form textarea,.inline-form input{font-size:.9rem;padding:7px}.status-pill{display:inline-block;border-radius:999px;padding:4px 8px;font-size:.82rem;font-weight:700}.status-open{background:#dbeafe;color:#1e40af}.status-in_progress,.status-pending_approval{background:#fef3c7;color:#92400e}.status-complete,.status-closed{background:#dcfce7;color:#166534}.status-not_completed,.status-cancelled{background:#f1f5f9;color:#334155}.asset-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.asset-field{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px}.asset-field span{display:block;color:#64748b;font-size:.85rem}.asset-field strong{display:block;margin-top:3px}.actions-board{display:grid;gap:12px}.recipient-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;max-height:360px;overflow:auto;border:1px solid #e5e7eb;border-radius:12px;padding:10px;background:#f8fafc}.recipient-item{display:flex;gap:10px;align-items:flex-start;background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:9px;margin:0;font-weight:400}.recipient-item input{width:auto;margin-top:4px}.email-app{background:#fff;border:1px solid #dde4ef;border-radius:14px;overflow:hidden;box-shadow:0 1px 4px #0001;margin:16px 0}.email-top{background:#4638cf;color:white;padding:16px 18px;display:flex;align-items:center;gap:12px}.email-title{display:flex;align-items:center;gap:10px;font-size:1.25rem}.email-icon{font-size:1.3rem}.email-top-actions{margin-left:auto}.email-config-btn{background:#ffffff22;color:white;border:1px solid #ffffff55;border-radius:9px;padding:8px 10px;text-decoration:none;font-weight:700}.email-layout{display:grid;grid-template-columns:330px 1fr;min-height:560px}.email-sidebar{border-right:1px solid #dde4ef;background:#f8fafc}.email-recipient-head{display:flex;align-items:center;gap:10px;padding:15px 14px;border-bottom:1px solid #dde4ef;font-size:1.05rem}.email-people{color:#4f46e5}.email-count{background:#e0e7ff;color:#4338ca;border-radius:9px;padding:3px 12px;font-weight:800;box-shadow:0 2px 6px #0001}.email-filter-bar{display:flex;gap:7px;flex-wrap:wrap;padding:12px 14px;border-bottom:1px solid #e7edf6}.email-chip{width:auto;border-radius:7px;padding:8px 10px;background:#eef2ff;color:#4338ca;font-weight:800}.email-chip.active{background:#4f46e5;color:#fff}.email-chip.paid{background:#dcfce7;color:#166534}.email-chip.unpaid{background:#fee2e2;color:#b91c1c}.email-chip.pending{background:#fef3c7;color:#92400e}.email-chip.committee{background:#f3e8ff;color:#7e22ce}.email-chip.none{background:#e2e8f0;color:#64748b}.email-search-wrap{padding:12px 14px}.email-search{background:#fff;padding-left:14px}.email-member-list{max-height:430px;overflow:auto}.email-member-card{display:grid;grid-template-columns:24px 1fr auto;gap:10px;align-items:center;padding:12px 14px;border-top:1px solid #edf2f7;background:#eef2ff;cursor:pointer;margin:0;font-weight:400}.email-member-card:hover{background:#e0e7ff}.email-member-card input{display:none}.email-check-ui{width:18px;height:18px;border-radius:6px;background:#4f46e5;color:#fff;display:grid;place-items:center;font-size:.78rem;font-weight:900}.email-member-card input:not(:checked)+.email-check-ui{background:#fff;color:transparent;border:2px solid #cbd5e1}.email-member-main strong{display:block;color:#1e293b}.email-member-main small,.email-callsign{display:block;color:#94a3b8;font-weight:700;margin-top:2px}.email-badge{border-radius:7px;padding:6px 9px;font-weight:800;font-size:.82rem}.email-badge.paid{background:#dcfce7;color:#166534}.email-badge.unpaid{background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5}.email-badge.pending{background:#fef3c7;color:#92400e}.email-empty{padding:14px}.email-compose{display:flex;flex-direction:column;background:#fff}.email-fields{padding:16px 22px;border-bottom:1px solid #dde4ef}.email-row{display:grid;grid-template-columns:70px 1fr;gap:12px;align-items:center;margin:8px 0}.email-row label{margin:0;text-align:right;color:#64748b}.email-row input{background:#f8fafc}.email-toolbar{display:flex;gap:14px;align-items:center;padding:12px 22px;border-bottom:1px solid #eef2f7}.email-attach-btn{display:inline-flex;align-items:center;gap:8px;width:auto;margin:0;padding:9px 12px;border:1px solid #dbe3ee;border-radius:9px;background:#fff;box-shadow:0 2px 5px #0001;cursor:pointer}.email-attach-btn input{display:none}.email-help{color:#94a3b8;font-weight:700}.email-help code{background:#eef2ff;color:#64748b;border-radius:5px;padding:2px 5px}.email-message{border:0;border-radius:0;min-height:330px;padding:22px;font-size:1rem;resize:vertical}.email-message:focus{outline:2px solid #c7d2fe;outline-offset:-2px}.email-sendbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:auto;padding:14px 22px;border-top:1px solid #eef2f7;background:#fbfdff}@media(max-width:900px){.email-layout{grid-template-columns:1fr}.email-sidebar{border-right:0;border-bottom:1px solid #dde4ef}.email-member-list{max-height:260px}.email-row{grid-template-columns:1fr}.email-row label{text-align:left}.email-sendbar{display:block}.email-sendbar div{margin-top:10px}}.role-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin:8px 0 12px}.role-grid .check{display:flex;align-items:center;gap:8px;margin:0;padding:8px 10px;border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc;font-weight:600;line-height:1.2;cursor:pointer}.role-grid .check:hover{background:#eef2ff;border-color:#c7d2fe}.role-grid .check input[type=checkbox]{width:18px;height:18px;min-width:18px;margin:0;accent-color:#1d4ed8}.role-grid .check span{display:inline-block}.role-grid .check input[disabled]+span{color:#64748b}.role-editor .role-grid{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}footer{text-align:center;color:#64748b;padding:24px}@media(max-width:800px){.two{grid-template-columns:1fr}.event-row{display:block}.calendar{grid-template-columns:1fr}.calendar-head{display:none}table{font-size:.9rem}}@media(max-width:720px){  header{padding:14px 12px}  header div{display:block}  header h1{font-size:1.25rem;margin:.2rem 0}  header span{display:block;font-size:.88rem;margin-top:2px}  .main-nav{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}  .main-nav a,.nav-drop{display:block;width:100%;box-sizing:border-box;text-align:center;padding:11px 10px}  .user-menu{margin-left:0}  .dropdown{padding-bottom:0;margin-bottom:0}  .dropdown::after{display:none}  .dropdown-menu,.dropdown-right{position:static;min-width:0;width:100%;box-sizing:border-box;margin-top:6px;box-shadow:none;border:1px solid #e5e7eb}  .dropdown-menu a{text-align:left}  main{margin:14px auto;padding:0 10px}  .card{border-radius:12px;padding:14px;margin:12px 0}  h1{font-size:1.55rem}  h2{font-size:1.25rem}  .grid,.two,.asset-grid,.stat-grid,.bw-steps{grid-template-columns:1fr}  .toolbar{display:grid;grid-template-columns:1fr;gap:8px}  .toolbar .btn,.toolbar button,.toolbar select{width:100%;box-sizing:border-box;text-align:center}  button,.btn{width:100%;box-sizing:border-box;text-align:center;margin:3px 0}  input,select,textarea{font-size:16px}  table{display:block;width:100%;overflow-x:auto;white-space:nowrap;font-size:.88rem}  th,td{padding:8px}  .event-row{display:block}  .event-actions{white-space:normal;margin-top:10px}  .calendar{display:block}  .calendar-head{display:none}  .calendar-day{min-height:auto;margin-bottom:8px}  .leaderboard-row{grid-template-columns:36px 1fr;align-items:start}  .leaderboard-row > .pill,.leaderboard-row > span:last-child{grid-column:2}  .bw-hero{grid-template-columns:1fr;text-align:left}  .bw-card-head{display:block}  .bw-status{margin-top:8px}  .bw-form button{width:100%}  .matrix-wrap{border-radius:10px}  .matrix{min-width:760px}  .modal{width:calc(100% - 18px);max-height:92vh;overflow:auto}  .modal-head{display:grid;grid-template-columns:1fr auto}  .attendance-modern-head{grid-template-columns:1fr;padding:18px 16px 10px}  .attendance-modern-head h2{font-size:1.45rem}  .attendance-date{font-size:1rem}  .attendance-counts{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}  .attendance-counts strong{font-size:1.15rem}  .attendance-modern-controls{grid-template-columns:1fr;padding:14px 16px;gap:9px}  .attendance-modern-row{grid-template-columns:34px 1fr;padding:14px 16px}  .attendance-row-status{grid-column:2;margin-top:4px}  .attendance-modern-footer{grid-template-columns:1fr;padding:14px 16px}  .attendance-savebar{display:block;padding:14px 16px}  .email-top{display:block}  .email-top-actions{margin-left:0;margin-top:10px}  .email-layout{grid-template-columns:1fr;min-height:0}  .email-sidebar{border-right:0;border-bottom:1px solid #dde4ef}  .email-filter-bar{display:grid;grid-template-columns:1fr 1fr}  .email-chip{width:100%}  .email-member-list{max-height:300px}  .email-member-card{grid-template-columns:24px 1fr;align-items:start}  .email-badge{grid-column:2;width:max-content}  .email-fields,.email-toolbar,.email-sendbar{padding:12px 14px}  .email-row{grid-template-columns:1fr}  .email-row label{text-align:left}  .email-toolbar{display:block}  .email-message{min-height:240px;padding:14px}  .role-grid{grid-template-columns:1fr}  .ticket-head{display:block}  .site-footer{margin-top:18px;padding:14px 10px;font-size:.88rem}}@media(max-width:420px){  .main-nav{grid-template-columns:1fr}  .attendance-counts{grid-template-columns:1fr}  .email-filter-bar{grid-template-columns:1fr}}';
     exit;
 }
@@ -1212,7 +1311,7 @@ if (route() === 'email_open') {
 }
 
 if (!installed() && route() !== 'install') redirect('install');
-if (installed()) { create_schema(); seed_roles_permissions(); seed_brickworks(); }
+if (installed()) { ensure_app_ready(); }
 
 if (route() === 'install') {
     if (installed()) redirect('login');
