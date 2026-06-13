@@ -34,3 +34,7 @@ Invite/reset links expire after 48 hours and ask the user to set their own passw
 Manual temporary passwords force the user to change password after login.
 
 Email delivery uses the configured mail method under Email system config.
+
+## UI tweaks
+
+The Users page role selector uses inline checkbox cards so the checkbox and role name line up clearly.
