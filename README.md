@@ -38,3 +38,18 @@ Email delivery uses the configured mail method under Email system config.
 ## UI tweaks
 
 The Users page role selector uses inline checkbox cards so the checkbox and role name line up clearly.
+
+## Deleting members and users
+
+Admins can delete user accounts from the Users page. The system prevents deleting your own logged-in account and prevents deleting the last active admin.
+
+Member DB users can delete member records where safe. If a member is linked to a user account, an admin is required because the linked user account must be deleted too. Deleting a member removes linked membership data, attendance records, consents, payments, directory preferences and Brickworks progress/evidence references.
+
+## Admin deletion safety
+
+User/member deletion now enforces:
+
+- Only admins can delete user accounts.
+- Admin users can only be deleted by another admin.
+- The last active admin cannot be deleted.
+- Removing roles cannot leave the system with zero active admins.

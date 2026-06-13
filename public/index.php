@@ -422,6 +422,10 @@ function ensure_schema_updates(): void {
     )');
 }
 function is_admin_user(): bool { return has_role('admin'); }
+function user_is_admin(int $user_id): bool { return in_array('admin', user_roles($user_id), true); }
+function active_admin_count(): int {
+    return (int)(first('SELECT COUNT(DISTINCT ur.user_id) AS c FROM user_roles ur JOIN roles r ON r.id=ur.role_id JOIN users u ON u.id=ur.user_id WHERE r.name="admin" AND u.status="active" AND (ur.expires_at IS NULL OR ur.expires_at > datetime("now"))')['c'] ?? 0);
+}
 function can_edit_membership_number(): bool { return is_admin_user(); }
 function member_joined_display(array $m): string {
     if (!empty($m['joined_before_system']) && empty($m['date_joined'])) return 'Not on record - joined before system';
@@ -1027,10 +1031,11 @@ function set_user_roles(int $user_id, array $role_names, int $by, string $reason
     $targetCurrent = user_roles($user_id);
     $actorCurrent = user_roles($by);
 
-    // Safety: do not let an admin remove their own final admin role and lock themselves out.
-    if ($user_id === $by && in_array('admin', $targetCurrent, true) && !in_array('admin', $role_names, true)) {
-        $adminCount = (int)(first('SELECT COUNT(DISTINCT ur.user_id) AS c FROM user_roles ur JOIN roles r ON r.id=ur.role_id JOIN users u ON u.id=ur.user_id WHERE r.name="admin" AND u.status="active"')['c'] ?? 0);
-        if ($adminCount <= 1) $role_names[] = 'admin';
+    // Safety: the system must always keep at least one active admin.
+    // If this user is currently an admin and the submitted role list would remove that role,
+    // keep admin when they are the last active admin.
+    if (in_array('admin', $targetCurrent, true) && !in_array('admin', $role_names, true)) {
+        if (active_admin_count() <= 1) $role_names[] = 'admin';
     }
 
     $added=[]; $removed=[];
@@ -1042,6 +1047,117 @@ function set_user_roles(int $user_id, array $role_names, int $by, string $reason
     }
     return ['added'=>$added,'removed'=>$removed,'final'=>user_roles($user_id)];
 }
+
+function can_delete_user_account(int $user_id, int $actor_user_id): array {
+    $target = first('SELECT * FROM users WHERE id=?', [$user_id]);
+    if (!$target) return [false, 'User not found.'];
+
+    // Only admin users can delete user accounts at all.
+    if (!user_is_admin($actor_user_id)) return [false, 'Only admin users can delete user accounts.'];
+
+    if ($user_id === $actor_user_id) return [false, 'You cannot delete your own user account while logged in.'];
+
+    // Admin accounts may only be deleted by another admin, and never if it would leave zero admins.
+    if (user_is_admin($user_id)) {
+        if (!user_is_admin($actor_user_id)) return [false, 'Only another admin can delete an admin user.'];
+        if (active_admin_count() <= 1) return [false, 'You cannot delete the last active admin user.'];
+    }
+
+    return [true, ''];
+}
+function delete_user_account(int $user_id, int $actor_user_id): array {
+    [$ok, $reason] = can_delete_user_account($user_id, $actor_user_id);
+    if (!$ok) return [false, $reason];
+    $target = first('SELECT * FROM users WHERE id=?', [$user_id]);
+    audit('user.delete_requested','user',$user_id);
+    exec_sql('DELETE FROM user_password_tokens WHERE user_id=?', [$user_id]);
+    exec_sql('DELETE FROM user_roles WHERE user_id=?', [$user_id]);
+    exec_sql('DELETE FROM user_role_history WHERE user_id=?', [$user_id]);
+    exec_sql('UPDATE event_attendance SET marked_by_user_id=NULL WHERE marked_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE events SET created_by_user_id=NULL WHERE created_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE event_attachments SET uploaded_by_user_id=0 WHERE uploaded_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE equipment_loans SET approved_by_user_id=NULL WHERE approved_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE maintenance_logs SET completed_by_user_id=NULL WHERE completed_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE equipment_maintenance_tickets SET assigned_user_id=NULL WHERE assigned_user_id=?', [$user_id]);
+    exec_sql('UPDATE equipment_maintenance_tickets SET created_by_user_id=NULL WHERE created_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE committee_actions SET assigned_user_id=NULL WHERE assigned_user_id=?', [$user_id]);
+    exec_sql('UPDATE committee_actions SET created_by_user_id=NULL WHERE created_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE committee_action_updates SET created_by_user_id=NULL WHERE created_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE brickworks_progress SET reviewed_by_user_id=NULL WHERE reviewed_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE brickworks_evidence SET uploaded_by_user_id=0 WHERE uploaded_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE brickworks_awards SET awarded_by_user_id=NULL WHERE awarded_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE subscription_payments SET recorded_by_user_id=NULL WHERE recorded_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE member_consents SET recorded_by_user_id=NULL WHERE recorded_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE member_status_history SET changed_by_user_id=NULL WHERE changed_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE emails SET created_by_user_id=0 WHERE created_by_user_id=?', [$user_id]);
+    exec_sql('UPDATE email_attachments SET uploaded_by_user_id=0 WHERE uploaded_by_user_id=?', [$user_id]);
+    exec_sql('DELETE FROM notifications WHERE user_id=?', [$user_id]);
+    exec_sql('DELETE FROM users WHERE id=?', [$user_id]);
+    audit('user.deleted','user',$user_id,'success',null,['email'=>$target['email'] ?? null]);
+    return [true, 'User deleted.'];
+}
+function can_delete_member_record(int $member_id, int $actor_user_id): array {
+    $member = first('SELECT * FROM members WHERE id=?', [$member_id]);
+    if (!$member) return [false, 'Member not found.'];
+    if (!has_permission('edit_membership_db')) return [false, 'You do not have permission to delete member records.'];
+    $linkedUsers = all('SELECT id FROM users WHERE member_id=?', [$member_id]);
+    foreach ($linkedUsers as $lu) {
+        $uid = (int)$lu['id'];
+        if ($uid === $actor_user_id) return [false, 'You cannot delete the member record linked to your own logged-in account.'];
+        $roles = user_roles($uid);
+        if (in_array('admin', $roles, true)) {
+            if (!user_is_admin($actor_user_id)) return [false, 'This member is linked to an admin user. Only another admin can delete it.'];
+            if (active_admin_count() <= 1) return [false, 'This member is linked to the last active admin user, so it cannot be deleted.'];
+        }
+        if (!user_is_admin($actor_user_id)) return [false, 'This member has a linked user account. Only admins can delete linked users.'];
+    }
+    return [true, ''];
+}
+function delete_member_record(int $member_id, int $actor_user_id): array {
+    [$ok, $reason] = can_delete_member_record($member_id, $actor_user_id);
+    if (!$ok) return [false, $reason];
+    $member = first('SELECT * FROM members WHERE id=?', [$member_id]);
+    audit('member.delete_requested','member',$member_id);
+
+    $linkedUsers = all('SELECT id FROM users WHERE member_id=?', [$member_id]);
+    foreach ($linkedUsers as $lu) {
+        [$uok, $ureason] = delete_user_account((int)$lu['id'], $actor_user_id);
+        if (!$uok) return [false, $ureason];
+    }
+
+    $participant = first('SELECT id FROM brickworks_participants WHERE member_id=?', [$member_id]);
+    if ($participant) {
+        $progressIds = array_column(all('SELECT id FROM brickworks_progress WHERE participant_id=?', [(int)$participant['id']]), 'id');
+        foreach ($progressIds as $pid) {
+            $evidenceRows = all('SELECT encrypted_file_path FROM brickworks_evidence WHERE progress_id=?', [(int)$pid]);
+            foreach ($evidenceRows as $er) {
+                $file = decrypt_value($er['encrypted_file_path'] ?? '');
+                $rp = $file ? realpath($file) : false;
+                $private = realpath(PRIVATE_PATH) ?: PRIVATE_PATH;
+                if ($rp && is_file($rp) && str_starts_with($rp, $private)) @unlink($rp);
+            }
+            exec_sql('DELETE FROM brickworks_evidence WHERE progress_id=?', [(int)$pid]);
+        }
+        exec_sql('DELETE FROM brickworks_progress WHERE participant_id=?', [(int)$participant['id']]);
+        exec_sql('DELETE FROM brickworks_awards WHERE participant_id=?', [(int)$participant['id']]);
+        exec_sql('DELETE FROM brickworks_participants WHERE id=?', [(int)$participant['id']]);
+    }
+
+    exec_sql('DELETE FROM member_consents WHERE member_id=?', [$member_id]);
+    exec_sql('DELETE FROM member_directory_preferences WHERE member_id=?', [$member_id]);
+    exec_sql('DELETE FROM member_email_preferences WHERE member_id=?', [$member_id]);
+    exec_sql('DELETE FROM member_status_history WHERE member_id=?', [$member_id]);
+    exec_sql('DELETE FROM subscription_payments WHERE member_id=?', [$member_id]);
+    exec_sql('DELETE FROM event_attendance WHERE member_id=?', [$member_id]);
+    exec_sql('DELETE FROM equipment_loans WHERE member_id=?', [$member_id]);
+    exec_sql('UPDATE committee_actions SET assigned_member_id=NULL WHERE assigned_member_id=?', [$member_id]);
+    exec_sql('DELETE FROM notifications WHERE member_id=?', [$member_id]);
+    exec_sql('DELETE FROM email_recipients WHERE member_id=?', [$member_id]);
+    exec_sql('DELETE FROM members WHERE id=?', [$member_id]);
+    audit('member.deleted','member',$member_id,'success',null,['name'=>trim(($member['first_name'] ?? '') . ' ' . ($member['last_name'] ?? '')), 'callsign'=>$member['callsign'] ?? null]);
+    return [true, 'Member deleted.'];
+}
+
 function attendance_stats(int $member_id): array {
     $signed = first('SELECT COUNT(*) c FROM event_attendance WHERE member_id=? AND status IN ("signed_up","attended","did_not_attend")',[$member_id])['c'] ?? 0;
     $att = first('SELECT COUNT(*) c FROM event_attendance WHERE member_id=? AND attended=1',[$member_id])['c'] ?? 0;
@@ -1236,6 +1352,12 @@ if (route() === 'members') {
     require_permission('view_membership_db'); audit('member_database.view'); page_header('Membership Database');
     if ($_SERVER['REQUEST_METHOD']==='POST') {
         require_permission('edit_membership_db'); require_csrf();
+        if (isset($_POST['delete_member'])) {
+            $deleteId = (int)($_POST['member_id'] ?? 0);
+            [$ok, $msg] = delete_member_record($deleteId, (int)$u['id']);
+            flash($msg);
+            redirect('members');
+        }
         $membershipNumber = can_edit_membership_number() ? trim($_POST['membership_number'] ?? '') : null;
         $joinedBeforeSystem = isset($_POST['joined_before_system']) ? 1 : 0;
         $dateJoined = $joinedBeforeSystem ? '' : trim($_POST['date_joined'] ?? '');
@@ -1245,7 +1367,12 @@ if (route() === 'members') {
     }
     $rows = all('SELECT * FROM members ORDER BY last_name, first_name');
     echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Membership database</h1><a class="btn" href="?route=member_export">Export all members spreadsheet</a></div><table><tr><th>No.</th><th>Name</th><th>Callsign</th><th>Status</th><th>Joined</th><th>Renewal</th><th>Attendance</th><th>Action</th></tr>';
-    foreach($rows as $m){ $st=attendance_stats((int)$m['id']); echo '<tr><td>'.e($m['membership_number']).'</td><td>'.e($m['first_name'].' '.$m['last_name']).'</td><td>'.e($m['callsign']).'</td><td>'.e($m['membership_status']).'</td><td>'.e(member_joined_display($m)).'</td><td>'.e($m['renewal_date']).'</td><td>'.e($st['signup_percent']===null?'N/A':$st['signup_percent'].'%').'</td><td><a class="btn secondary" href="?route=member_view&id='.e($m['id']).'">Open</a></td></tr>'; }
+    foreach($rows as $m){
+        $st=attendance_stats((int)$m['id']);
+        echo '<tr><td>'.e($m['membership_number']).'</td><td>'.e($m['first_name'].' '.$m['last_name']).'</td><td>'.e($m['callsign']).'</td><td>'.e($m['membership_status']).'</td><td>'.e(member_joined_display($m)).'</td><td>'.e($m['renewal_date']).'</td><td>'.e($st['signup_percent']===null?'N/A':$st['signup_percent'].'%').'</td><td><div class="toolbar"><a class="btn secondary" href="?route=member_view&id='.e($m['id']).'">Open</a>';
+        if (has_permission('edit_membership_db')) echo '<form method="post" onsubmit="return confirm(&quot;Delete this member and all linked records? This cannot be undone.&quot;)">'.csrf_field().'<input type="hidden" name="delete_member" value="1"><input type="hidden" name="member_id" value="'.e($m['id']).'"><button class="danger">Delete</button></form>';
+        echo '</div></td></tr>';
+    }
     echo '</table></div><div class="card"><h2>Add member</h2><form method="post">'.csrf_field().'<div class="two">';
     if (can_edit_membership_number()) echo '<div><label>Membership number</label><input name="membership_number"></div>';
     echo '<div><label>Callsign</label><input name="callsign"></div><div><label>First name</label><input name="first_name" required></div><div><label>Surname</label><input name="last_name" required></div><div><label>Email</label><input name="email" type="email" required></div><div><label>Licence level</label><input name="licence_level"></div><div><label>Phone</label><input name="phone"></div><div class="full"><label>Address</label><textarea name="address"></textarea></div><div class="full"><h3>Emergency contact</h3></div><div><label>Emergency contact name</label><input name="emergency_contact_name"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone"></div><div><label>Membership type</label><input name="membership_type"></div><div><label>Date joined</label><input name="date_joined" type="date"></div><div><label>Renewal date</label><input name="renewal_date" type="date"></div><div><label>Membership status</label><select name="membership_status"><option>active</option><option>pending</option><option>expired</option><option>former</option><option>suspended</option><option>honorary</option></select></div></div><label><input type="checkbox" name="joined_before_system"> Joined before system / date not on record</label><h3>Consents</h3>'.render_consent_checkboxes(0).'<p class="muted">Consents can also be set after the member has been created.</p><button>Add member</button></form></div>';
@@ -1348,6 +1475,11 @@ if (route() === 'member_view') {
     require_permission('view_membership_db'); $id=(int)($_GET['id']??0); $m=first('SELECT * FROM members WHERE id=?',[$id]); if(!$m) redirect('members'); audit('member.view','member',$id);
     if ($_SERVER['REQUEST_METHOD']==='POST') {
         require_permission('edit_membership_db'); require_csrf();
+        if (isset($_POST['delete_member'])) {
+            [$ok, $msg] = delete_member_record($id, (int)$u['id']);
+            flash($msg);
+            redirect('members');
+        }
         if (isset($_POST['add_payment'])) { exec_sql('INSERT INTO subscription_payments (member_id,subscription_year,amount_due,amount_paid,payment_date,payment_method,payment_reference,receipt_number,status,recorded_by_user_id,notes_encrypted,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime("now"),datetime("now"))',[$id,(int)$_POST['subscription_year'],(float)$_POST['amount_due'],(float)$_POST['amount_paid'],$_POST['payment_date'],$_POST['payment_method'],$_POST['payment_reference'],$_POST['receipt_number'],$_POST['status'],$u['id'],encrypt_value($_POST['notes']??'')]); audit('subscription.create','member',$id); flash('Payment/subs record added.'); redirect('member_view&id='.$id); }
         $membershipNumber = can_edit_membership_number() ? trim($_POST['membership_number'] ?? '') : $m['membership_number'];
         $joinedBeforeSystem = isset($_POST['joined_before_system']) ? 1 : 0;
@@ -1358,7 +1490,9 @@ if (route() === 'member_view') {
         audit('member.update','member',$id,'success',null,['membership_number_changed'=>can_edit_membership_number()]); flash('Member updated.'); redirect('member_view&id='.$id);
     }
     page_header('Member record'); $stats=attendance_stats($id);
-    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">'.e($m['first_name'].' '.$m['last_name']).'</h1><a class="btn secondary" href="?route=member_export">Export all members spreadsheet</a></div><form method="post">'.csrf_field().'<div class="two">';
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">'.e($m['first_name'].' '.$m['last_name']).'</h1><a class="btn secondary" href="?route=member_export">Export all members spreadsheet</a>';
+    if (has_permission('edit_membership_db')) echo '<form method="post" onsubmit="return confirm(&quot;Delete this member and all linked records? This cannot be undone.&quot;)" style="display:inline">'.csrf_field().'<input type="hidden" name="delete_member" value="1"><button class="danger">Delete member</button></form>';
+    echo '</div><form method="post">'.csrf_field().'<div class="two">';
     if (can_edit_membership_number()) echo '<div><label>Membership number</label><input name="membership_number" value="'.e($m['membership_number']).'"></div>'; else echo '<div><label>Membership number</label><p><strong>'.e($m['membership_number'] ?: 'Not set').'</strong><br><span class="muted">Only admin users can change this.</span></p></div>';
     echo '<div><label>Callsign</label><input name="callsign" value="'.e($m['callsign']).'"></div><div><label>First name</label><input name="first_name" value="'.e($m['first_name']).'"></div><div><label>Surname</label><input name="last_name" value="'.e($m['last_name']).'"></div><div><label>Email address</label><input type="email" name="email" value="'.e($m['email']).'"></div><div><label>Licence level</label><input name="licence_level" value="'.e($m['licence_level']).'"></div><div><label>Phone number</label><input name="phone" value="'.e(decrypt_value($m['phone_encrypted'])).'"></div><div class="full"><label>Address</label><textarea name="address">'.e(decrypt_value($m['address_encrypted'])).'</textarea></div><div class="full"><h2>Emergency contact</h2></div><div><label>Emergency contact name</label><input name="emergency_contact_name" value="'.e(decrypt_value($m['emergency_contact_name_encrypted'] ?? '')).'"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship" value="'.e(decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '')).'"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone" value="'.e(decrypt_value($m['emergency_contact_phone_encrypted'] ?? '')).'"></div><div><label>Membership type</label><input name="membership_type" value="'.e($m['membership_type']).'"></div><div><label>Date joined</label><input type="date" name="date_joined" value="'.e($m['date_joined']).'"><label class="small"><input type="checkbox" name="joined_before_system" '.(!empty($m['joined_before_system'])?'checked':'').'> Not on record / joined before system</label></div><div><label>Renewal date</label><input type="date" name="renewal_date" value="'.e($m['renewal_date']).'"></div><div><label>Membership status</label><select name="membership_status">'; foreach(['pending','active','expired','former','suspended','honorary','life_member'] as $s) echo '<option '.($m['membership_status']===$s?'selected':'').'>'.e($s).'</option>'; echo '</select></div></div><h2>Consents</h2><p class="muted">Visible and editable by Member DB users and admins.</p>'.render_consent_checkboxes($id).'<label>Private notes</label><textarea name="notes">'.e(decrypt_value($m['notes_encrypted'])).'</textarea><button>Save member</button></form></div>';
     echo '<div class="grid"><div class="card"><h2>Attendance</h2><p>Attended: '.e($stats['attended']).'</p><p>Signed up: '.e($stats['signed_up']).'</p><p>Signup attendance: '.e($stats['signup_percent']===null?'N/A':$stats['signup_percent'].'%').'</p><p>Overall attendance: '.e($stats['overall_percent']===null?'N/A':$stats['overall_percent'].'%').'</p></div>';
@@ -1371,6 +1505,13 @@ if (route() === 'member_view') {
 if (route() === 'users') {
     require_permission('manage_users'); page_header('Users'); audit('users.view');
     if ($_SERVER['REQUEST_METHOD']==='POST') { require_csrf();
+        if (isset($_POST['delete_user'])) {
+            require_permission('manage_users');
+            $targetUserId = (int)($_POST['user_id'] ?? 0);
+            [$ok, $msg] = delete_user_account($targetUserId, (int)$u['id']);
+            flash($msg);
+            redirect('users');
+        }
         if (isset($_POST['reset_password'])) {
             require_permission('reset_passwords');
             $new=$_POST['new_password'];
@@ -1438,7 +1579,7 @@ if (route() === 'users') {
     $canReset = has_permission('reset_passwords');
     $allRoles = all('SELECT name, display_name, description FROM roles ORDER BY CASE name WHEN "member" THEN 1 WHEN "committee" THEN 2 WHEN "member_db" THEN 3 WHEN "brickworks_reviewer" THEN 4 WHEN "equipment_manager" THEN 5 WHEN "event_manager" THEN 6 WHEN "treasurer" THEN 7 WHEN "admin" THEN 99 ELSE 50 END, display_name');
     $users=all('SELECT u.*,m.first_name,m.last_name,m.callsign FROM users u LEFT JOIN members m ON m.id=u.member_id ORDER BY u.created_at DESC');
-    echo '<div class="card"><h1>Users</h1><p class="muted">Admins can create users, send invites, send password reset emails and manage roles. Invite/reset links ask the user to set their own password.</p><table><tr><th>Email</th><th>Member</th><th>Status</th><th>Roles</th><th>Access emails / password</th></tr>';
+    echo '<div class="card"><h1>Users</h1><p class="muted">Admins can create users, send invites, send password reset emails and manage roles. Invite/reset links ask the user to set their own password.</p><table><tr><th>Email</th><th>Member</th><th>Status</th><th>Roles</th><th>Access emails / password</th><th>Delete</th></tr>';
     foreach($users as $usr){
         $currentRoles = user_roles((int)$usr['id']);
         $memberLabel = trim(($usr['first_name']??'').' '.($usr['last_name']??'')).($usr['callsign']?' ('.$usr['callsign'].')':'');
@@ -1457,7 +1598,10 @@ if (route() === 'users') {
         echo '<form method="post">'.csrf_field().'<input type="hidden" name="send_invite_existing" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><button class="secondary">Send invite</button></form>';
         if ($canReset) echo '<form method="post">'.csrf_field().'<input type="hidden" name="send_reset_email" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><button>Send password reset email</button></form>';
         if ($canReset) echo '<details><summary>Manual temp password</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="reset_password" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><input name="new_password" placeholder="New temp password"><button>Set temp password</button></form></details>';
-        echo '</div></td></tr>';
+        echo '</div></td><td>';
+        if (is_admin_user() && (int)$usr['id'] !== (int)$u['id']) echo '<form method="post" onsubmit="return confirm(&quot;Delete this user account? This cannot be undone. The linked member record will not be deleted.&quot;)">'.csrf_field().'<input type="hidden" name="delete_user" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><button class="danger">Delete user</button></form>';
+        else echo '<span class="muted">Not available</span>';
+        echo '</td></tr>';
     }
     echo '</table></div>';
 
