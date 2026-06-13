@@ -247,23 +247,22 @@ Admin can:
 
 The next step should be replacing the basic email sender with a real SMTP/MIME mailer and improving the role-management UI, so admins can assign/remove multiple roles directly in the app.
 
-## Update notes - directory, membership numbers, join dates and consents
+## Update notes - Programme, committee menu and Brickworks dashboard
 
-This build updates the member/profile workflow:
+This build adds the requested programme/events improvements:
 
-- The internal directory now shows **Name** then **Callsign** only.
-- Members opt into the internal directory using one simple profile checkbox.
-- Admin users only can manually set or change membership numbers.
-- Member DB users can still view membership numbers, but cannot edit them unless they are also Admin.
-- Member record fields now have labels above the inputs.
-- Member profiles show membership number and date joined.
-- Member records now support **Joined before system / date not on record**.
-- Consents have been simplified to:
-  - Email communications
-  - Text messages
-  - WhatsApp community opt-in
-- Members can edit their own consents from My Profile.
-- Member DB users and Admins can view/edit consents from the membership database.
-- Email sending now only includes active members who have consented to email communications.
+- Programme / Events page now has list view and calendar view toggles.
+- Event add form is only shown to users with the Committee Member or Admin role.
+- Event detail pages show full description, timings, location, max attendees and attachments.
+- Committee/Admin users see event attendance, edit and delete controls on the event detail page.
+- Event attachments are stored privately under `storage/private/event-attachments` and downloaded through authenticated routes.
+- The main navigation has been streamlined. Admin/committee users get a Committee dropdown containing:
+  - Members
+  - Users
+  - Attendance tracking
+  - Audit logs
+  - Emails
+- A Brickworks leaderboard is now shown on the dashboard.
+- A dedicated attendance tracking page lists event signup and attendance totals.
 
-When updating a live install, keep using the existing rsync method and exclude `database/` and `storage/`. The app will add the new `joined_before_system` database column automatically after login.
+Note: routes remain permission-protected. The Committee dropdown is only visible to Committee/Admin roles, but access to sensitive pages such as the membership database, users and audit logs still depends on the existing permissions.
