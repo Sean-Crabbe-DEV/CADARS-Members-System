@@ -142,6 +142,35 @@ function audit(string $action, ?string $entity_type=null, ?int $entity_id=null, 
 function first(string $sql, array $args=[]): ?array { $s=db()->prepare($sql); $s->execute($args); $r=$s->fetch(PDO::FETCH_ASSOC); return $r ?: null; }
 function all(string $sql, array $args=[]): array { $s=db()->prepare($sql); $s->execute($args); return $s->fetchAll(PDO::FETCH_ASSOC); }
 function exec_sql(string $sql, array $args=[]): void { $s=db()->prepare($sql); $s->execute($args); }
+function csv_download(string $filename, array $headers, array $rows): void {
+    header('Content-Type: text/csv; charset=UTF-8');
+    header('Content-Disposition: attachment; filename="' . preg_replace('/[^A-Za-z0-9._-]/', '_', $filename) . '"');
+    header('Pragma: no-cache');
+    header('Expires: 0');
+    echo "ï»¿";
+    $out = fopen('php://output', 'w');
+    fputcsv($out, $headers);
+    foreach ($rows as $row) fputcsv($out, $row);
+    fclose($out);
+    exit;
+}
+function emergency_contact_summary(array $m): string {
+    $name = decrypt_value($m['emergency_contact_name_encrypted'] ?? '') ?: '';
+    $rel = decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '') ?: '';
+    $phone = decrypt_value($m['emergency_contact_phone_encrypted'] ?? '') ?: '';
+    if ($name || $rel || $phone) return trim($name . ($rel ? ' (' . $rel . ')' : '') . ($phone ? ' - ' . $phone : ''));
+    return decrypt_value($m['emergency_contact_encrypted'] ?? '') ?: '';
+}
+function record_action_history(int $action_id, string $type, string $note='', array $changes=[]): void {
+    $u = current_user();
+    exec_sql('INSERT INTO committee_action_updates (action_id, update_type, update_encrypted, changes_json, created_by_user_id, created_at) VALUES (?,?,?,?,?,datetime("now"))', [
+        $action_id,
+        $type,
+        encrypt_value($note),
+        $changes ? json_encode($changes) : null,
+        $u['id'] ?? null
+    ]);
+}
 function has_role(string $role): bool { $u=current_user(); return $u ? in_array($role, user_roles((int)$u['id']), true) : false; }
 function is_committee_or_admin(): bool { return has_role('committee') || has_role('admin'); }
 function can_manage_events(): bool { return is_committee_or_admin(); }
@@ -187,6 +216,15 @@ function table_has_column(string $table, string $column): bool {
 function ensure_schema_updates(): void {
     if (!table_has_column('members', 'joined_before_system')) {
         db()->exec('ALTER TABLE members ADD COLUMN joined_before_system INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!table_has_column('members', 'emergency_contact_name_encrypted')) {
+        db()->exec('ALTER TABLE members ADD COLUMN emergency_contact_name_encrypted TEXT NULL');
+    }
+    if (!table_has_column('members', 'emergency_contact_relationship_encrypted')) {
+        db()->exec('ALTER TABLE members ADD COLUMN emergency_contact_relationship_encrypted TEXT NULL');
+    }
+    if (!table_has_column('members', 'emergency_contact_phone_encrypted')) {
+        db()->exec('ALTER TABLE members ADD COLUMN emergency_contact_phone_encrypted TEXT NULL');
     }
     if (!table_has_column('equipment', 'purchase_date')) {
         db()->exec('ALTER TABLE equipment ADD COLUMN purchase_date TEXT NULL');
@@ -234,6 +272,15 @@ function ensure_schema_updates(): void {
         completed_at TEXT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+    )');
+    db()->exec('CREATE TABLE IF NOT EXISTS committee_action_updates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        action_id INTEGER NOT NULL,
+        update_type TEXT NOT NULL DEFAULT "note",
+        update_encrypted TEXT NULL,
+        changes_json TEXT NULL,
+        created_by_user_id INTEGER NULL,
+        created_at TEXT NOT NULL
     )');
 }
 function is_admin_user(): bool { return has_role('admin'); }
@@ -387,6 +434,9 @@ CREATE TABLE IF NOT EXISTS members (
  phone_encrypted TEXT NULL,
  address_encrypted TEXT NULL,
  emergency_contact_encrypted TEXT NULL,
+ emergency_contact_name_encrypted TEXT NULL,
+ emergency_contact_relationship_encrypted TEXT NULL,
+ emergency_contact_phone_encrypted TEXT NULL,
  date_joined TEXT NULL,
  joined_before_system INTEGER NOT NULL DEFAULT 0,
  date_left TEXT NULL,
@@ -585,6 +635,15 @@ CREATE TABLE IF NOT EXISTS committee_actions (
  completed_at TEXT NULL,
  created_at TEXT NOT NULL,
  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS committee_action_updates (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ action_id INTEGER NOT NULL,
+ update_type TEXT NOT NULL DEFAULT 'note',
+ update_encrypted TEXT NULL,
+ changes_json TEXT NULL,
+ created_by_user_id INTEGER NULL,
+ created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS brickworks_themes (
  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -912,7 +971,8 @@ if (route() === 'profile') {
     $m = first('SELECT * FROM members WHERE id=?',[$u['member_id']]); if (!$m) exit('No member record linked.');
     if ($_SERVER['REQUEST_METHOD']==='POST') {
         require_csrf();
-        exec_sql('UPDATE members SET first_name=?, last_name=?, callsign=?, licence_level=?, email=?, phone_encrypted=?, address_encrypted=?, emergency_contact_encrypted=?, data_last_confirmed_at=datetime("now"), updated_at=datetime("now") WHERE id=?', [trim($_POST['first_name']),trim($_POST['last_name']),trim($_POST['callsign']),trim($_POST['licence_level']),trim($_POST['email']),encrypt_value(trim($_POST['phone'] ?? '')),encrypt_value(trim($_POST['address'] ?? '')),encrypt_value(trim($_POST['emergency_contact'] ?? '')),$m['id']]);
+        $emergencySummary = trim(($_POST['emergency_contact_name'] ?? '') . ' | ' . ($_POST['emergency_contact_relationship'] ?? '') . ' | ' . ($_POST['emergency_contact_phone'] ?? ''));
+        exec_sql('UPDATE members SET first_name=?, last_name=?, callsign=?, licence_level=?, email=?, phone_encrypted=?, address_encrypted=?, emergency_contact_encrypted=?, emergency_contact_name_encrypted=?, emergency_contact_relationship_encrypted=?, emergency_contact_phone_encrypted=?, data_last_confirmed_at=datetime("now"), updated_at=datetime("now") WHERE id=?', [trim($_POST['first_name']),trim($_POST['last_name']),trim($_POST['callsign']),trim($_POST['licence_level']),trim($_POST['email']),encrypt_value(trim($_POST['phone'] ?? '')),encrypt_value(trim($_POST['address'] ?? '')),encrypt_value($emergencySummary),encrypt_value(trim($_POST['emergency_contact_name'] ?? '')),encrypt_value(trim($_POST['emergency_contact_relationship'] ?? '')),encrypt_value(trim($_POST['emergency_contact_phone'] ?? '')),$m['id']]);
         exec_sql('UPDATE users SET email=?, updated_at=datetime("now") WHERE id=?',[trim($_POST['email']),$u['id']]);
         exec_sql('INSERT OR IGNORE INTO member_directory_preferences (member_id, created_at, updated_at) VALUES (?, datetime("now"), datetime("now"))',[$m['id']]);
         $directoryOptIn = isset($_POST['show_in_directory']) ? 1 : 0;
@@ -926,7 +986,7 @@ if (route() === 'profile') {
     audit('profile.view','member',(int)$m['id']);
     $dp = first('SELECT * FROM member_directory_preferences WHERE member_id=?',[$m['id']]) ?: [];
     page_header('My Profile');
-    echo '<div class="card"><h1>My Profile</h1><p><strong>Membership number:</strong> '.e($m['membership_number'] ?: 'Not set').'<br><strong>Date joined:</strong> '.e(member_joined_display($m)).'</p><form method="post">'.csrf_field().'<div class="two"><div><label>First name</label><input name="first_name" value="'.e($m['first_name']).'"></div><div><label>Surname</label><input name="last_name" value="'.e($m['last_name']).'"></div><div><label>Callsign</label><input name="callsign" value="'.e($m['callsign']).'"></div><div><label>Licence level</label><input name="licence_level" value="'.e($m['licence_level']).'"></div><div><label>Email</label><input type="email" name="email" value="'.e($m['email']).'"></div><div><label>Phone</label><input name="phone" value="'.e(decrypt_value($m['phone_encrypted'])).'"></div><div class="full"><label>Address</label><textarea name="address">'.e(decrypt_value($m['address_encrypted'])).'</textarea></div><div><label>Emergency contact</label><textarea name="emergency_contact">'.e(decrypt_value($m['emergency_contact_encrypted'])).'</textarea></div></div>';
+    echo '<div class="card"><h1>My Profile</h1><p><strong>Membership number:</strong> '.e($m['membership_number'] ?: 'Not set').'<br><strong>Date joined:</strong> '.e(member_joined_display($m)).'</p><form method="post">'.csrf_field().'<div class="two"><div><label>First name</label><input name="first_name" value="'.e($m['first_name']).'"></div><div><label>Surname</label><input name="last_name" value="'.e($m['last_name']).'"></div><div><label>Callsign</label><input name="callsign" value="'.e($m['callsign']).'"></div><div><label>Licence level</label><input name="licence_level" value="'.e($m['licence_level']).'"></div><div><label>Email</label><input type="email" name="email" value="'.e($m['email']).'"></div><div><label>Phone</label><input name="phone" value="'.e(decrypt_value($m['phone_encrypted'])).'"></div><div class="full"><label>Address</label><textarea name="address">'.e(decrypt_value($m['address_encrypted'])).'</textarea></div><div class="full"><h2>Emergency contact</h2></div><div><label>Emergency contact name</label><input name="emergency_contact_name" value="'.e(decrypt_value($m['emergency_contact_name_encrypted'] ?? '')).'"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship" value="'.e(decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '')).'"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone" value="'.e(decrypt_value($m['emergency_contact_phone_encrypted'] ?? '')).'"></div></div>';
     echo '<h2>Internal directory</h2><p class="muted">If enabled, the internal directory will show only your name and callsign to logged-in members.</p><label><input type="checkbox" name="show_in_directory" '.(!empty($dp['show_callsign'])?'checked':'').'> Show my name and callsign in the internal directory</label>';
     echo '<h2>Consents</h2><p class="muted">These control how the society may contact you.</p>'.render_consent_checkboxes((int)$m['id']).'<p><button>Save profile</button></p></form></div>';
     $payments = all('SELECT * FROM subscription_payments WHERE member_id=? ORDER BY subscription_year DESC',[$m['id']]);
@@ -949,7 +1009,8 @@ if (route() === 'members') {
         $membershipNumber = can_edit_membership_number() ? trim($_POST['membership_number'] ?? '') : null;
         $joinedBeforeSystem = isset($_POST['joined_before_system']) ? 1 : 0;
         $dateJoined = $joinedBeforeSystem ? '' : trim($_POST['date_joined'] ?? '');
-        exec_sql('INSERT INTO members (membership_number,first_name,last_name,callsign,licence_level,email,phone_encrypted,address_encrypted,date_joined,joined_before_system,renewal_date,membership_status,membership_type,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, datetime("now"), datetime("now"))', [$membershipNumber ?: null,trim($_POST['first_name']),trim($_POST['last_name']),trim($_POST['callsign']),trim($_POST['licence_level']),trim($_POST['email']),encrypt_value(trim($_POST['phone'])),encrypt_value(trim($_POST['address'])),$dateJoined,$joinedBeforeSystem,trim($_POST['renewal_date']),trim($_POST['membership_status']),trim($_POST['membership_type'])]);
+        $emergencySummary = trim(($_POST['emergency_contact_name'] ?? '') . ' | ' . ($_POST['emergency_contact_relationship'] ?? '') . ' | ' . ($_POST['emergency_contact_phone'] ?? ''));
+        exec_sql('INSERT INTO members (membership_number,first_name,last_name,callsign,licence_level,email,phone_encrypted,address_encrypted,emergency_contact_encrypted,emergency_contact_name_encrypted,emergency_contact_relationship_encrypted,emergency_contact_phone_encrypted,date_joined,joined_before_system,renewal_date,membership_status,membership_type,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime("now"), datetime("now"))', [$membershipNumber ?: null,trim($_POST['first_name']),trim($_POST['last_name']),trim($_POST['callsign']),trim($_POST['licence_level']),trim($_POST['email']),encrypt_value(trim($_POST['phone'])),encrypt_value(trim($_POST['address'])),encrypt_value($emergencySummary),encrypt_value(trim($_POST['emergency_contact_name'] ?? '')),encrypt_value(trim($_POST['emergency_contact_relationship'] ?? '')),encrypt_value(trim($_POST['emergency_contact_phone'] ?? '')),$dateJoined,$joinedBeforeSystem,trim($_POST['renewal_date']),trim($_POST['membership_status']),trim($_POST['membership_type'])]);
         $mid=(int)db()->lastInsertId(); exec_sql('INSERT INTO member_directory_preferences (member_id, created_at, updated_at) VALUES (?,datetime("now"),datetime("now"))',[$mid]); exec_sql('INSERT INTO member_email_preferences (member_id, created_at, updated_at) VALUES (?,datetime("now"),datetime("now"))',[$mid]); save_consent_post($mid, (int)$u['id']); audit('member.create','member',$mid); flash('Member added.'); redirect('members');
     }
     $rows = all('SELECT * FROM members ORDER BY last_name, first_name');
@@ -957,8 +1018,43 @@ if (route() === 'members') {
     foreach($rows as $m){ $st=attendance_stats((int)$m['id']); echo '<tr><td>'.e($m['membership_number']).'</td><td>'.e($m['first_name'].' '.$m['last_name']).'</td><td>'.e($m['callsign']).'</td><td>'.e($m['membership_status']).'</td><td>'.e(member_joined_display($m)).'</td><td>'.e($m['renewal_date']).'</td><td>'.e($st['signup_percent']===null?'N/A':$st['signup_percent'].'%').'</td><td><a class="btn secondary" href="?route=member_view&id='.e($m['id']).'">Open</a></td></tr>'; }
     echo '</table></div><div class="card"><h2>Add member</h2><form method="post">'.csrf_field().'<div class="two">';
     if (can_edit_membership_number()) echo '<div><label>Membership number</label><input name="membership_number"></div>';
-    echo '<div><label>Callsign</label><input name="callsign"></div><div><label>First name</label><input name="first_name" required></div><div><label>Surname</label><input name="last_name" required></div><div><label>Email</label><input name="email" type="email" required></div><div><label>Licence level</label><input name="licence_level"></div><div><label>Phone</label><input name="phone"></div><div class="full"><label>Address</label><textarea name="address"></textarea></div><div><label>Membership type</label><input name="membership_type"></div><div><label>Date joined</label><input name="date_joined" type="date"></div><div><label>Renewal date</label><input name="renewal_date" type="date"></div><div><label>Membership status</label><select name="membership_status"><option>active</option><option>pending</option><option>expired</option><option>former</option><option>suspended</option><option>honorary</option></select></div></div><label><input type="checkbox" name="joined_before_system"> Joined before system / date not on record</label><h3>Consents</h3>'.render_consent_checkboxes(0).'<p class="muted">Consents can also be set after the member has been created.</p><button>Add member</button></form></div>';
+    echo '<div><label>Callsign</label><input name="callsign"></div><div><label>First name</label><input name="first_name" required></div><div><label>Surname</label><input name="last_name" required></div><div><label>Email</label><input name="email" type="email" required></div><div><label>Licence level</label><input name="licence_level"></div><div><label>Phone</label><input name="phone"></div><div class="full"><label>Address</label><textarea name="address"></textarea></div><div class="full"><h3>Emergency contact</h3></div><div><label>Emergency contact name</label><input name="emergency_contact_name"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone"></div><div><label>Membership type</label><input name="membership_type"></div><div><label>Date joined</label><input name="date_joined" type="date"></div><div><label>Renewal date</label><input name="renewal_date" type="date"></div><div><label>Membership status</label><select name="membership_status"><option>active</option><option>pending</option><option>expired</option><option>former</option><option>suspended</option><option>honorary</option></select></div></div><label><input type="checkbox" name="joined_before_system"> Joined before system / date not on record</label><h3>Consents</h3>'.render_consent_checkboxes(0).'<p class="muted">Consents can also be set after the member has been created.</p><button>Add member</button></form></div>';
     page_footer(); exit;
+}
+
+
+if (route() === 'member_export') {
+    require_permission('export_member_data');
+    $id=(int)($_GET['id']??0);
+    $m=first('SELECT * FROM members WHERE id=?',[$id]);
+    if(!$m) redirect('members');
+    audit('member.export','member',$id);
+    $rows=[];
+    $rows[]=['Member details','Membership number',$m['membership_number'] ?? ''];
+    $rows[]=['Member details','Name',trim(($m['first_name']??'').' '.($m['last_name']??''))];
+    $rows[]=['Member details','Callsign',$m['callsign'] ?? ''];
+    $rows[]=['Member details','Licence level',$m['licence_level'] ?? ''];
+    $rows[]=['Member details','Email',$m['email'] ?? ''];
+    $rows[]=['Member details','Phone',decrypt_value($m['phone_encrypted'] ?? '') ?: ''];
+    $rows[]=['Member details','Address',decrypt_value($m['address_encrypted'] ?? '') ?: ''];
+    $rows[]=['Member details','Date joined',member_joined_display($m)];
+    $rows[]=['Member details','Renewal date',$m['renewal_date'] ?? ''];
+    $rows[]=['Member details','Membership status',$m['membership_status'] ?? ''];
+    $rows[]=['Member details','Membership type',$m['membership_type'] ?? ''];
+    $rows[]=['Emergency contact','Name',decrypt_value($m['emergency_contact_name_encrypted'] ?? '') ?: ''];
+    $rows[]=['Emergency contact','Relationship',decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '') ?: ''];
+    $rows[]=['Emergency contact','Phone',decrypt_value($m['emergency_contact_phone_encrypted'] ?? '') ?: ''];
+    foreach(consent_labels() as $type=>$label){ $rows[]=['Consent',$label,get_member_consent($id,$type)?'Yes':'No']; }
+    $stats=attendance_stats($id);
+    $rows[]=['Attendance','Events attended',$stats['attended'] ?? 0];
+    $rows[]=['Attendance','Events signed up',$stats['signed_up'] ?? 0];
+    $rows[]=['Attendance','Signup attendance %',$stats['signup_percent'] === null ? 'N/A' : $stats['signup_percent'].'%'];
+    $rows[]=['Attendance','Overall attendance %',$stats['overall_percent'] === null ? 'N/A' : $stats['overall_percent'].'%'];
+    $payments=all('SELECT * FROM subscription_payments WHERE member_id=? ORDER BY subscription_year DESC, payment_date DESC',[$id]);
+    foreach($payments as $p){
+        $rows[]=['Payment/subs',$p['subscription_year'].' '.$p['status'],'Due £'.number_format((float)$p['amount_due'],2).' / Paid £'.number_format((float)$p['amount_paid'],2).' / '.$p['payment_date'].' / '.$p['payment_method'].' / Ref '.$p['payment_reference'].' / Receipt '.$p['receipt_number']];
+    }
+    csv_download('member-'.($m['membership_number'] ?: $id).'-details.csv', ['Section','Field','Value'], $rows);
 }
 
 if (route() === 'member_view') {
@@ -969,14 +1065,15 @@ if (route() === 'member_view') {
         $membershipNumber = can_edit_membership_number() ? trim($_POST['membership_number'] ?? '') : $m['membership_number'];
         $joinedBeforeSystem = isset($_POST['joined_before_system']) ? 1 : 0;
         $dateJoined = $joinedBeforeSystem ? '' : trim($_POST['date_joined'] ?? '');
-        exec_sql('UPDATE members SET membership_number=?, first_name=?, last_name=?, callsign=?, licence_level=?, email=?, phone_encrypted=?, address_encrypted=?, date_joined=?, joined_before_system=?, renewal_date=?, membership_status=?, membership_type=?, notes_encrypted=?, updated_at=datetime("now") WHERE id=?',[$membershipNumber ?: null,trim($_POST['first_name']),trim($_POST['last_name']),trim($_POST['callsign']),trim($_POST['licence_level']),trim($_POST['email']),encrypt_value(trim($_POST['phone'])),encrypt_value(trim($_POST['address'])),$dateJoined,$joinedBeforeSystem,trim($_POST['renewal_date']),trim($_POST['membership_status']),trim($_POST['membership_type']),encrypt_value(trim($_POST['notes']??'')),$id]);
+        $emergencySummary = trim(($_POST['emergency_contact_name'] ?? '') . ' | ' . ($_POST['emergency_contact_relationship'] ?? '') . ' | ' . ($_POST['emergency_contact_phone'] ?? ''));
+        exec_sql('UPDATE members SET membership_number=?, first_name=?, last_name=?, callsign=?, licence_level=?, email=?, phone_encrypted=?, address_encrypted=?, emergency_contact_encrypted=?, emergency_contact_name_encrypted=?, emergency_contact_relationship_encrypted=?, emergency_contact_phone_encrypted=?, date_joined=?, joined_before_system=?, renewal_date=?, membership_status=?, membership_type=?, notes_encrypted=?, updated_at=datetime("now") WHERE id=?',[$membershipNumber ?: null,trim($_POST['first_name']),trim($_POST['last_name']),trim($_POST['callsign']),trim($_POST['licence_level']),trim($_POST['email']),encrypt_value(trim($_POST['phone'])),encrypt_value(trim($_POST['address'])),encrypt_value($emergencySummary),encrypt_value(trim($_POST['emergency_contact_name'] ?? '')),encrypt_value(trim($_POST['emergency_contact_relationship'] ?? '')),encrypt_value(trim($_POST['emergency_contact_phone'] ?? '')),$dateJoined,$joinedBeforeSystem,trim($_POST['renewal_date']),trim($_POST['membership_status']),trim($_POST['membership_type']),encrypt_value(trim($_POST['notes']??'')),$id]);
         save_consent_post($id, (int)$u['id']);
         audit('member.update','member',$id,'success',null,['membership_number_changed'=>can_edit_membership_number()]); flash('Member updated.'); redirect('member_view&id='.$id);
     }
     page_header('Member record'); $stats=attendance_stats($id);
-    echo '<div class="card"><h1>'.e($m['first_name'].' '.$m['last_name']).'</h1><form method="post">'.csrf_field().'<div class="two">';
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">'.e($m['first_name'].' '.$m['last_name']).'</h1><a class="btn secondary" href="?route=member_export&id='.e($id).'">Export spreadsheet</a></div><form method="post">'.csrf_field().'<div class="two">';
     if (can_edit_membership_number()) echo '<div><label>Membership number</label><input name="membership_number" value="'.e($m['membership_number']).'"></div>'; else echo '<div><label>Membership number</label><p><strong>'.e($m['membership_number'] ?: 'Not set').'</strong><br><span class="muted">Only admin users can change this.</span></p></div>';
-    echo '<div><label>Callsign</label><input name="callsign" value="'.e($m['callsign']).'"></div><div><label>First name</label><input name="first_name" value="'.e($m['first_name']).'"></div><div><label>Surname</label><input name="last_name" value="'.e($m['last_name']).'"></div><div><label>Email address</label><input type="email" name="email" value="'.e($m['email']).'"></div><div><label>Licence level</label><input name="licence_level" value="'.e($m['licence_level']).'"></div><div><label>Phone number</label><input name="phone" value="'.e(decrypt_value($m['phone_encrypted'])).'"></div><div class="full"><label>Address</label><textarea name="address">'.e(decrypt_value($m['address_encrypted'])).'</textarea></div><div><label>Membership type</label><input name="membership_type" value="'.e($m['membership_type']).'"></div><div><label>Date joined</label><input type="date" name="date_joined" value="'.e($m['date_joined']).'"><label class="small"><input type="checkbox" name="joined_before_system" '.(!empty($m['joined_before_system'])?'checked':'').'> Not on record / joined before system</label></div><div><label>Renewal date</label><input type="date" name="renewal_date" value="'.e($m['renewal_date']).'"></div><div><label>Membership status</label><select name="membership_status">'; foreach(['pending','active','expired','former','suspended','honorary','life_member'] as $s) echo '<option '.($m['membership_status']===$s?'selected':'').'>'.e($s).'</option>'; echo '</select></div></div><h2>Consents</h2><p class="muted">Visible and editable by Member DB users and admins.</p>'.render_consent_checkboxes($id).'<label>Private notes</label><textarea name="notes">'.e(decrypt_value($m['notes_encrypted'])).'</textarea><button>Save member</button></form></div>';
+    echo '<div><label>Callsign</label><input name="callsign" value="'.e($m['callsign']).'"></div><div><label>First name</label><input name="first_name" value="'.e($m['first_name']).'"></div><div><label>Surname</label><input name="last_name" value="'.e($m['last_name']).'"></div><div><label>Email address</label><input type="email" name="email" value="'.e($m['email']).'"></div><div><label>Licence level</label><input name="licence_level" value="'.e($m['licence_level']).'"></div><div><label>Phone number</label><input name="phone" value="'.e(decrypt_value($m['phone_encrypted'])).'"></div><div class="full"><label>Address</label><textarea name="address">'.e(decrypt_value($m['address_encrypted'])).'</textarea></div><div class="full"><h2>Emergency contact</h2></div><div><label>Emergency contact name</label><input name="emergency_contact_name" value="'.e(decrypt_value($m['emergency_contact_name_encrypted'] ?? '')).'"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship" value="'.e(decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '')).'"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone" value="'.e(decrypt_value($m['emergency_contact_phone_encrypted'] ?? '')).'"></div><div><label>Membership type</label><input name="membership_type" value="'.e($m['membership_type']).'"></div><div><label>Date joined</label><input type="date" name="date_joined" value="'.e($m['date_joined']).'"><label class="small"><input type="checkbox" name="joined_before_system" '.(!empty($m['joined_before_system'])?'checked':'').'> Not on record / joined before system</label></div><div><label>Renewal date</label><input type="date" name="renewal_date" value="'.e($m['renewal_date']).'"></div><div><label>Membership status</label><select name="membership_status">'; foreach(['pending','active','expired','former','suspended','honorary','life_member'] as $s) echo '<option '.($m['membership_status']===$s?'selected':'').'>'.e($s).'</option>'; echo '</select></div></div><h2>Consents</h2><p class="muted">Visible and editable by Member DB users and admins.</p>'.render_consent_checkboxes($id).'<label>Private notes</label><textarea name="notes">'.e(decrypt_value($m['notes_encrypted'])).'</textarea><button>Save member</button></form></div>';
     echo '<div class="grid"><div class="card"><h2>Attendance</h2><p>Attended: '.e($stats['attended']).'</p><p>Signed up: '.e($stats['signed_up']).'</p><p>Signup attendance: '.e($stats['signup_percent']===null?'N/A':$stats['signup_percent'].'%').'</p><p>Overall attendance: '.e($stats['overall_percent']===null?'N/A':$stats['overall_percent'].'%').'</p></div>';
     $payments=all('SELECT * FROM subscription_payments WHERE member_id=? ORDER BY subscription_year DESC',[$id]); echo '<div class="card"><h2>Payment/subs history</h2><table><tr><th>Year</th><th>Due</th><th>Paid</th><th>Date</th><th>Status</th></tr>'; foreach($payments as $p) echo '<tr><td>'.e($p['subscription_year']).'</td><td>£'.e(number_format($p['amount_due'],2)).'</td><td>£'.e(number_format($p['amount_paid'],2)).'</td><td>'.e($p['payment_date']).'</td><td>'.e($p['status']).'</td></tr>'; echo '</table></div></div>';
     echo '<div class="card"><h2>Add subs/payment record</h2><form method="post">'.csrf_field().'<input type="hidden" name="add_payment" value="1"><div class="two"><input type="number" name="subscription_year" value="'.date('Y').'" required><input type="number" step="0.01" name="amount_due" placeholder="Amount due" required><input type="number" step="0.01" name="amount_paid" placeholder="Amount paid" required><input type="date" name="payment_date"><input name="payment_method" placeholder="Payment method"><input name="payment_reference" placeholder="Payment reference"><input name="receipt_number" placeholder="Receipt number"><select name="status"><option>unpaid</option><option>part-paid</option><option>paid</option><option>waived</option><option>refunded</option></select></div><textarea name="notes" placeholder="Notes"></textarea><button>Add payment record</button></form></div>';
@@ -1051,31 +1148,78 @@ if (route() === 'equipment_view') {
 
 if (route() === 'committee_actions') {
     require_permission('view_committee_actions'); audit('committee_actions.view'); page_header('Committee actions');
-    $users=all('SELECT u.id,u.email,m.first_name,m.last_name,m.callsign FROM users u LEFT JOIN members m ON m.id=u.member_id WHERE u.status="active" ORDER BY m.last_name,u.email');
     $members=all('SELECT id,first_name,last_name,callsign FROM members WHERE membership_status IN ("active","honorary","life_member") ORDER BY last_name,first_name');
     if ($_SERVER['REQUEST_METHOD']==='POST') { require_permission('manage_committee_actions'); require_csrf();
         if (isset($_POST['add_action'])) {
             exec_sql('INSERT INTO committee_actions (title,status,priority,action_required,description_encrypted,due_date,assigned_user_id,assigned_member_id,created_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,datetime("now"),datetime("now"))',[
-                trim($_POST['title']),'open',trim($_POST['priority'] ?? 'normal'),trim($_POST['action_required']),encrypt_value(trim($_POST['description'] ?? '')),trim($_POST['due_date'] ?? ''),!empty($_POST['assigned_user_id'])?(int)$_POST['assigned_user_id']:null,!empty($_POST['assigned_member_id'])?(int)$_POST['assigned_member_id']:null,$u['id']
+                trim($_POST['title']),'open',trim($_POST['priority'] ?? 'normal'),trim($_POST['action_required']),encrypt_value(trim($_POST['description'] ?? '')),trim($_POST['due_date'] ?? ''),null,!empty($_POST['assigned_member_id'])?(int)$_POST['assigned_member_id']:null,$u['id']
             ]);
-            audit('committee_action.create','committee_action',(int)db()->lastInsertId()); flash('Committee action created.'); redirect('committee_actions');
+            $newId=(int)db()->lastInsertId();
+            record_action_history($newId, 'created', 'Action created', ['status'=>['from'=>null,'to'=>'open']]);
+            audit('committee_action.create','committee_action',$newId); flash('Committee action created.'); redirect('committee_actions');
+        }
+        if (isset($_POST['add_action_update'])) {
+            $aid=(int)$_POST['action_id'];
+            record_action_history($aid, 'update', trim($_POST['update_note'] ?? ''), []);
+            exec_sql('UPDATE committee_actions SET updated_at=datetime("now") WHERE id=?',[$aid]);
+            audit('committee_action.note','committee_action',$aid); flash('Update added.'); redirect('committee_actions');
         }
         if (isset($_POST['update_action'])) {
             $aid=(int)$_POST['action_id']; $status=$_POST['status'] ?? 'open';
-            exec_sql('UPDATE committee_actions SET title=?, status=?, priority=?, action_required=?, description_encrypted=?, due_date=?, assigned_user_id=?, assigned_member_id=?, completed_at=CASE WHEN ?="closed" THEN COALESCE(completed_at, datetime("now")) ELSE NULL END, updated_at=datetime("now") WHERE id=?',[
-                trim($_POST['title']),$status,trim($_POST['priority'] ?? 'normal'),trim($_POST['action_required']),encrypt_value(trim($_POST['description'] ?? '')),trim($_POST['due_date'] ?? ''),!empty($_POST['assigned_user_id'])?(int)$_POST['assigned_user_id']:null,!empty($_POST['assigned_member_id'])?(int)$_POST['assigned_member_id']:null,$status,$aid
+            $old=first('SELECT * FROM committee_actions WHERE id=?',[$aid]);
+            if (!$old) { flash('Action not found.'); redirect('committee_actions'); }
+            $newVals=[
+                'title'=>trim($_POST['title']),
+                'status'=>$status,
+                'priority'=>trim($_POST['priority'] ?? 'normal'),
+                'action_required'=>trim($_POST['action_required']),
+                'description'=>trim($_POST['description'] ?? ''),
+                'due_date'=>trim($_POST['due_date'] ?? ''),
+                'assigned_member_id'=>!empty($_POST['assigned_member_id'])?(int)$_POST['assigned_member_id']:null,
+            ];
+            $changes=[];
+            foreach(['title','status','priority','action_required','due_date','assigned_member_id'] as $field){
+                $oldVal=$old[$field] ?? null; $newVal=$newVals[$field] ?? null;
+                if ((string)$oldVal !== (string)$newVal) $changes[$field]=['from'=>$oldVal,'to'=>$newVal];
+            }
+            $oldDesc=decrypt_value($old['description_encrypted'] ?? '') ?: '';
+            if ($oldDesc !== $newVals['description']) $changes['description']=['from'=>'[previous description]','to'=>'[updated description]'];
+            exec_sql('UPDATE committee_actions SET title=?, status=?, priority=?, action_required=?, description_encrypted=?, due_date=?, assigned_user_id=NULL, assigned_member_id=?, completed_at=CASE WHEN ?="closed" THEN COALESCE(completed_at, datetime("now")) ELSE NULL END, updated_at=datetime("now") WHERE id=?',[
+                $newVals['title'],$newVals['status'],$newVals['priority'],$newVals['action_required'],encrypt_value($newVals['description']),$newVals['due_date'],$newVals['assigned_member_id'],$status,$aid
             ]);
-            audit('committee_action.update','committee_action',$aid); flash('Committee action updated.'); redirect('committee_actions');
+            record_action_history($aid, 'field_change', trim($_POST['update_note'] ?? ''), $changes);
+            audit('committee_action.update','committee_action',$aid,'success',null,['changes'=>array_keys($changes)]); flash('Committee action updated.'); redirect('committee_actions');
         }
     }
-    echo '<div class="card"><h1>Committee actions</h1><p class="muted">Track committee tasks/actions in a simple ticket-style list.</p></div>';
+    echo '<div class="card"><h1>Committee actions</h1><p class="muted">Track committee tasks/actions in a simple ticket-style list. Actions are assigned to members, and each ticket keeps an update/history log.</p></div>';
     if (has_permission('manage_committee_actions')) {
-        echo '<div class="card"><h2>Create action</h2><form method="post">'.csrf_field().'<input type="hidden" name="add_action" value="1"><div class="two"><div><label>Action title</label><input name="title" required></div><div><label>Priority</label><select name="priority"><option>low</option><option selected>normal</option><option>high</option><option>urgent</option></select></div><div><label>Due date</label><input type="date" name="due_date"></div><div><label>Assign to user</label><select name="assigned_user_id"><option value="">Unassigned</option>'; foreach($users as $usr) echo '<option value="'.e($usr['id']).'">'.e(trim(($usr['first_name']??'').' '.($usr['last_name']??'')).($usr['callsign']?' - '.$usr['callsign']:'').' / '.$usr['email']).'</option>'; echo '</select></div><div><label>Assign to member</label><select name="assigned_member_id"><option value="">None</option>'; foreach($members as $m) echo '<option value="'.e($m['id']).'">'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'' )).'</option>'; echo '</select></div></div><label>Action required</label><input name="action_required" required placeholder="What needs doing?"><label>Description</label><textarea name="description" placeholder="Notes, background, decisions, next steps"></textarea><button>Create action</button></form></div>';
+        echo '<div class="card"><h2>Create action</h2><form method="post">'.csrf_field().'<input type="hidden" name="add_action" value="1"><div class="two"><div><label>Action title</label><input name="title" required></div><div><label>Priority</label><select name="priority"><option>low</option><option selected>normal</option><option>high</option><option>urgent</option></select></div><div><label>Due date</label><input type="date" name="due_date"></div><div><label>Assign to member</label><select name="assigned_member_id"><option value="">Unassigned</option>'; foreach($members as $m) echo '<option value="'.e($m['id']).'">'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'' )).'</option>'; echo '</select></div></div><label>Action required</label><input name="action_required" required placeholder="What needs doing?"><label>Description</label><textarea name="description" placeholder="Notes, background, decisions, next steps"></textarea><button>Create action</button></form></div>';
     }
-    $actions=all('SELECT ca.*,u.email,m.first_name user_first,m.last_name user_last,am.first_name member_first,am.last_name member_last,am.callsign member_callsign FROM committee_actions ca LEFT JOIN users u ON u.id=ca.assigned_user_id LEFT JOIN members m ON m.id=u.member_id LEFT JOIN members am ON am.id=ca.assigned_member_id ORDER BY CASE ca.status WHEN "open" THEN 1 WHEN "in_progress" THEN 2 WHEN "closed" THEN 3 ELSE 4 END, date(ca.due_date) ASC, datetime(ca.created_at) DESC');
+    $actions=all('SELECT ca.*,am.first_name member_first,am.last_name member_last,am.callsign member_callsign FROM committee_actions ca LEFT JOIN members am ON am.id=ca.assigned_member_id ORDER BY CASE ca.status WHEN "open" THEN 1 WHEN "in_progress" THEN 2 WHEN "closed" THEN 3 ELSE 4 END, date(ca.due_date) ASC, datetime(ca.created_at) DESC');
     echo '<div class="card"><h2>Action tickets</h2><div class="actions-board">';
     if(!$actions) echo '<p>No committee actions have been created yet.</p>';
-    foreach($actions as $a){ $cls=str_replace(' ','_',strtolower($a['status'])); $assignedUser=trim(($a['user_first']??'').' '.($a['user_last']??'')) ?: ($a['email'] ?: 'Unassigned'); $assignedMember=trim(($a['member_first']??'').' '.($a['member_last']??'')).($a['member_callsign']?' - '.$a['member_callsign']:''); echo '<div class="ticket '.e($cls).'"><div class="ticket-head"><div><strong>'.e($a['title']).'</strong><br><span class="muted">Created '.e($a['created_at']).' • Due '.e($a['due_date'] ?: 'not set').' • Assigned to '.e($assignedUser).($assignedMember?' • Member: '.e($assignedMember):'').'</span></div><span class="status-pill status-'.e($cls).'">'.e($a['status']).'</span></div><p><strong>Action:</strong> '.e($a['action_required']).'</p><p>'.nl2br(e(decrypt_value($a['description_encrypted']))).'</p>'; if(has_permission('manage_committee_actions')){ echo '<details><summary>Edit action</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="update_action" value="1"><input type="hidden" name="action_id" value="'.e($a['id']).'"><label>Title</label><input name="title" value="'.e($a['title']).'" required><label>Status</label><select name="status"><option '.($a['status']==='open'?'selected':'').'>open</option><option '.($a['status']==='in_progress'?'selected':'').'>in_progress</option><option '.($a['status']==='closed'?'selected':'').'>closed</option><option '.($a['status']==='cancelled'?'selected':'').'>cancelled</option></select><label>Priority</label><select name="priority"><option '.($a['priority']==='low'?'selected':'').'>low</option><option '.($a['priority']==='normal'?'selected':'').'>normal</option><option '.($a['priority']==='high'?'selected':'').'>high</option><option '.($a['priority']==='urgent'?'selected':'').'>urgent</option></select><label>Due date</label><input type="date" name="due_date" value="'.e($a['due_date']).'"><label>Assign to user</label><select name="assigned_user_id"><option value="">Unassigned</option>'; foreach($users as $usr) echo '<option value="'.e($usr['id']).'" '.((int)$a['assigned_user_id']===(int)$usr['id']?'selected':'').'>'.e(trim(($usr['first_name']??'').' '.($usr['last_name']??'')).($usr['callsign']?' - '.$usr['callsign']:'').' / '.$usr['email']).'</option>'; echo '</select><label>Assign to member</label><select name="assigned_member_id"><option value="">None</option>'; foreach($members as $m) echo '<option value="'.e($m['id']).'" '.((int)$a['assigned_member_id']===(int)$m['id']?'selected':'').'>'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'' )).'</option>'; echo '</select><label>Action required</label><input name="action_required" value="'.e($a['action_required']).'" required><label>Description</label><textarea name="description">'.e(decrypt_value($a['description_encrypted'])).'</textarea><button>Update action</button></form></details>'; } echo '</div>'; }
+    foreach($actions as $a){
+        $cls=str_replace(' ','_',strtolower($a['status']));
+        $assignedMember=trim(($a['member_first']??'').' '.($a['member_last']??'')).($a['member_callsign']?' - '.$a['member_callsign']:'');
+        $history=all('SELECT cu.*,u.email,m.first_name,m.last_name,m.callsign FROM committee_action_updates cu LEFT JOIN users u ON u.id=cu.created_by_user_id LEFT JOIN members m ON m.id=u.member_id WHERE cu.action_id=? ORDER BY datetime(cu.created_at) DESC, cu.id DESC',[$a['id']]);
+        echo '<div class="ticket '.e($cls).'"><div class="ticket-head"><div><strong>'.e($a['title']).'</strong><br><span class="muted">Created '.e($a['created_at']).' • Due '.e($a['due_date'] ?: 'not set').' • Assigned member: '.e($assignedMember ?: 'Unassigned').'</span></div><span class="status-pill status-'.e($cls).'">'.e($a['status']).'</span></div><p><strong>Action:</strong> '.e($a['action_required']).'</p><p>'.nl2br(e(decrypt_value($a['description_encrypted']))).'</p>';
+        echo '<details><summary>Updates / history ('.e(count($history)).')</summary>';
+        if(!$history) echo '<p class="muted">No updates yet.</p>';
+        foreach($history as $h){
+            $by=trim(($h['first_name']??'').' '.($h['last_name']??'')) ?: ($h['email'] ?: 'System');
+            echo '<div class="asset-field"><span>'.e($h['created_at']).' • '.e($h['update_type']).' • '.e($by).'</span>';
+            $note=decrypt_value($h['update_encrypted'] ?? ''); if($note) echo '<strong>'.nl2br(e($note)).'</strong>';
+            $changes=json_decode($h['changes_json'] ?? '', true);
+            if($changes){ echo '<ul class="small">'; foreach($changes as $field=>$change){ echo '<li><strong>'.e($field).':</strong> '.e($change['from'] ?? '').' → '.e($change['to'] ?? '').'</li>'; } echo '</ul>'; }
+            echo '</div>';
+        }
+        echo '</details>';
+        if(has_permission('manage_committee_actions')){
+            echo '<details><summary>Add update</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="add_action_update" value="1"><input type="hidden" name="action_id" value="'.e($a['id']).'"><label>Update note</label><textarea name="update_note" placeholder="Add progress update, decision, phone call note, etc"></textarea><button>Add update</button></form></details>';
+            echo '<details><summary>Edit action</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="update_action" value="1"><input type="hidden" name="action_id" value="'.e($a['id']).'"><label>Title</label><input name="title" value="'.e($a['title']).'" required><label>Status</label><select name="status"><option '.($a['status']==='open'?'selected':'').'>open</option><option '.($a['status']==='in_progress'?'selected':'').'>in_progress</option><option '.($a['status']==='closed'?'selected':'').'>closed</option><option '.($a['status']==='cancelled'?'selected':'').'>cancelled</option></select><label>Priority</label><select name="priority"><option '.($a['priority']==='low'?'selected':'').'>low</option><option '.($a['priority']==='normal'?'selected':'').'>normal</option><option '.($a['priority']==='high'?'selected':'').'>high</option><option '.($a['priority']==='urgent'?'selected':'').'>urgent</option></select><label>Due date</label><input type="date" name="due_date" value="'.e($a['due_date']).'"><label>Assign to member</label><select name="assigned_member_id"><option value="">Unassigned</option>'; foreach($members as $m) echo '<option value="'.e($m['id']).'" '.((int)$a['assigned_member_id']===(int)$m['id']?'selected':'').'>'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'' )).'</option>'; echo '</select><label>Action required</label><input name="action_required" value="'.e($a['action_required']).'" required><label>Description</label><textarea name="description">'.e(decrypt_value($a['description_encrypted'])).'</textarea><label>Update note / reason for change</label><textarea name="update_note" placeholder="Optional explanation for this edit"></textarea><button>Update action</button></form></details>';
+        }
+        echo '</div>';
+    }
     echo '</div></div>';
     page_footer(); exit;
 }
@@ -1297,6 +1441,40 @@ if (route() === 'brickworks_evidence') {
     readfile($path); exit;
 }
 
+
+if (route() === 'brickworks_export') {
+    require_permission('export_brickworks_reports');
+    audit('brickworks.export');
+    $criteria=all('SELECT bc.*,bt.name theme FROM brickworks_criteria bc JOIN brickworks_themes bt ON bt.id=bc.theme_id WHERE bc.active=1 ORDER BY bt.sort_order,bc.sort_order');
+    $participants=all('SELECT b.*,m.first_name,m.last_name,m.callsign,m.id member_id FROM brickworks_participants b JOIN members m ON m.id=b.member_id ORDER BY m.last_name,m.first_name');
+    foreach($participants as $part){ foreach($criteria as $c){ exec_sql('INSERT OR IGNORE INTO brickworks_progress (participant_id,criterion_id,created_at,updated_at) VALUES (?,?,datetime("now"),datetime("now"))',[$part['id'],$c['id']]); } }
+    $progressRows=all('SELECT bp.*,b.member_id FROM brickworks_progress bp JOIN brickworks_participants b ON b.id=bp.participant_id');
+    $progress=[]; foreach($progressRows as $pr){ $progress[(int)$pr['participant_id']][(int)$pr['criterion_id']]=$pr; }
+    $evidenceCounts=all('SELECT bp.participant_id,bp.criterion_id,COUNT(be.id) c FROM brickworks_progress bp LEFT JOIN brickworks_evidence be ON be.progress_id=bp.id GROUP BY bp.participant_id,bp.criterion_id');
+    $ev=[]; foreach($evidenceCounts as $er){ $ev[(int)$er['participant_id']][(int)$er['criterion_id']]=(int)$er['c']; }
+    $headers=['Name','Callsign','Completed','Pending','Current award'];
+    foreach($criteria as $c) $headers[]=$c['theme'].' - '.$c['title'];
+    $rows=[];
+    foreach($participants as $part){
+        $complete=0; $pending=0;
+        $row=[trim($part['first_name'].' '.$part['last_name']),$part['callsign']];
+        $cells=[];
+        foreach($criteria as $c){
+            $pr=$progress[(int)$part['id']][(int)$c['id']] ?? null;
+            $status=$pr['status'] ?? 'not_completed';
+            if($status==='complete') $complete++;
+            if($status==='pending_approval') $pending++;
+            $label=$status==='complete' ? 'Complete - '.($pr['completed_at'] ?? '') : ($status==='pending_approval' ? 'In progress / Pending approval' : 'Not completed');
+            $evidence=(int)($ev[(int)$part['id']][(int)$c['id']] ?? 0);
+            $comment=decrypt_value($pr['reviewer_comment_encrypted'] ?? '') ?: '';
+            $cells[]=$label.' | Evidence: '.$evidence.($comment?' | Reviewer: '.$comment:'');
+        }
+        $row[]=$complete; $row[]=$pending; $row[]=brickworks_award($complete) ?: 'No award yet';
+        $rows[]=array_merge($row,$cells);
+    }
+    csv_download('brickworks-progress-export.csv', $headers, $rows);
+}
+
 if (route() === 'brickworks_manage') {
     require_permission('review_brickworks_evidence');
     page_header('Brickworks Management'); audit('brickworks.manage.view');
@@ -1316,7 +1494,7 @@ if (route() === 'brickworks_manage') {
     $progress=[]; foreach($progressRows as $pr){ $progress[(int)$pr['participant_id']][(int)$pr['criterion_id']]=$pr; }
     $evidenceRows=all('SELECT be.*,bp.participant_id,bp.criterion_id FROM brickworks_evidence be JOIN brickworks_progress bp ON bp.id=be.progress_id ORDER BY be.created_at DESC');
     $evidence=[]; foreach($evidenceRows as $er){ $evidence[(int)$er['participant_id']][(int)$er['criterion_id']][]=$er; }
-    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Brickworks management</h1><a class="btn secondary" href="?route=brickworks">Back to Brickworks</a><a class="btn secondary" href="?route=brickworks_review">Pending only</a></div><p class="muted">Members are listed down the left. Criteria run left to right across the top. Use each cell to approve, return for more evidence, or reset a criterion.</p></div>';
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Brickworks management</h1><a class="btn secondary" href="?route=brickworks">Back to Brickworks</a><a class="btn secondary" href="?route=brickworks_review">Pending only</a><a class="btn" href="?route=brickworks_export">Export spreadsheet</a></div><p class="muted">Members are listed down the left. Criteria run left to right across the top. Use each cell to approve, return for more evidence, or reset a criterion.</p></div>';
     echo '<div class="card"><div class="matrix-wrap"><table class="matrix"><tr><th>Member</th>';
     foreach($criteria as $c){ echo '<th><span class="small">'.e($c['theme']).'</span><br>'.e($c['title']).'</th>'; }
     echo '</tr>';

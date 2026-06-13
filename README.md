@@ -247,35 +247,10 @@ Admin can:
 
 The next step should be replacing the basic email sender with a real SMTP/MIME mailer and improving the role-management UI, so admins can assign/remove multiple roles directly in the app.
 
-## Update notes - Programme, committee menu and Brickworks dashboard
+## Latest changes
 
-This build adds the requested programme/events improvements:
-
-- Programme / Events page now has list view and calendar view toggles.
-- Event add form is only shown to users with the Committee Member or Admin role.
-- Event detail pages show full description, timings, location, max attendees and attachments.
-- Committee/Admin users see event attendance, edit and delete controls on the event detail page.
-- Event attachments are stored privately under `storage/private/event-attachments` and downloaded through authenticated routes.
-- The main navigation has been streamlined. Admin/committee users get a Committee dropdown containing:
-  - Members
-  - Users
-  - Attendance tracking
-  - Audit logs
-  - Emails
-- A Brickworks leaderboard is now shown on the dashboard.
-- A dedicated attendance tracking page lists event signup and attendance totals.
-
-Note: routes remain permission-protected. The Committee dropdown is only visible to Committee/Admin roles, but access to sensitive pages such as the membership database, users and audit logs still depends on the existing permissions.
-
-## Latest attendance/programme update
-
-This build includes:
-
-- Fixed event creation redirect that could show `Page not found` after adding an event.
-- Attendance register now uses a checkbox list rather than a dropdown per member.
-- Committee/Admin users can add visitors/guests to an event register with comments.
-- Attendance tracking is split into upcoming and past events, with the closest upcoming and most recent past events at the top.
-- Added Attendance Stats page under the Committee menu.
-- Attendance stats show totals and averages by event type, month/year, and person.
-- Members can self sign up for events in advance, but only committee/admin users can view/modify attendance registers.
-- Dropdown menus have improved hover spacing so they do not disappear before the cursor reaches the menu.
+- Brickworks management now includes an Export spreadsheet button producing a CSV progress matrix.
+- Member record pages now include an Export spreadsheet button producing a detailed CSV for that member.
+- Emergency contact details are now split into name, relationship to member, and phone number.
+- Committee actions are assigned to members only, not users.
+- Committee action tickets now support update notes and a visible history of creation, edits, assignment changes, status changes, due date changes, and comments.
