@@ -24,6 +24,7 @@ function app_config(): array {
         'smtp_security' => 'tls',
         'smtp_username' => '',
         'smtp_password' => '',
+        'resend_api_key' => '',
     ];
     if (file_exists(CONFIG_PATH)) {
         $cfg = include CONFIG_PATH;
@@ -34,6 +35,84 @@ function app_config(): array {
 function save_app_config(array $updates): void {
     $cfg = array_merge(app_config(), $updates);
     file_put_contents(CONFIG_PATH, '<?php return ' . var_export($cfg, true) . ';');
+}
+
+function send_configured_email(array $cfg, array $to, array $bcc, string $subject, string $html, string $fromName, string $fromAddress, string $replyTo): array {
+    $method = $cfg['email_method'] ?? 'php_mail';
+    $to = array_values(array_filter(array_map('trim', $to)));
+    $bcc = array_values(array_filter(array_map('trim', $bcc)));
+    $subject = str_replace(["\r","\n"], '', $subject);
+    $fromName = str_replace(["\r","\n"], '', $fromName);
+    $fromAddress = str_replace(["\r","\n"], '', $fromAddress);
+    $replyTo = str_replace(["\r","\n"], '', $replyTo);
+
+    if (!$to) return ['ok' => false, 'error' => 'No To recipient supplied.'];
+
+    if ($method === 'resend') {
+        $apiKey = trim((string)($cfg['resend_api_key'] ?? ''));
+        if ($apiKey === '') return ['ok' => false, 'error' => 'Resend API key is not configured.'];
+
+        $payload = [
+            'from' => $fromName ? ($fromName . ' <' . $fromAddress . '>') : $fromAddress,
+            'to' => $to,
+            'subject' => $subject,
+            'html' => $html,
+        ];
+        if ($bcc) $payload['bcc'] = $bcc;
+        if ($replyTo) $payload['reply_to'] = $replyTo;
+
+        $json = json_encode($payload);
+        $headers = [
+            'Authorization: Bearer ' . $apiKey,
+            'Content-Type: application/json',
+        ];
+
+        if (function_exists('curl_init')) {
+            $ch = curl_init('https://api.resend.com/emails');
+            curl_setopt_array($ch, [
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => $json,
+                CURLOPT_HTTPHEADER => $headers,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => 30,
+            ]);
+            $response = curl_exec($ch);
+            $error = curl_error($ch);
+            $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+
+            if ($response === false) return ['ok' => false, 'error' => $error ?: 'Resend cURL request failed.'];
+            if ($status >= 200 && $status < 300) return ['ok' => true, 'error' => null, 'provider_response' => $response];
+            return ['ok' => false, 'error' => 'Resend API error HTTP ' . $status . ': ' . substr((string)$response, 0, 500)];
+        }
+
+        $context = stream_context_create([
+            'http' => [
+                'method' => 'POST',
+                'header' => implode("\r\n", $headers) . "\r\n",
+                'content' => $json,
+                'timeout' => 30,
+                'ignore_errors' => true,
+            ]
+        ]);
+        $response = @file_get_contents('https://api.resend.com/emails', false, $context);
+        $status = 0;
+        if (!empty($http_response_header)) {
+            foreach ($http_response_header as $h) {
+                if (preg_match('/^HTTP\/\S+\s+(\d+)/', $h, $m)) { $status = (int)$m[1]; break; }
+            }
+        }
+        if ($response !== false && $status >= 200 && $status < 300) return ['ok' => true, 'error' => null, 'provider_response' => $response];
+        return ['ok' => false, 'error' => 'Resend API request failed' . ($status ? ' HTTP ' . $status : '') . ': ' . substr((string)$response, 0, 500)];
+    }
+
+    $headers = "MIME-Version: 1.0\r\nContent-type: text/html; charset=UTF-8\r\n";
+    $headers .= 'From: ' . $fromName . ' <' . $fromAddress . ">\r\n";
+    $headers .= 'Reply-To: ' . $replyTo . "\r\n";
+    if ($bcc) $headers .= 'Bcc: ' . implode(', ', $bcc) . "\r\n";
+
+    $ok = @mail(implode(', ', $to), $subject, $html, $headers);
+    return ['ok' => (bool)$ok, 'error' => $ok ? null : 'mail() failed or is not configured.'];
 }
 
 function db(): PDO {
@@ -938,7 +1017,7 @@ function brickworks_award(int $complete): ?string {
 
 if (route() === 'assets.css') {
     header('Content-Type: text/css');
-    echo 'body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#f6f7fb;color:#18202a}header{background:#101827;color:white;padding:18px 24px}header div{display:flex;gap:12px;align-items:end}header span{opacity:.7}.main-nav{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center}.main-nav a,.nav-drop{color:white;background:#24324a;padding:8px 10px;border-radius:8px;text-decoration:none;border:0;font:inherit;cursor:pointer}.dropdown{position:relative;padding-bottom:14px;margin-bottom:-14px}.dropdown::after{content:"";position:absolute;left:0;right:0;top:100%;height:14px}.dropdown-menu{display:none;position:absolute;z-index:999;top:calc(100% - 6px);left:0;min-width:220px;background:white;border-radius:10px;box-shadow:0 10px 25px #0003;padding:8px;margin-top:0}.dropdown:hover .dropdown-menu,.dropdown:focus-within .dropdown-menu,.dropdown.open .dropdown-menu{display:block}.dropdown-menu a{display:block;color:#18202a;background:white;padding:10px;border-radius:8px}.dropdown-menu a:hover{background:#f1f5f9}main{max-width:1180px;margin:24px auto;padding:0 18px}.card{background:white;border-radius:14px;padding:18px;margin:16px 0;box-shadow:0 1px 4px #0001}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}label{display:block;margin:10px 0 4px;font-weight:600}input,select,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd3df;border-radius:8px}textarea{min-height:110px}button,.btn{background:#1d4ed8;color:white;border:0;border-radius:8px;padding:10px 14px;text-decoration:none;display:inline-block;cursor:pointer}button.secondary,.btn.secondary{background:#475569}.btn.danger,button.danger{background:#b91c1c}table{width:100%;border-collapse:collapse;background:white}th,td{border-bottom:1px solid #e5e7eb;padding:10px;text-align:left;vertical-align:top}th{background:#f1f5f9}.flash{background:#dcfce7;border:1px solid #86efac;padding:12px;border-radius:10px}.danger-box,.card.danger{background:#fee2e2;border:1px solid #fecaca}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#e0e7ff}.muted{color:#64748b}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.event-list{display:grid;gap:12px}.event-row{display:flex;gap:18px;justify-content:space-between;align-items:flex-start;border:1px solid #e5e7eb;border-radius:12px;padding:14px;background:#fff}.event-actions{white-space:nowrap}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}.calendar-head{font-weight:700;text-align:center;background:#e2e8f0;border-radius:8px;padding:8px}.calendar-day{min-height:110px;background:white;border:1px solid #e5e7eb;border-radius:10px;padding:8px}.calendar-day.muted-day{background:#f8fafc;color:#94a3b8}.calendar-date{font-weight:700;margin-bottom:6px}.calendar-event{display:block;background:#dbeafe;color:#1e3a8a;text-decoration:none;border-radius:8px;padding:5px;margin:4px 0;font-size:.88rem}.leaderboard{counter-reset:rank}.leaderboard-row{display:grid;grid-template-columns:42px 1fr auto;gap:10px;align-items:center;border-bottom:1px solid #e5e7eb;padding:10px 0}.leaderboard-row:before{counter-increment:rank;content:counter(rank);background:#e0e7ff;border-radius:999px;width:30px;height:30px;display:grid;place-items:center;font-weight:700}.progressbar{height:10px;background:#e5e7eb;border-radius:999px;overflow:hidden}.progressbar span{display:block;height:100%;background:#1d4ed8}.small{font-size:.9rem}.status-complete{background:#dcfce7}.status-pending{background:#fef3c7}.status-none{background:#f1f5f9}.user-menu{margin-left:auto}.dropdown-right{right:0;left:auto}.modal{border:0;border-radius:16px;padding:0;max-width:820px;width:calc(100% - 32px);box-shadow:0 24px 80px #0005}.modal::backdrop{background:#0f172acc}.modal .card{margin:0;box-shadow:none}.modal-head{display:flex;align-items:center;gap:12px}.modal-head h2{margin-right:auto}.icon-btn{background:#e2e8f0;color:#0f172a;border-radius:999px;padding:8px 12px}.category-pill{background:#eef2ff;color:#312e81}.attendance-tools{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.attendance-list{display:grid;gap:8px}.attendance-item{display:grid;grid-template-columns:32px 1fr 160px;gap:10px;align-items:center;border:1px solid #e5e7eb;border-radius:10px;padding:10px}.attendance-item input[type=checkbox]{width:auto}.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.stat-tile{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:12px}.full{grid-column:1/-1}.bw-hero{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center}.bw-score{font-size:2.2rem;font-weight:800}.bw-steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px}.bw-step{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:10px}.bw-grid{display:grid;gap:14px}.bw-card{border:1px solid #e5e7eb;border-radius:14px;padding:14px;background:#fff}.bw-card-head{display:flex;gap:10px;align-items:flex-start;justify-content:space-between}.bw-card h3{margin:.1rem 0 .35rem}.bw-theme{font-size:.85rem;color:#475569;font-weight:700;text-transform:uppercase;letter-spacing:.03em}.bw-status{display:inline-block;border-radius:999px;padding:5px 9px;font-weight:700;font-size:.85rem;white-space:nowrap}.bw-status.complete{background:#dcfce7;color:#166534}.bw-status.pending{background:#fef3c7;color:#92400e}.bw-status.none{background:#f1f5f9;color:#334155}.bw-form{display:grid;gap:8px;margin-top:12px;background:#f8fafc;border-radius:12px;padding:12px}.bw-comments{margin-top:10px;border-left:4px solid #e2e8f0;padding-left:10px}.bw-muted-line{color:#64748b;font-size:.92rem}.ticket{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fff;margin:10px 0}.ticket-head{display:flex;gap:10px;align-items:center;justify-content:space-between}.ticket.open{border-left:5px solid #2563eb}.ticket.in_progress{border-left:5px solid #f59e0b}.ticket.closed{border-left:5px solid #16a34a}.ticket.cancelled{border-left:5px solid #64748b}.matrix-wrap{overflow:auto;max-width:100%;border:1px solid #e5e7eb;border-radius:12px}.matrix{min-width:980px}.matrix th{position:sticky;top:0;z-index:3}.matrix th:first-child,.matrix td:first-child{position:sticky;left:0;background:#fff;z-index:2;box-shadow:2px 0 0 #e5e7eb}.matrix th:first-child{z-index:4;background:#f1f5f9}.matrix-cell{min-width:220px}.inline-form{display:grid;gap:6px}.inline-form select,.inline-form textarea,.inline-form input{font-size:.9rem;padding:7px}.status-pill{display:inline-block;border-radius:999px;padding:4px 8px;font-size:.82rem;font-weight:700}.status-open{background:#dbeafe;color:#1e40af}.status-in_progress,.status-pending_approval{background:#fef3c7;color:#92400e}.status-complete,.status-closed{background:#dcfce7;color:#166534}.status-not_completed,.status-cancelled{background:#f1f5f9;color:#334155}.asset-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.asset-field{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px}.asset-field span{display:block;color:#64748b;font-size:.85rem}.asset-field strong{display:block;margin-top:3px}.actions-board{display:grid;gap:12px}.recipient-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;max-height:360px;overflow:auto;border:1px solid #e5e7eb;border-radius:12px;padding:10px;background:#f8fafc}.recipient-item{display:flex;gap:10px;align-items:flex-start;background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:9px;margin:0;font-weight:400}.recipient-item input{width:auto;margin-top:4px}footer{text-align:center;color:#64748b;padding:24px}@media(max-width:800px){.two{grid-template-columns:1fr}.event-row{display:block}.calendar{grid-template-columns:1fr}.calendar-head{display:none}table{font-size:.9rem}}';
+    echo 'body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#f6f7fb;color:#18202a}header{background:#101827;color:white;padding:18px 24px}header div{display:flex;gap:12px;align-items:end}header span{opacity:.7}.main-nav{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center}.main-nav a,.nav-drop{color:white;background:#24324a;padding:8px 10px;border-radius:8px;text-decoration:none;border:0;font:inherit;cursor:pointer}.dropdown{position:relative;padding-bottom:14px;margin-bottom:-14px}.dropdown::after{content:"";position:absolute;left:0;right:0;top:100%;height:14px}.dropdown-menu{display:none;position:absolute;z-index:999;top:calc(100% - 6px);left:0;min-width:220px;background:white;border-radius:10px;box-shadow:0 10px 25px #0003;padding:8px;margin-top:0}.dropdown:hover .dropdown-menu,.dropdown:focus-within .dropdown-menu,.dropdown.open .dropdown-menu{display:block}.dropdown-menu a{display:block;color:#18202a;background:white;padding:10px;border-radius:8px}.dropdown-menu a:hover{background:#f1f5f9}main{max-width:1180px;margin:24px auto;padding:0 18px}.card{background:white;border-radius:14px;padding:18px;margin:16px 0;box-shadow:0 1px 4px #0001}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}label{display:block;margin:10px 0 4px;font-weight:600}input,select,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd3df;border-radius:8px}textarea{min-height:110px}button,.btn{background:#1d4ed8;color:white;border:0;border-radius:8px;padding:10px 14px;text-decoration:none;display:inline-block;cursor:pointer}button.secondary,.btn.secondary{background:#475569}.btn.danger,button.danger{background:#b91c1c}table{width:100%;border-collapse:collapse;background:white}th,td{border-bottom:1px solid #e5e7eb;padding:10px;text-align:left;vertical-align:top}th{background:#f1f5f9}.flash{background:#dcfce7;border:1px solid #86efac;padding:12px;border-radius:10px}.danger-box,.card.danger{background:#fee2e2;border:1px solid #fecaca}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#e0e7ff}.muted{color:#64748b}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.event-list{display:grid;gap:12px}.event-row{display:flex;gap:18px;justify-content:space-between;align-items:flex-start;border:1px solid #e5e7eb;border-radius:12px;padding:14px;background:#fff}.event-actions{white-space:nowrap}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}.calendar-head{font-weight:700;text-align:center;background:#e2e8f0;border-radius:8px;padding:8px}.calendar-day{min-height:110px;background:white;border:1px solid #e5e7eb;border-radius:10px;padding:8px}.calendar-day.muted-day{background:#f8fafc;color:#94a3b8}.calendar-date{font-weight:700;margin-bottom:6px}.calendar-event{display:block;background:#dbeafe;color:#1e3a8a;text-decoration:none;border-radius:8px;padding:5px;margin:4px 0;font-size:.88rem}.leaderboard{counter-reset:rank}.leaderboard-row{display:grid;grid-template-columns:42px 1fr auto;gap:10px;align-items:center;border-bottom:1px solid #e5e7eb;padding:10px 0}.leaderboard-row:before{counter-increment:rank;content:counter(rank);background:#e0e7ff;border-radius:999px;width:30px;height:30px;display:grid;place-items:center;font-weight:700}.progressbar{height:10px;background:#e5e7eb;border-radius:999px;overflow:hidden}.progressbar span{display:block;height:100%;background:#1d4ed8}.small{font-size:.9rem}.status-complete{background:#dcfce7}.status-pending{background:#fef3c7}.status-none{background:#f1f5f9}.user-menu{margin-left:auto}.dropdown-right{right:0;left:auto}.modal{border:0;border-radius:16px;padding:0;max-width:820px;width:calc(100% - 32px);box-shadow:0 24px 80px #0005}.modal::backdrop{background:#0f172acc}.modal .card{margin:0;box-shadow:none}.modal-head{display:flex;align-items:center;gap:12px}.modal-head h2{margin-right:auto}.icon-btn{background:#e2e8f0;color:#0f172a;border-radius:999px;padding:8px 12px}.category-pill{background:#eef2ff;color:#312e81}.attendance-tools{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.attendance-list{display:grid;gap:8px}.attendance-item{display:grid;grid-template-columns:32px 1fr 160px;gap:10px;align-items:center;border:1px solid #e5e7eb;border-radius:10px;padding:10px}.attendance-item input[type=checkbox]{width:auto}.attendance-modern{padding:0;overflow:hidden;border-radius:18px}.attendance-modern-head{display:grid;grid-template-columns:1fr auto;gap:18px;padding:28px 32px 18px;align-items:start}.attendance-modern-head h2{font-size:1.9rem;margin:.1rem 0 .35rem}.attendance-date{font-size:1.25rem;color:#64748b;font-weight:650}.attendance-counts{display:flex;gap:28px;text-align:center;align-items:start}.attendance-counts span{display:block;color:#64748b;font-weight:650}.attendance-counts strong{font-size:1.45rem}.attendance-counts .present{color:#16a34a}.attendance-counts .guest{color:#ea580c}.attendance-counts .absent{color:#dc2626}.attendance-modern-controls{display:grid;grid-template-columns:1fr 220px auto auto;gap:14px;padding:18px 32px 28px;align-items:center}.attendance-search-wrap{position:relative}.attendance-search-wrap:before{content:"⌕";position:absolute;left:14px;top:50%;transform:translateY(-50%);font-size:1.35rem;color:#94a3b8}.attendance-search{font-size:1.05rem;padding-left:46px}.attendance-filter,.attendance-search{height:44px;box-shadow:0 2px 7px #00000012}.attendance-modern-list{border-top:1px solid #e5e7eb}.attendance-modern-row{display:grid;grid-template-columns:44px 1fr auto;gap:14px;align-items:center;padding:18px 32px;border-bottom:1px solid #e5e7eb;background:#fff}.attendance-modern-row:hover{background:#f8fafc}.attendance-modern-row input[type=checkbox]{width:24px;height:24px;accent-color:#1d4ed8}.attendance-person strong{display:block;font-size:1.05rem}.attendance-person span{display:block;color:#64748b;margin-top:2px}.attendance-row-status{font-weight:700;color:#94a3b8}.attendance-row-status.present{color:#16a34a}.attendance-row-status.guest{color:#ea580c}.attendance-modern-footer{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;padding:18px 32px;align-items:end;background:#f8fafc}.attendance-modern-footer input{background:white}.attendance-savebar{padding:18px 32px;display:flex;gap:10px;justify-content:space-between;align-items:center;background:#fff}.attendance-empty{padding:22px 32px;color:#64748b}.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.stat-tile{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:12px}.full{grid-column:1/-1}.bw-hero{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center}.bw-score{font-size:2.2rem;font-weight:800}.bw-steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px}.bw-step{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:10px}.bw-grid{display:grid;gap:14px}.bw-card{border:1px solid #e5e7eb;border-radius:14px;padding:14px;background:#fff}.bw-card-head{display:flex;gap:10px;align-items:flex-start;justify-content:space-between}.bw-card h3{margin:.1rem 0 .35rem}.bw-theme{font-size:.85rem;color:#475569;font-weight:700;text-transform:uppercase;letter-spacing:.03em}.bw-status{display:inline-block;border-radius:999px;padding:5px 9px;font-weight:700;font-size:.85rem;white-space:nowrap}.bw-status.complete{background:#dcfce7;color:#166534}.bw-status.pending{background:#fef3c7;color:#92400e}.bw-status.none{background:#f1f5f9;color:#334155}.bw-form{display:grid;gap:8px;margin-top:12px;background:#f8fafc;border-radius:12px;padding:12px}.bw-comments{margin-top:10px;border-left:4px solid #e2e8f0;padding-left:10px}.bw-muted-line{color:#64748b;font-size:.92rem}.ticket{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fff;margin:10px 0}.ticket-head{display:flex;gap:10px;align-items:center;justify-content:space-between}.ticket.open{border-left:5px solid #2563eb}.ticket.in_progress{border-left:5px solid #f59e0b}.ticket.closed{border-left:5px solid #16a34a}.ticket.cancelled{border-left:5px solid #64748b}.matrix-wrap{overflow:auto;max-width:100%;border:1px solid #e5e7eb;border-radius:12px}.matrix{min-width:980px}.matrix th{position:sticky;top:0;z-index:3}.matrix th:first-child,.matrix td:first-child{position:sticky;left:0;background:#fff;z-index:2;box-shadow:2px 0 0 #e5e7eb}.matrix th:first-child{z-index:4;background:#f1f5f9}.matrix-cell{min-width:220px}.inline-form{display:grid;gap:6px}.inline-form select,.inline-form textarea,.inline-form input{font-size:.9rem;padding:7px}.status-pill{display:inline-block;border-radius:999px;padding:4px 8px;font-size:.82rem;font-weight:700}.status-open{background:#dbeafe;color:#1e40af}.status-in_progress,.status-pending_approval{background:#fef3c7;color:#92400e}.status-complete,.status-closed{background:#dcfce7;color:#166534}.status-not_completed,.status-cancelled{background:#f1f5f9;color:#334155}.asset-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.asset-field{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px}.asset-field span{display:block;color:#64748b;font-size:.85rem}.asset-field strong{display:block;margin-top:3px}.actions-board{display:grid;gap:12px}.recipient-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;max-height:360px;overflow:auto;border:1px solid #e5e7eb;border-radius:12px;padding:10px;background:#f8fafc}.recipient-item{display:flex;gap:10px;align-items:flex-start;background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:9px;margin:0;font-weight:400}.recipient-item input{width:auto;margin-top:4px}.email-app{background:#fff;border:1px solid #dde4ef;border-radius:14px;overflow:hidden;box-shadow:0 1px 4px #0001;margin:16px 0}.email-top{background:#4638cf;color:white;padding:16px 18px;display:flex;align-items:center;gap:12px}.email-title{display:flex;align-items:center;gap:10px;font-size:1.25rem}.email-icon{font-size:1.3rem}.email-top-actions{margin-left:auto}.email-config-btn{background:#ffffff22;color:white;border:1px solid #ffffff55;border-radius:9px;padding:8px 10px;text-decoration:none;font-weight:700}.email-layout{display:grid;grid-template-columns:330px 1fr;min-height:560px}.email-sidebar{border-right:1px solid #dde4ef;background:#f8fafc}.email-recipient-head{display:flex;align-items:center;gap:10px;padding:15px 14px;border-bottom:1px solid #dde4ef;font-size:1.05rem}.email-people{color:#4f46e5}.email-count{background:#e0e7ff;color:#4338ca;border-radius:9px;padding:3px 12px;font-weight:800;box-shadow:0 2px 6px #0001}.email-filter-bar{display:flex;gap:7px;flex-wrap:wrap;padding:12px 14px;border-bottom:1px solid #e7edf6}.email-chip{width:auto;border-radius:7px;padding:8px 10px;background:#eef2ff;color:#4338ca;font-weight:800}.email-chip.active{background:#4f46e5;color:#fff}.email-chip.paid{background:#dcfce7;color:#166534}.email-chip.unpaid{background:#fee2e2;color:#b91c1c}.email-chip.pending{background:#fef3c7;color:#92400e}.email-chip.committee{background:#f3e8ff;color:#7e22ce}.email-chip.none{background:#e2e8f0;color:#64748b}.email-search-wrap{padding:12px 14px}.email-search{background:#fff;padding-left:14px}.email-member-list{max-height:430px;overflow:auto}.email-member-card{display:grid;grid-template-columns:24px 1fr auto;gap:10px;align-items:center;padding:12px 14px;border-top:1px solid #edf2f7;background:#eef2ff;cursor:pointer;margin:0;font-weight:400}.email-member-card:hover{background:#e0e7ff}.email-member-card input{display:none}.email-check-ui{width:18px;height:18px;border-radius:6px;background:#4f46e5;color:#fff;display:grid;place-items:center;font-size:.78rem;font-weight:900}.email-member-card input:not(:checked)+.email-check-ui{background:#fff;color:transparent;border:2px solid #cbd5e1}.email-member-main strong{display:block;color:#1e293b}.email-member-main small,.email-callsign{display:block;color:#94a3b8;font-weight:700;margin-top:2px}.email-badge{border-radius:7px;padding:6px 9px;font-weight:800;font-size:.82rem}.email-badge.paid{background:#dcfce7;color:#166534}.email-badge.unpaid{background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5}.email-badge.pending{background:#fef3c7;color:#92400e}.email-empty{padding:14px}.email-compose{display:flex;flex-direction:column;background:#fff}.email-fields{padding:16px 22px;border-bottom:1px solid #dde4ef}.email-row{display:grid;grid-template-columns:70px 1fr;gap:12px;align-items:center;margin:8px 0}.email-row label{margin:0;text-align:right;color:#64748b}.email-row input{background:#f8fafc}.email-toolbar{display:flex;gap:14px;align-items:center;padding:12px 22px;border-bottom:1px solid #eef2f7}.email-attach-btn{display:inline-flex;align-items:center;gap:8px;width:auto;margin:0;padding:9px 12px;border:1px solid #dbe3ee;border-radius:9px;background:#fff;box-shadow:0 2px 5px #0001;cursor:pointer}.email-attach-btn input{display:none}.email-help{color:#94a3b8;font-weight:700}.email-help code{background:#eef2ff;color:#64748b;border-radius:5px;padding:2px 5px}.email-message{border:0;border-radius:0;min-height:330px;padding:22px;font-size:1rem;resize:vertical}.email-message:focus{outline:2px solid #c7d2fe;outline-offset:-2px}.email-sendbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:auto;padding:14px 22px;border-top:1px solid #eef2f7;background:#fbfdff}@media(max-width:900px){.email-layout{grid-template-columns:1fr}.email-sidebar{border-right:0;border-bottom:1px solid #dde4ef}.email-member-list{max-height:260px}.email-row{grid-template-columns:1fr}.email-row label{text-align:left}.email-sendbar{display:block}.email-sendbar div{margin-top:10px}}footer{text-align:center;color:#64748b;padding:24px}@media(max-width:800px){.two{grid-template-columns:1fr}.event-row{display:block}.calendar{grid-template-columns:1fr}.calendar-head{display:none}table{font-size:.9rem}}';
     exit;
 }
 if (route() === 'email_open') {
@@ -1467,7 +1546,19 @@ if (route() === 'event_view') {
         if (isset($_POST['add_member_attendance'])) { require_permission('track_attendance'); $memberId=(int)$_POST['member_id']; if($memberId>0){ exec_sql('INSERT OR IGNORE INTO event_attendance (event_id,member_id,status,signed_up_at,created_at,updated_at) VALUES (?,? ,"signed_up",datetime("now"),datetime("now"),datetime("now"))',[$id,$memberId]); audit('attendance.member_added','event',$id,'success',null,['member_id'=>$memberId]); flash('Member added to attendance list.'); } redirect('event_view&id='.$id); }
         if (isset($_POST['delete_event'])) { if (!can_manage_events()) require_permission('manage_events'); exec_sql('DELETE FROM event_attendance WHERE event_id=?',[$id]); exec_sql('DELETE FROM event_guests WHERE event_id=?',[$id]); exec_sql('DELETE FROM event_attachments WHERE event_id=?',[$id]); exec_sql('DELETE FROM events WHERE id=?',[$id]); audit('event.delete','event',$id); flash('Event deleted.'); redirect('events'); }
         if (isset($_POST['add_guest_attendance'])) { require_permission('track_attendance'); $guestName=trim($_POST['guest_name'] ?? ''); if($guestName!==''){ exec_sql('INSERT INTO event_guests (event_id,name,comment_encrypted,attended,added_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,datetime("now"),datetime("now"))',[$id,$guestName,encrypt_value(trim($_POST['guest_comment'] ?? '')),0,$u['id']]); audit('attendance.guest_added','event',$id); flash('Guest / visitor added.'); } redirect('event_view&id='.$id); }
-        if (isset($_POST['mark_attendance'])) { require_permission('track_attendance'); $memberRows=all('SELECT member_id FROM event_attendance WHERE event_id=?',[$id]); $checkedMembers=$_POST['member_attended'] ?? []; foreach($memberRows as $row){ $memberId=(int)$row['member_id']; $isAttended=isset($checkedMembers[$memberId]) ? 1 : 0; exec_sql('UPDATE event_attendance SET attended=?, status=CASE WHEN ?=1 THEN "attended" ELSE "did_not_attend" END, marked_at=datetime("now"), marked_by_user_id=?, updated_at=datetime("now") WHERE event_id=? AND member_id=?',[$isAttended,$isAttended,$u['id'],$id,$memberId]); }
+        if (isset($_POST['mark_attendance'])) { require_permission('track_attendance');
+            $checkedMembers=$_POST['member_attended'] ?? [];
+            $activeMembers=all('SELECT m.id, ea.id attendance_id FROM members m LEFT JOIN event_attendance ea ON ea.member_id=m.id AND ea.event_id=? WHERE m.membership_status IN ("active","honorary","life_member")',[$id]);
+            foreach($activeMembers as $row){
+                $memberId=(int)$row['id'];
+                $isAttended=isset($checkedMembers[$memberId]) ? 1 : 0;
+                if ($isAttended) {
+                    exec_sql('INSERT OR IGNORE INTO event_attendance (event_id,member_id,status,attended,signed_up_at,marked_at,marked_by_user_id,created_at,updated_at) VALUES (?, ?, "attended", 1, COALESCE((SELECT signed_up_at FROM event_attendance WHERE event_id=? AND member_id=?), datetime("now")), datetime("now"), ?, datetime("now"), datetime("now"))',[$id,$memberId,$id,$memberId,$u['id']]);
+                    exec_sql('UPDATE event_attendance SET attended=1, status="attended", marked_at=datetime("now"), marked_by_user_id=?, updated_at=datetime("now") WHERE event_id=? AND member_id=?',[$u['id'],$id,$memberId]);
+                } elseif (!empty($row['attendance_id'])) {
+                    exec_sql('UPDATE event_attendance SET attended=0, status="did_not_attend", marked_at=datetime("now"), marked_by_user_id=?, updated_at=datetime("now") WHERE event_id=? AND member_id=?',[$u['id'],$id,$memberId]);
+                }
+            }
             $guestRows=all('SELECT id FROM event_guests WHERE event_id=?',[$id]); $checkedGuests=$_POST['guest_attended'] ?? []; foreach($guestRows as $row){ $guestId=(int)$row['id']; $isAttended=isset($checkedGuests[$guestId]) ? 1 : 0; $comment=trim($_POST['guest_comment_existing'][$guestId] ?? ''); exec_sql('UPDATE event_guests SET attended=?, comment_encrypted=?, updated_at=datetime("now") WHERE event_id=? AND id=?',[$isAttended,encrypt_value($comment),$id,$guestId]); }
             audit('attendance.update','event',$id); flash('Attendance updated.'); redirect('event_view&id='.$id); }
     }
@@ -1478,17 +1569,39 @@ if (route() === 'event_view') {
     $atts=all('SELECT * FROM event_attachments WHERE event_id=? ORDER BY created_at DESC',[$id]); echo '<h2>Attachments</h2>'; if(!$atts) echo '<p>No attachments.</p>'; else { echo '<ul>'; foreach($atts as $a) echo '<li><a href="?route=event_attachment&id='.e($a['id']).'">'.e($a['original_filename']).'</a> <span class="muted">'.e(round($a['file_size']/1024,1)).' KB</span></li>'; echo '</ul>'; }
     echo '<form method="post">'.csrf_field().'<input type="hidden" name="signup" value="1"><button>Sign up / mark me attending</button></form></div>';
     if (is_committee_or_admin()) {
-        $att=all('SELECT ea.*,m.first_name,m.last_name,m.callsign FROM event_attendance ea JOIN members m ON m.id=ea.member_id WHERE ea.event_id=? ORDER BY m.last_name,m.first_name',[$id]);
+        $membersForRegister=all('SELECT m.id,m.first_name,m.last_name,m.callsign,m.email,ea.status,ea.attended,ea.signed_up_at FROM members m LEFT JOIN event_attendance ea ON ea.member_id=m.id AND ea.event_id=? WHERE m.membership_status IN ("active","honorary","life_member") ORDER BY m.last_name,m.first_name',[$id]);
         $guests=all('SELECT * FROM event_guests WHERE event_id=? ORDER BY name',[$id]);
-        $available=all('SELECT id,first_name,last_name,callsign FROM members WHERE membership_status IN ("active","honorary","life_member") AND id NOT IN (SELECT member_id FROM event_attendance WHERE event_id=?) ORDER BY last_name,first_name',[$id]);
-        echo '<div class="card"><h2>Attendance register</h2><p class="muted">Committee members can mark attendance. Members can still self sign up in advance from the event page.</p><form method="post" class="attendance-tools">'.csrf_field().'<input type="hidden" name="add_member_attendance" value="1"><div><label>Add member to attendance list</label><select name="member_id"><option value="">Select member...</option>'; foreach($available as $m) echo '<option value="'.e($m['id']).'">'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'')).'</option>'; echo '</select></div><button>Add member</button></form>';
-        echo '<form method="post" class="attendance-tools">'.csrf_field().'<input type="hidden" name="add_guest_attendance" value="1"><div><label>Add visitor / guest</label><input name="guest_name" placeholder="Guest / visitor name"><label>Guest comments</label><input name="guest_comment" placeholder="Notes, callsign, reason for attending, etc."></div><button>Add guest</button></form>';
-        if(!$att && !$guests) echo '<p>No one has signed up yet. Add members/guests above to track attendance manually.</p>';
-        echo '<form method="post">'.csrf_field().'<input type="hidden" name="mark_attendance" value="1"><div class="attendance-list">';
-        foreach($att as $a){ echo '<div class="attendance-item"><input type="checkbox" name="member_attended['.e($a['member_id']).']" value="1" '.((string)$a['attended']==='1'?'checked':'').'><div><strong>'.e($a['first_name'].' '.$a['last_name']).'</strong> '.($a['callsign']?'<span class="muted">'.e($a['callsign']).'</span>':'').'<br><span class="muted">'.e($a['status']).' • '.e($a['signed_up_at'] ?: 'added manually').'</span></div><span class="pill">Member</span></div>'; }
-        foreach($guests as $g){ echo '<div class="attendance-item"><input type="checkbox" name="guest_attended['.e($g['id']).']" value="1" '.((string)$g['attended']==='1'?'checked':'').'><div><strong>'.e($g['name']).'</strong><br><input name="guest_comment_existing['.e($g['id']).']" value="'.e(decrypt_value($g['comment_encrypted'])).'" placeholder="Guest comments"></div><span class="pill">Guest</span></div>'; }
-        echo '</div><p><button>Save attendance register</button></p></form></div>';
+        $memberTotal=count($membersForRegister);
+        $memberPresent=0;
+        foreach($membersForRegister as $row){ if((string)$row['attended']==='1') $memberPresent++; }
+        $guestPresent=0;
+        foreach($guests as $row){ if((string)$row['attended']==='1') $guestPresent++; }
+        $memberAbsent=max(0,$memberTotal-$memberPresent);
+        echo '<div class="card attendance-modern" data-attendance-register>';
+        echo '<div class="attendance-modern-head"><div><h2>'.e($ev['title']).'</h2><div class="attendance-date">'.e(date('l j F Y, H:i', strtotime($ev['start_at']))).'</div><p class="muted">Committee members can mark attendance here. Members can still self sign up in advance from the event page.</p></div><div class="attendance-counts"><div><span>Members</span><strong class="present" data-count-members>'.e($memberPresent).'</strong></div><div><span>Guests</span><strong class="guest" data-count-guests>'.e($guestPresent).'</strong></div><div><span>Absent</span><strong class="absent" data-count-absent>'.e($memberAbsent).'</strong></div></div></div>';
+        echo '<form method="post">'.csrf_field().'<input type="hidden" name="mark_attendance" value="1">';
+        echo '<div class="attendance-modern-controls"><div class="attendance-search-wrap"><input class="attendance-search" data-att-search placeholder="Search members..."></div><select class="attendance-filter" data-att-filter><option value="all">All</option><option value="members">Members</option><option value="guests">Guests</option><option value="present">Present</option><option value="absent">Absent</option><option value="signed_up">Signed up</option></select><button type="button" class="secondary" data-att-all>✓ All</button><button type="button" class="secondary" data-att-none>× None</button></div>';
+        echo '<div class="attendance-modern-list">';
+        if(!$membersForRegister && !$guests) echo '<div class="attendance-empty">No active members or guests found for this register.</div>';
+        foreach($membersForRegister as $a){
+            $present=(string)$a['attended']==='1';
+            $signed=($a['status']==='signed_up');
+            $filterStatus=$present?'present':($signed?'signed_up':'absent');
+            $statusLabel=$present?'Present':($signed?'Signed up':'Absent');
+            $secondary=$a['callsign'] ?: $a['email'];
+            echo '<label class="attendance-modern-row" data-att-row data-kind="member" data-status="'.e($filterStatus).'" data-name="'.e(strtolower($a['first_name'].' '.$a['last_name'].' '.$a['callsign'].' '.$a['email'])).'"><input class="attendance-check" type="checkbox" name="member_attended['.e($a['id']).']" value="1" '.($present?'checked':'').'><span class="attendance-person"><strong>'.e($a['first_name'].' '.$a['last_name']).'</strong><span>'.e($secondary ?: 'No callsign/email recorded').'</span></span><span class="attendance-row-status '.($present?'present':'').'" data-row-status>'.e($statusLabel).'</span></label>';
+        }
+        foreach($guests as $g){
+            $present=(string)$g['attended']==='1';
+            $comment=decrypt_value($g['comment_encrypted']);
+            echo '<label class="attendance-modern-row" data-att-row data-kind="guest" data-status="'.($present?'present':'absent').'" data-name="'.e(strtolower($g['name'].' '.$comment)).'"><input class="attendance-check" type="checkbox" name="guest_attended['.e($g['id']).']" value="1" '.($present?'checked':'').'><span class="attendance-person"><strong>'.e($g['name']).'</strong><span><input name="guest_comment_existing['.e($g['id']).']" value="'.e($comment).'" placeholder="Guest comments"></span></span><span class="attendance-row-status '.($present?'present':'guest').'" data-row-status>'.e($present?'Present':'Guest absent').'</span></label>';
+        }
+        echo '</div><div class="attendance-savebar"><span class="muted">Tick members/guests who attended, then save the register.</span><button>Save attendance register</button></div></form>';
+        echo '<form method="post" class="attendance-modern-footer">'.csrf_field().'<input type="hidden" name="add_guest_attendance" value="1"><div><label>Add visitor / guest</label><input name="guest_name" placeholder="Guest / visitor name"></div><div><label>Guest comments</label><input name="guest_comment" placeholder="Notes, callsign, reason for attending, etc."></div><button>Add guest</button></form>';
+        echo '</div>';
+        echo '<script>(function(){var root=document.querySelector("[data-attendance-register]");if(!root)return;var search=root.querySelector("[data-att-search]"),filter=root.querySelector("[data-att-filter]");function rows(){return Array.prototype.slice.call(root.querySelectorAll("[data-att-row]"));}function update(){var q=(search.value||"").toLowerCase(),f=filter.value||"all",mp=0,gp=0,totalMembers=0;rows().forEach(function(r){var cb=r.querySelector(".attendance-check"),kind=r.dataset.kind,status=cb.checked?"present":(r.dataset.status==="signed_up"?"signed_up":"absent"),name=r.dataset.name||"";r.dataset.status=status;var okSearch=!q||name.indexOf(q)>-1;var okFilter=f==="all"||(f==="members"&&kind==="member")||(f==="guests"&&kind==="guest")||f===status; r.style.display=(okSearch&&okFilter)?"grid":"none";var label=r.querySelector("[data-row-status]");if(label){label.classList.toggle("present",cb.checked);if(kind==="guest"&&!cb.checked){label.classList.add("guest");}else{label.classList.remove("guest");}label.textContent=cb.checked?"Present":(kind==="guest"?"Guest absent":(status==="signed_up"?"Signed up":"Absent"));} if(kind==="member"){totalMembers++; if(cb.checked)mp++;} if(kind==="guest"&&cb.checked)gp++;});root.querySelector("[data-count-members]").textContent=mp;root.querySelector("[data-count-guests]").textContent=gp;root.querySelector("[data-count-absent]").textContent=Math.max(0,totalMembers-mp);}root.querySelector("[data-att-all]").addEventListener("click",function(){rows().forEach(function(r){if(r.style.display!=="none")r.querySelector(".attendance-check").checked=true;});update();});root.querySelector("[data-att-none]").addEventListener("click",function(){rows().forEach(function(r){if(r.style.display!=="none")r.querySelector(".attendance-check").checked=false;});update();});root.addEventListener("change",function(e){if(e.target.matches(".attendance-check,[data-att-filter]"))update();});search.addEventListener("input",update);update();})();</script>';
     }
+
     page_footer(); exit;
 }
 
@@ -1732,34 +1845,105 @@ if (route() === 'emails') {
                     $base=rtrim($cfg['base_url'] ?: ((isset($_SERVER['HTTPS'])?'https':'http').'://'.($_SERVER['HTTP_HOST']??'' ).dirname($_SERVER['SCRIPT_NAME'])), '/');
                     $singleBody.='<img src="'.$base.'/?route=email_open&id='.e($r['tracking_id']).'" width="1" height="1" alt="">';
                 }
-                $ok=@mail($r['email_address'],$_POST['subject'],$singleBody,$headers);
-                exec_sql('UPDATE email_recipients SET status=?, sent_at=CASE WHEN ?=1 THEN datetime("now") ELSE sent_at END, failed_at=CASE WHEN ?=0 THEN datetime("now") ELSE failed_at END, failure_reason=CASE WHEN ?=0 THEN "mail() failed or not configured" ELSE NULL END, updated_at=datetime("now") WHERE id=?',[$ok?'sent':'failed',$ok?1:0,$ok?1:0,$ok?1:0,$r['id']]);
+                $send=send_configured_email($cfg, [$r['email_address']], [], $_POST['subject'], $singleBody, $safeFromName, $safeFromAddress, $safeReplyTo);
+                $ok=(bool)$send['ok']; $sendError=$send['error'] ?? null;
+                exec_sql('UPDATE email_recipients SET status=?, sent_at=CASE WHEN ?=1 THEN datetime("now") ELSE sent_at END, failed_at=CASE WHEN ?=0 THEN datetime("now") ELSE failed_at END, failure_reason=CASE WHEN ?=0 THEN ? ELSE NULL END, updated_at=datetime("now") WHERE id=?',[$ok?'sent':'failed',$ok?1:0,$ok?1:0,$ok?1:0,$sendError,$r['id']]);
             } else {
-                $bcc = implode(', ', array_map(fn($r) => str_replace(["\r","\n"], '', $r['email_address']), $recips));
-                $bulkHeaders = $headers . 'Bcc: ' . $bcc . "\r\n";
-                $ok=@mail($safeFromAddress,$_POST['subject'],$body,$bulkHeaders);
+                $bcc = array_map(fn($r) => str_replace(["\r","\n"], '', $r['email_address']), $recips);
+                $send=send_configured_email($cfg, [$safeFromAddress], $bcc, $_POST['subject'], $body, $safeFromName, $safeFromAddress, $safeReplyTo);
+                $ok=(bool)$send['ok']; $sendError=$send['error'] ?? null;
                 foreach($recips as $r){
-                    exec_sql('UPDATE email_recipients SET status=?, sent_at=CASE WHEN ?=1 THEN datetime("now") ELSE sent_at END, failed_at=CASE WHEN ?=0 THEN datetime("now") ELSE failed_at END, failure_reason=CASE WHEN ?=0 THEN "mail() failed or not configured" ELSE NULL END, tracking_enabled=0, tracking_id=NULL, updated_at=datetime("now") WHERE id=?',[$ok?'sent_bcc':'failed',$ok?1:0,$ok?1:0,$ok?1:0,$r['id']]);
+                    exec_sql('UPDATE email_recipients SET status=?, sent_at=CASE WHEN ?=1 THEN datetime("now") ELSE sent_at END, failed_at=CASE WHEN ?=0 THEN datetime("now") ELSE failed_at END, failure_reason=CASE WHEN ?=0 THEN ? ELSE NULL END, tracking_enabled=0, tracking_id=NULL, updated_at=datetime("now") WHERE id=?',[$ok?'sent_bcc':'failed',$ok?1:0,$ok?1:0,$ok?1:0,$sendError,$r['id']]);
                 }
             }
-            exec_sql('UPDATE emails SET status="sent", sent_at=datetime("now"), updated_at=datetime("now") WHERE id=?',[$email_id]);
-            audit('email.sent','email',$email_id,'success',null,['recipient_count'=>count($recips),'bcc_used'=>count($recips)>1]);
-            flash('Email created and send attempted. If more than one recipient was selected, the email was sent using BCC.'); redirect('emails');
+            exec_sql('UPDATE emails SET status=?, sent_at=CASE WHEN ?=1 THEN datetime("now") ELSE sent_at END, updated_at=datetime("now") WHERE id=?',[$ok?'sent':'failed',$ok?1:0,$email_id]);
+            audit('email.sent','email',$email_id,'success',null,['recipient_count'=>count($recips),'bcc_used'=>count($recips)>1,'method'=>$cfg['email_method'] ?? 'php_mail']);
+            flash('Email created and send attempted using '.(($cfg['email_method'] ?? 'php_mail') === 'resend' ? 'Resend API' : 'PHP mail').'. If more than one recipient was selected, the email was sent using BCC.'); redirect('emails');
         }
         audit('email.draft_created','email',$email_id,'success',null,['recipient_count'=>count($members),'recipient_mode'=>$recipientMode]);
         flash('Email draft created with recipients.'); redirect('emails');
     }
     $emails=all('SELECT * FROM emails ORDER BY created_at DESC LIMIT 25');
-    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Email communications</h1>';
-    if (is_admin_user()) echo '<a class="btn secondary" href="?route=email_config">Email system config</a>';
-    echo '</div><p class="muted">Select individual members or use Send all. Any email with more than one recipient is sent using BCC for privacy. Members must be active and opted in to email communications.</p><table><tr><th>Subject</th><th>Status</th><th>Sent</th><th>Recipients</th><th>Opens</th></tr>';
+    $eligible=all('SELECT DISTINCT m.id,m.first_name,m.last_name,m.callsign,m.email,m.membership_status, (SELECT sp.status FROM subscription_payments sp WHERE sp.member_id=m.id ORDER BY sp.subscription_year DESC, COALESCE(sp.payment_date, "") DESC, sp.id DESC LIMIT 1) AS latest_subs_status, EXISTS(SELECT 1 FROM users uu JOIN user_roles ur ON ur.user_id=uu.id JOIN roles rr ON rr.id=ur.role_id WHERE uu.member_id=m.id AND rr.name="committee" AND (ur.expires_at IS NULL OR ur.expires_at > datetime("now"))) AS is_committee FROM members m JOIN member_consents c ON c.member_id=m.id AND c.consent_type="email_comms" AND c.granted=1 WHERE m.membership_status="active" AND m.email IS NOT NULL AND m.email <> "" ORDER BY m.last_name,m.first_name');
+    $fromAddress = trim($cfg['email_from_address'] ?: ('no-reply@' . ($_SERVER['HTTP_HOST'] ?? 'localhost')));
+    $fromName = trim($cfg['email_from_name'] ?: ($cfg['society_name'] ?? 'Membership System'));
+
+    echo '<div class="email-app"><form method="post" enctype="multipart/form-data" id="emailComposeForm">'.csrf_field().'<input type="hidden" name="category" value="admin"><input type="hidden" name="recipient_mode" value="selected"><div class="email-top"><div class="email-title"><span class="email-icon">✉</span><strong>New Email</strong></div><div class="email-top-actions">';
+    if (is_admin_user()) echo '<a class="email-config-btn" href="?route=email_config">Email system config</a>';
+    echo '</div></div><div class="email-layout"><aside class="email-sidebar"><div class="email-recipient-head"><span class="email-people">☷</span><strong>Recipients</strong><span class="email-count" id="emailSelectedCount">0</span></div><div class="email-filter-bar"><button type="button" class="email-chip active" data-email-filter="all">All</button><button type="button" class="email-chip paid" data-email-filter="paid">Paid</button><button type="button" class="email-chip unpaid" data-email-filter="unpaid">Unpaid</button><button type="button" class="email-chip pending" data-email-filter="pending">Pending</button><button type="button" class="email-chip committee" data-email-filter="committee">Committee</button><button type="button" class="email-chip none" data-email-filter="none">None</button></div><div class="email-search-wrap"><input id="emailMemberSearch" class="email-search" placeholder="Search members..."></div><div class="email-member-list">';
+    if(!$eligible) echo '<p class="email-empty">No active members with email communications consent are available.</p>';
+    foreach($eligible as $m){
+        $subsStatus = strtolower(trim((string)($m['latest_subs_status'] ?: 'unpaid')));
+        if (!in_array($subsStatus, ['paid','unpaid','pending','part-paid','part_paid','waived','refunded'], true)) $subsStatus = 'unpaid';
+        $paymentGroup = str_contains($subsStatus, 'paid') && $subsStatus !== 'unpaid' ? 'paid' : ($subsStatus === 'pending' ? 'pending' : 'unpaid');
+        $badgeText = $paymentGroup === 'paid' ? 'Paid' : ($paymentGroup === 'pending' ? 'Pending' : 'Unpaid');
+        $name=e($m['first_name'].' '.$m['last_name']); $email=e($m['email']); $callsign=e($m['callsign'] ?: '');
+        echo '<label class="email-member-card" data-name="'.strtolower(e($m['first_name'].' '.$m['last_name'].' '.$m['email'].' '.$m['callsign'])).'" data-payment="'.e($paymentGroup).'" data-committee="'.((int)$m['is_committee'] ? '1' : '0').'"><input class="email-member-check" type="checkbox" name="member_ids[]" value="'.e($m['id']).'" checked><span class="email-check-ui">✓</span><span class="email-member-main"><strong>'.$name.'</strong>'.($callsign?'<span class="email-callsign">'.$callsign.'</span>':'').'<small>'.$email.'</small></span><span class="email-badge '.e($paymentGroup).'">'.e($badgeText).'</span></label>';
+    }
+    echo '</div></aside><section class="email-compose"><div class="email-fields"><div class="email-row"><label>To:</label><input id="emailToSummary" value="0 members selected" readonly></div><div class="email-row"><label>From:</label><input value="'.e($fromName).' <'.e($fromAddress).'>" readonly></div><div class="email-row"><label>Subject:</label><input name="subject" placeholder="Email subject..." required></div></div><div class="email-toolbar"><label class="email-attach-btn">📎 Attach<input type="file" name="attachment" id="emailAttachment"></label><span id="emailAttachName" class="email-help">Use <code>{member_name}</code> to personalise each email.</span></div><textarea class="email-message" name="body_html" placeholder="Write your message here... Use {member_name} to personalise for each recipient." required></textarea><div class="email-sendbar"><span class="muted">Multiple-recipient emails are sent using BCC for member privacy.</span><div><button class="secondary" type="submit">Save draft</button> <button name="send_now" value="1">Send now</button></div></div></section></div></form></div>';
+
+    echo '<div class="card"><h2>Recent emails</h2><table><tr><th>Subject</th><th>Status</th><th>Sent</th><th>Recipients</th><th>Opens</th></tr>';
     foreach($emails as $em){ $rc=first('SELECT COUNT(*) c, SUM(open_count) opens FROM email_recipients WHERE email_id=?',[$em['id']]); echo '<tr><td>'.e($em['subject']).'</td><td>'.e($em['status']).'</td><td>'.e($em['sent_at']).'</td><td>'.e($rc['c']).'</td><td>'.e($rc['opens'] ?: 0).'</td></tr>'; }
     echo '</table></div>';
-    $eligible=all('SELECT DISTINCT m.id,m.first_name,m.last_name,m.callsign,m.email FROM members m JOIN member_consents c ON c.member_id=m.id AND c.consent_type="email_comms" AND c.granted=1 WHERE m.membership_status="active" AND m.email IS NOT NULL AND m.email <> "" ORDER BY m.last_name,m.first_name');
-    echo '<div class="card"><h2>Compose email</h2><form method="post" enctype="multipart/form-data">'.csrf_field().'<label>Category</label><select name="category"><option>admin</option><option>subs</option><option>events</option><option>newsletter</option><option>brickworks</option></select><label>Subject</label><input name="subject" required><label>Body HTML</label><textarea name="body_html" placeholder="Use basic HTML formatting" required></textarea><label>Attachment</label><input type="file" name="attachment"><h3>Recipients</h3><label><input type="radio" name="recipient_mode" value="all"> Send all eligible active members</label><label><input type="radio" name="recipient_mode" value="selected" checked> Send selected members only</label><div class="recipient-list">';
-    if(!$eligible) echo '<p>No active members with email communications consent are available.</p>';
-    foreach($eligible as $m){ echo '<label class="recipient-item"><input type="checkbox" name="member_ids[]" value="'.e($m['id']).'"> <span><strong>'.e($m['first_name'].' '.$m['last_name']).'</strong> '.($m['callsign']?'<span class="muted">'.e($m['callsign']).'</span>':'').'<br><span class="muted">'.e($m['email']).'</span></span></label>'; }
-    echo '</div><p><button name="send_now" value="1">Send now</button> <button class="secondary">Save draft</button></p></form></div>';
+    echo <<<'HTML'
+<script>
+(function(){
+  const cards = Array.from(document.querySelectorAll('.email-member-card'));
+  const checks = Array.from(document.querySelectorAll('.email-member-check'));
+  const count = document.getElementById('emailSelectedCount');
+  const toSummary = document.getElementById('emailToSummary');
+  const search = document.getElementById('emailMemberSearch');
+  const chips = Array.from(document.querySelectorAll('[data-email-filter]'));
+  const attach = document.getElementById('emailAttachment');
+  const attachName = document.getElementById('emailAttachName');
+  let activeFilter = 'all';
+
+  function updateCount(){
+    const selected = checks.filter(c => c.checked).length;
+    if (count) count.textContent = selected;
+    if (toSummary) toSummary.value = selected + (selected === 1 ? ' member selected' : ' members selected');
+  }
+  function applyFilter(){
+    const q = (search && search.value ? search.value : '').trim().toLowerCase();
+    cards.forEach(card => {
+      let show = true;
+      if (activeFilter === 'paid') show = card.dataset.payment === 'paid';
+      if (activeFilter === 'unpaid') show = card.dataset.payment === 'unpaid';
+      if (activeFilter === 'pending') show = card.dataset.payment === 'pending';
+      if (activeFilter === 'committee') show = card.dataset.committee === '1';
+      if (q && !(card.dataset.name || '').includes(q)) show = false;
+      card.style.display = show ? 'grid' : 'none';
+    });
+  }
+  chips.forEach(chip => chip.addEventListener('click', () => {
+    activeFilter = chip.dataset.emailFilter;
+    chips.forEach(c => c.classList.toggle('active', c === chip));
+    if (activeFilter === 'none') {
+      checks.forEach(c => c.checked = false);
+      activeFilter = 'all';
+      chips.forEach(c => c.classList.toggle('active', c.dataset.emailFilter === 'all'));
+    } else if (activeFilter === 'all') {
+      checks.forEach(c => c.checked = true);
+    } else {
+      checks.forEach(c => {
+        const card = c.closest('.email-member-card');
+        let match = false;
+        if (activeFilter === 'paid') match = card.dataset.payment === 'paid';
+        if (activeFilter === 'unpaid') match = card.dataset.payment === 'unpaid';
+        if (activeFilter === 'pending') match = card.dataset.payment === 'pending';
+        if (activeFilter === 'committee') match = card.dataset.committee === '1';
+        c.checked = match;
+      });
+    }
+    applyFilter(); updateCount();
+  }));
+  checks.forEach(c => c.addEventListener('change', updateCount));
+  if (search) search.addEventListener('input', applyFilter);
+  if (attach) attach.addEventListener('change', () => { if (attach.files.length) attachName.textContent = attach.files[0].name; });
+  updateCount(); applyFilter();
+})();
+</script>
+HTML;
     page_footer(); exit;
 }
 
@@ -1778,10 +1962,11 @@ if (route() === 'email_config') {
             'smtp_security' => trim($_POST['smtp_security'] ?? 'tls'),
             'smtp_username' => trim($_POST['smtp_username'] ?? ''),
             'smtp_password' => trim($_POST['smtp_password'] ?? ''),
+            'resend_api_key' => trim($_POST['resend_api_key'] ?? ''),
         ]);
         audit('email.config.update'); flash('Email configuration saved.'); redirect('email_config');
     }
-    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Email system config</h1><a class="btn secondary" href="?route=emails">Back to emails</a></div><p class="muted">These settings control the sender details. SMTP fields are stored here ready for production SMTP wiring; the starter currently sends through PHP mail().</p><form method="post">'.csrf_field().'<div class="two"><div><label>From name</label><input name="email_from_name" value="'.e($cfg['email_from_name']).'"></div><div><label>From email address</label><input type="email" name="email_from_address" value="'.e($cfg['email_from_address']).'" placeholder="noreply@example.org"></div><div><label>Reply-to email</label><input type="email" name="email_reply_to" value="'.e($cfg['email_reply_to']).'"></div><div><label>Mail method</label><select name="email_method"><option value="php_mail" '.($cfg['email_method']==='php_mail'?'selected':'').'>PHP mail()</option><option value="smtp" '.($cfg['email_method']==='smtp'?'selected':'').'>SMTP settings stored</option></select></div><div><label>SMTP host</label><input name="smtp_host" value="'.e($cfg['smtp_host']).'"></div><div><label>SMTP port</label><input name="smtp_port" value="'.e($cfg['smtp_port']).'"></div><div><label>SMTP security</label><select name="smtp_security"><option value="tls" '.($cfg['smtp_security']==='tls'?'selected':'').'>TLS</option><option value="ssl" '.($cfg['smtp_security']==='ssl'?'selected':'').'>SSL</option><option value="none" '.($cfg['smtp_security']==='none'?'selected':'').'>None</option></select></div><div><label>SMTP username</label><input name="smtp_username" value="'.e($cfg['smtp_username']).'"></div><div><label>SMTP password</label><input type="password" name="smtp_password" value="'.e($cfg['smtp_password']).'"></div></div><p><button>Save email config</button></p></form></div>';
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Email system config</h1><a class="btn secondary" href="?route=emails">Back to emails</a></div><p class="muted">Choose how the system sends email. PHP mail uses the server mail setup. Resend API sends via Resend using the API key below. SMTP fields are stored for future SMTP wiring.</p><form method="post">'.csrf_field().'<div class="two"><div><label>From name</label><input name="email_from_name" value="'.e($cfg['email_from_name']).'"></div><div><label>From email address</label><input type="email" name="email_from_address" value="'.e($cfg['email_from_address']).'" placeholder="noreply@example.org"></div><div><label>Reply-to email</label><input type="email" name="email_reply_to" value="'.e($cfg['email_reply_to']).'"></div><div><label>Mail method</label><select name="email_method"><option value="php_mail" '.($cfg['email_method']==='php_mail'?'selected':'').'>PHP mail()</option><option value="resend" '.($cfg['email_method']==='resend'?'selected':'').'>Resend API</option><option value="smtp" '.($cfg['email_method']==='smtp'?'selected':'').'>SMTP settings stored</option></select></div><div class="full"><label>Resend API key</label><input type="password" name="resend_api_key" value="'.e($cfg['resend_api_key'] ?? '').'" placeholder="re_..."><p class="muted small">Used only when Mail method is set to Resend API. The From email must be allowed/verified in your Resend account.</p></div><div><label>SMTP host</label><input name="smtp_host" value="'.e($cfg['smtp_host']).'"></div><div><label>SMTP port</label><input name="smtp_port" value="'.e($cfg['smtp_port']).'"></div><div><label>SMTP security</label><select name="smtp_security"><option value="tls" '.($cfg['smtp_security']==='tls'?'selected':'').'>TLS</option><option value="ssl" '.($cfg['smtp_security']==='ssl'?'selected':'').'>SSL</option><option value="none" '.($cfg['smtp_security']==='none'?'selected':'').'>None</option></select></div><div><label>SMTP username</label><input name="smtp_username" value="'.e($cfg['smtp_username']).'"></div><div><label>SMTP password</label><input type="password" name="smtp_password" value="'.e($cfg['smtp_password']).'"></div></div><p><button>Save email config</button></p></form></div>';
     page_footer(); exit;
 }
 
