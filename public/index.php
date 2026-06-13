@@ -93,6 +93,33 @@ function require_permission(string $permission): void {
         exit;
     }
 }
+function client_ip(): ?string {
+    // Cloudflare Tunnel / Cloudflare proxy aware client IP handling.
+    // Prefer CF-Connecting-IP, then True-Client-IP, then first valid X-Forwarded-For IP, then REMOTE_ADDR.
+    $candidates = [];
+    if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) $candidates[] = $_SERVER['HTTP_CF_CONNECTING_IP'];
+    if (!empty($_SERVER['HTTP_TRUE_CLIENT_IP'])) $candidates[] = $_SERVER['HTTP_TRUE_CLIENT_IP'];
+    if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        foreach (explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']) as $ip) $candidates[] = trim($ip);
+    }
+    if (!empty($_SERVER['REMOTE_ADDR'])) $candidates[] = $_SERVER['REMOTE_ADDR'];
+    foreach ($candidates as $ip) {
+        if (filter_var($ip, FILTER_VALIDATE_IP)) return $ip;
+    }
+    return $_SERVER['REMOTE_ADDR'] ?? null;
+}
+function request_ip_metadata(): array {
+    return [
+        'client_ip_source' => !empty($_SERVER['HTTP_CF_CONNECTING_IP']) ? 'cf_connecting_ip' : (!empty($_SERVER['HTTP_TRUE_CLIENT_IP']) ? 'true_client_ip' : (!empty($_SERVER['HTTP_X_FORWARDED_FOR']) ? 'x_forwarded_for' : 'remote_addr')),
+        'remote_addr' => $_SERVER['REMOTE_ADDR'] ?? null,
+        'cf_connecting_ip' => $_SERVER['HTTP_CF_CONNECTING_IP'] ?? null,
+        'true_client_ip' => $_SERVER['HTTP_TRUE_CLIENT_IP'] ?? null,
+        'x_forwarded_for' => $_SERVER['HTTP_X_FORWARDED_FOR'] ?? null,
+        'cf_ray' => $_SERVER['HTTP_CF_RAY'] ?? null,
+        'cf_ipcountry' => $_SERVER['HTTP_CF_IPCOUNTRY'] ?? null,
+    ];
+}
+
 function audit(string $action, ?string $entity_type=null, ?int $entity_id=null, string $result='success', ?string $reason=null, array $metadata=[]): void {
     if (!installed() || !file_exists(DB_PATH)) return;
     $u = current_user();
@@ -105,10 +132,10 @@ function audit(string $action, ?string $entity_type=null, ?int $entity_id=null, 
             $entity_id,
             $result,
             $reason,
-            $_SERVER['REMOTE_ADDR'] ?? null,
+            client_ip(),
             $_SERVER['HTTP_USER_AGENT'] ?? null,
             session_id(),
-            $metadata ? json_encode($metadata) : null
+            json_encode(array_filter(array_merge($metadata, ['ip_details' => request_ip_metadata()]), fn($v) => $v !== null && $v !== []))
         ]);
     } catch (Throwable $e) { /* never break app because logging failed */ }
 }
@@ -161,6 +188,12 @@ function ensure_schema_updates(): void {
     if (!table_has_column('members', 'joined_before_system')) {
         db()->exec('ALTER TABLE members ADD COLUMN joined_before_system INTEGER NOT NULL DEFAULT 0');
     }
+    if (!table_has_column('equipment', 'purchase_date')) {
+        db()->exec('ALTER TABLE equipment ADD COLUMN purchase_date TEXT NULL');
+    }
+    if (!table_has_column('equipment', 'purchase_amount')) {
+        db()->exec('ALTER TABLE equipment ADD COLUMN purchase_amount REAL NULL');
+    }
     db()->exec('CREATE TABLE IF NOT EXISTS event_guests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_id INTEGER NOT NULL,
@@ -168,6 +201,37 @@ function ensure_schema_updates(): void {
         comment_encrypted TEXT NULL,
         attended INTEGER NOT NULL DEFAULT 0,
         added_by_user_id INTEGER NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )');
+    db()->exec('CREATE TABLE IF NOT EXISTS equipment_maintenance_tickets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        equipment_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT "open",
+        priority TEXT NOT NULL DEFAULT "normal",
+        due_date TEXT NULL,
+        description_encrypted TEXT NULL,
+        action_taken_encrypted TEXT NULL,
+        cost REAL NULL,
+        assigned_user_id INTEGER NULL,
+        created_by_user_id INTEGER NULL,
+        closed_at TEXT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )');
+    db()->exec('CREATE TABLE IF NOT EXISTS committee_actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT "open",
+        priority TEXT NOT NULL DEFAULT "normal",
+        action_required TEXT NOT NULL,
+        description_encrypted TEXT NULL,
+        due_date TEXT NULL,
+        assigned_user_id INTEGER NULL,
+        assigned_member_id INTEGER NULL,
+        created_by_user_id INTEGER NULL,
+        completed_at TEXT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )');
@@ -227,9 +291,14 @@ function page_header(string $title): void {
         echo '<nav class="main-nav">';
         echo '<a href="?route=dashboard">Dashboard</a><a href="?route=events">Programme</a><a href="?route=directory">Directory</a><a href="?route=brickworks">Brickworks</a>';
         if (is_committee_or_admin()) {
-            echo '<div class="dropdown"><button type="button" class="nav-drop">Committee ▾</button><div class="dropdown-menu">';
-            if (has_permission('view_equipment')) echo '<a href="?route=equipment">Equipment</a>';
-            echo '<a href="?route=members">Members</a><a href="?route=users">Users</a><a href="?route=attendance">Attendance tracking</a><a href="?route=attendance_stats">Attendance stats</a><a href="?route=audit">Audit logs</a><a href="?route=emails">Emails</a>';
+            echo '<div class="dropdown"><button type="button" class="nav-drop" aria-haspopup="true">Committee ▾</button><div class="dropdown-menu">';
+            if (has_permission('view_membership_db')) echo '<a href="?route=members">Members</a>';
+            if (has_permission('track_attendance')) echo '<a href="?route=attendance">Attendance</a><a href="?route=attendance_stats">Attendance stats</a>';
+            if (has_permission('send_member_emails')) echo '<a href="?route=emails">Emails</a>';
+            if (has_permission('view_equipment')) echo '<a href="?route=equipment">Equipment / assets</a>';
+            if (has_permission('view_committee_actions')) echo '<a href="?route=committee_actions">Actions</a>';
+            if (has_permission('manage_users')) echo '<a href="?route=users">Users</a>';
+            if (has_permission('view_audit_logs')) echo '<a href="?route=audit">Audit logs</a>';
             echo '</div></div>';
         }
         echo '<div class="dropdown user-menu"><button type="button" class="nav-drop">' . e($displayName) . ' ▾</button><div class="dropdown-menu dropdown-right"><a href="?route=profile">My Profile</a><a href="?route=logout">Logout</a></div></div>';
@@ -238,7 +307,25 @@ function page_header(string $title): void {
     echo '</header><main>';
     if (!empty($_SESSION['flash'])) { echo '<div class="flash">' . e($_SESSION['flash']) . '</div>'; unset($_SESSION['flash']); }
 }
-function page_footer(): void { echo '</main><footer>Audit logging enabled • Private uploads are stored outside web root • Open tracking is opt-in only</footer></body></html>'; }
+function page_footer(): void {
+    echo <<<'HTML'
+</main><footer>Audit logging enabled • Private uploads are stored outside web root • Open tracking is opt-in only</footer>
+<script>
+document.querySelectorAll('.nav-drop').forEach(function(btn){
+  btn.addEventListener('click', function(e){
+    var d = btn.closest('.dropdown');
+    if (!d) return;
+    e.preventDefault();
+    document.querySelectorAll('.dropdown.open').forEach(function(x){ if (x !== d) x.classList.remove('open'); });
+    d.classList.toggle('open');
+  });
+});
+document.addEventListener('click', function(e){
+  if (!e.target.closest('.dropdown')) document.querySelectorAll('.dropdown.open').forEach(function(x){ x.classList.remove('open'); });
+});
+</script></body></html>
+HTML;
+}
 function flash(string $msg): void { $_SESSION['flash'] = $msg; }
 
 function create_schema(): void {
@@ -434,6 +521,8 @@ CREATE TABLE IF NOT EXISTS equipment (
  serial_number_encrypted TEXT NULL,
  location TEXT NULL,
  condition TEXT NULL,
+ purchase_date TEXT NULL,
+ purchase_amount REAL NULL,
  value REAL NULL,
  maintenance_due_at TEXT NULL,
  notes_encrypted TEXT NULL,
@@ -463,6 +552,37 @@ CREATE TABLE IF NOT EXISTS maintenance_logs (
  cost REAL NULL,
  completed_by_user_id INTEGER NULL,
  next_due_at TEXT NULL,
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS equipment_maintenance_tickets (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ equipment_id INTEGER NOT NULL,
+ title TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'open',
+ priority TEXT NOT NULL DEFAULT 'normal',
+ due_date TEXT NULL,
+ description_encrypted TEXT NULL,
+ action_taken_encrypted TEXT NULL,
+ cost REAL NULL,
+ assigned_user_id INTEGER NULL,
+ created_by_user_id INTEGER NULL,
+ closed_at TEXT NULL,
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS committee_actions (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ title TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'open',
+ priority TEXT NOT NULL DEFAULT 'normal',
+ action_required TEXT NOT NULL,
+ description_encrypted TEXT NULL,
+ due_date TEXT NULL,
+ assigned_user_id INTEGER NULL,
+ assigned_member_id INTEGER NULL,
+ created_by_user_id INTEGER NULL,
+ completed_at TEXT NULL,
  created_at TEXT NOT NULL,
  updated_at TEXT NOT NULL
 );
@@ -629,15 +749,15 @@ function seed_roles_permissions(): void {
     ];
     $permissions = [
         'view_own_profile','edit_own_profile','view_events','signup_events','view_internal_directory','search_internal_directory','manage_own_directory_preferences','manage_own_email_preferences','view_own_brickworks','join_brickworks','submit_brickworks_evidence',
-        'manage_events','track_attendance','view_equipment','edit_equipment','manage_equipment_loans','view_membership_db','edit_membership_db','manage_subscriptions','export_member_data','manage_users','manage_roles','reset_passwords','view_audit_logs','view_security_logs','view_member_audit_logs','view_equipment_audit_logs','export_audit_logs','view_brickworks_participants','review_brickworks_evidence','approve_brickworks_criteria','manage_brickworks_criteria','export_brickworks_reports','send_member_emails','send_role_emails','send_event_emails','send_subs_reminders','send_brickworks_emails','manage_email_templates','view_email_reports','view_email_open_tracking','manage_email_attachments','system_admin'
+        'manage_events','track_attendance','view_committee_actions','manage_committee_actions','view_equipment','edit_equipment','manage_equipment_loans','view_membership_db','edit_membership_db','manage_subscriptions','export_member_data','manage_users','manage_roles','reset_passwords','view_audit_logs','view_security_logs','view_member_audit_logs','view_equipment_audit_logs','export_audit_logs','view_brickworks_participants','review_brickworks_evidence','approve_brickworks_criteria','manage_brickworks_criteria','export_brickworks_reports','send_member_emails','send_role_emails','send_event_emails','send_subs_reminders','send_brickworks_emails','manage_email_templates','view_email_reports','view_email_open_tracking','manage_email_attachments','system_admin'
     ];
     foreach ($roles as $name=>$display) exec_sql('INSERT OR IGNORE INTO roles (name, display_name, description, created_at, updated_at) VALUES (?, ?, ?, datetime("now"), datetime("now"))', [$name,$display,$display]);
     foreach ($permissions as $p) exec_sql('INSERT OR IGNORE INTO permissions (name, description, created_at, updated_at) VALUES (?, ?, datetime("now"), datetime("now"))', [$p,$p]);
     $rolePerms = [
         'member' => ['view_own_profile','edit_own_profile','view_events','signup_events','view_internal_directory','search_internal_directory','manage_own_directory_preferences','manage_own_email_preferences','view_own_brickworks','join_brickworks','submit_brickworks_evidence'],
-        'committee' => ['view_events','manage_events','track_attendance','view_equipment','edit_equipment','manage_equipment_loans'],
+        'committee' => ['view_events','manage_events','track_attendance','view_committee_actions','manage_committee_actions','view_equipment','edit_equipment','manage_equipment_loans'],
         'equipment_manager' => ['view_equipment','edit_equipment','manage_equipment_loans','view_equipment_audit_logs'],
-        'event_manager' => ['manage_events','track_attendance','send_event_emails'],
+        'event_manager' => ['manage_events','track_attendance','view_committee_actions','manage_committee_actions','send_event_emails'],
         'member_db' => ['view_membership_db','edit_membership_db','manage_subscriptions','export_member_data','view_member_audit_logs','send_member_emails','send_subs_reminders','view_email_reports','view_email_open_tracking'],
         'brickworks_reviewer' => ['view_brickworks_participants','review_brickworks_evidence','approve_brickworks_criteria','export_brickworks_reports','send_brickworks_emails'],
         'treasurer' => ['view_membership_db','manage_subscriptions','send_subs_reminders'],
@@ -704,7 +824,7 @@ function brickworks_award(int $complete): ?string {
 
 if (route() === 'assets.css') {
     header('Content-Type: text/css');
-    echo 'body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#f6f7fb;color:#18202a}header{background:#101827;color:white;padding:18px 24px}header div{display:flex;gap:12px;align-items:end}header span{opacity:.7}.main-nav{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center}.main-nav a,.nav-drop{color:white;background:#24324a;padding:8px 10px;border-radius:8px;text-decoration:none;border:0;font:inherit;cursor:pointer}.dropdown{position:relative;padding-bottom:8px;margin-bottom:-8px}.dropdown-menu{display:none;position:absolute;z-index:999;top:100%;left:0;min-width:220px;background:white;border-radius:10px;box-shadow:0 10px 25px #0003;padding:8px;margin-top:0}.dropdown:hover .dropdown-menu,.dropdown:focus-within .dropdown-menu{display:block}.dropdown-menu a{display:block;color:#18202a;background:white;padding:10px;border-radius:8px}.dropdown-menu a:hover{background:#f1f5f9}main{max-width:1180px;margin:24px auto;padding:0 18px}.card{background:white;border-radius:14px;padding:18px;margin:16px 0;box-shadow:0 1px 4px #0001}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}label{display:block;margin:10px 0 4px;font-weight:600}input,select,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd3df;border-radius:8px}textarea{min-height:110px}button,.btn{background:#1d4ed8;color:white;border:0;border-radius:8px;padding:10px 14px;text-decoration:none;display:inline-block;cursor:pointer}button.secondary,.btn.secondary{background:#475569}.btn.danger,button.danger{background:#b91c1c}table{width:100%;border-collapse:collapse;background:white}th,td{border-bottom:1px solid #e5e7eb;padding:10px;text-align:left;vertical-align:top}th{background:#f1f5f9}.flash{background:#dcfce7;border:1px solid #86efac;padding:12px;border-radius:10px}.danger-box,.card.danger{background:#fee2e2;border:1px solid #fecaca}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#e0e7ff}.muted{color:#64748b}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.event-list{display:grid;gap:12px}.event-row{display:flex;gap:18px;justify-content:space-between;align-items:flex-start;border:1px solid #e5e7eb;border-radius:12px;padding:14px;background:#fff}.event-actions{white-space:nowrap}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}.calendar-head{font-weight:700;text-align:center;background:#e2e8f0;border-radius:8px;padding:8px}.calendar-day{min-height:110px;background:white;border:1px solid #e5e7eb;border-radius:10px;padding:8px}.calendar-day.muted-day{background:#f8fafc;color:#94a3b8}.calendar-date{font-weight:700;margin-bottom:6px}.calendar-event{display:block;background:#dbeafe;color:#1e3a8a;text-decoration:none;border-radius:8px;padding:5px;margin:4px 0;font-size:.88rem}.leaderboard{counter-reset:rank}.leaderboard-row{display:grid;grid-template-columns:42px 1fr auto;gap:10px;align-items:center;border-bottom:1px solid #e5e7eb;padding:10px 0}.leaderboard-row:before{counter-increment:rank;content:counter(rank);background:#e0e7ff;border-radius:999px;width:30px;height:30px;display:grid;place-items:center;font-weight:700}.progressbar{height:10px;background:#e5e7eb;border-radius:999px;overflow:hidden}.progressbar span{display:block;height:100%;background:#1d4ed8}.small{font-size:.9rem}.status-complete{background:#dcfce7}.status-pending{background:#fef3c7}.status-none{background:#f1f5f9}.user-menu{margin-left:auto}.dropdown-right{right:0;left:auto}.modal{border:0;border-radius:16px;padding:0;max-width:820px;width:calc(100% - 32px);box-shadow:0 24px 80px #0005}.modal::backdrop{background:#0f172acc}.modal .card{margin:0;box-shadow:none}.modal-head{display:flex;align-items:center;gap:12px}.modal-head h2{margin-right:auto}.icon-btn{background:#e2e8f0;color:#0f172a;border-radius:999px;padding:8px 12px}.category-pill{background:#eef2ff;color:#312e81}.attendance-tools{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.attendance-list{display:grid;gap:8px}.attendance-item{display:grid;grid-template-columns:32px 1fr 160px;gap:10px;align-items:center;border:1px solid #e5e7eb;border-radius:10px;padding:10px}.attendance-item input[type=checkbox]{width:auto}.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.stat-tile{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:12px}.full{grid-column:1/-1}.bw-hero{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center}.bw-score{font-size:2.2rem;font-weight:800}.bw-steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px}.bw-step{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:10px}.bw-grid{display:grid;gap:14px}.bw-card{border:1px solid #e5e7eb;border-radius:14px;padding:14px;background:#fff}.bw-card-head{display:flex;gap:10px;align-items:flex-start;justify-content:space-between}.bw-card h3{margin:.1rem 0 .35rem}.bw-theme{font-size:.85rem;color:#475569;font-weight:700;text-transform:uppercase;letter-spacing:.03em}.bw-status{display:inline-block;border-radius:999px;padding:5px 9px;font-weight:700;font-size:.85rem;white-space:nowrap}.bw-status.complete{background:#dcfce7;color:#166534}.bw-status.pending{background:#fef3c7;color:#92400e}.bw-status.none{background:#f1f5f9;color:#334155}.bw-form{display:grid;gap:8px;margin-top:12px;background:#f8fafc;border-radius:12px;padding:12px}.bw-comments{margin-top:10px;border-left:4px solid #e2e8f0;padding-left:10px}.bw-muted-line{color:#64748b;font-size:.92rem}footer{text-align:center;color:#64748b;padding:24px}@media(max-width:800px){.two{grid-template-columns:1fr}.event-row{display:block}.calendar{grid-template-columns:1fr}.calendar-head{display:none}table{font-size:.9rem}}';
+    echo 'body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#f6f7fb;color:#18202a}header{background:#101827;color:white;padding:18px 24px}header div{display:flex;gap:12px;align-items:end}header span{opacity:.7}.main-nav{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center}.main-nav a,.nav-drop{color:white;background:#24324a;padding:8px 10px;border-radius:8px;text-decoration:none;border:0;font:inherit;cursor:pointer}.dropdown{position:relative;padding-bottom:14px;margin-bottom:-14px}.dropdown::after{content:"";position:absolute;left:0;right:0;top:100%;height:14px}.dropdown-menu{display:none;position:absolute;z-index:999;top:calc(100% - 6px);left:0;min-width:220px;background:white;border-radius:10px;box-shadow:0 10px 25px #0003;padding:8px;margin-top:0}.dropdown:hover .dropdown-menu,.dropdown:focus-within .dropdown-menu,.dropdown.open .dropdown-menu{display:block}.dropdown-menu a{display:block;color:#18202a;background:white;padding:10px;border-radius:8px}.dropdown-menu a:hover{background:#f1f5f9}main{max-width:1180px;margin:24px auto;padding:0 18px}.card{background:white;border-radius:14px;padding:18px;margin:16px 0;box-shadow:0 1px 4px #0001}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}label{display:block;margin:10px 0 4px;font-weight:600}input,select,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd3df;border-radius:8px}textarea{min-height:110px}button,.btn{background:#1d4ed8;color:white;border:0;border-radius:8px;padding:10px 14px;text-decoration:none;display:inline-block;cursor:pointer}button.secondary,.btn.secondary{background:#475569}.btn.danger,button.danger{background:#b91c1c}table{width:100%;border-collapse:collapse;background:white}th,td{border-bottom:1px solid #e5e7eb;padding:10px;text-align:left;vertical-align:top}th{background:#f1f5f9}.flash{background:#dcfce7;border:1px solid #86efac;padding:12px;border-radius:10px}.danger-box,.card.danger{background:#fee2e2;border:1px solid #fecaca}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#e0e7ff}.muted{color:#64748b}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.event-list{display:grid;gap:12px}.event-row{display:flex;gap:18px;justify-content:space-between;align-items:flex-start;border:1px solid #e5e7eb;border-radius:12px;padding:14px;background:#fff}.event-actions{white-space:nowrap}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}.calendar-head{font-weight:700;text-align:center;background:#e2e8f0;border-radius:8px;padding:8px}.calendar-day{min-height:110px;background:white;border:1px solid #e5e7eb;border-radius:10px;padding:8px}.calendar-day.muted-day{background:#f8fafc;color:#94a3b8}.calendar-date{font-weight:700;margin-bottom:6px}.calendar-event{display:block;background:#dbeafe;color:#1e3a8a;text-decoration:none;border-radius:8px;padding:5px;margin:4px 0;font-size:.88rem}.leaderboard{counter-reset:rank}.leaderboard-row{display:grid;grid-template-columns:42px 1fr auto;gap:10px;align-items:center;border-bottom:1px solid #e5e7eb;padding:10px 0}.leaderboard-row:before{counter-increment:rank;content:counter(rank);background:#e0e7ff;border-radius:999px;width:30px;height:30px;display:grid;place-items:center;font-weight:700}.progressbar{height:10px;background:#e5e7eb;border-radius:999px;overflow:hidden}.progressbar span{display:block;height:100%;background:#1d4ed8}.small{font-size:.9rem}.status-complete{background:#dcfce7}.status-pending{background:#fef3c7}.status-none{background:#f1f5f9}.user-menu{margin-left:auto}.dropdown-right{right:0;left:auto}.modal{border:0;border-radius:16px;padding:0;max-width:820px;width:calc(100% - 32px);box-shadow:0 24px 80px #0005}.modal::backdrop{background:#0f172acc}.modal .card{margin:0;box-shadow:none}.modal-head{display:flex;align-items:center;gap:12px}.modal-head h2{margin-right:auto}.icon-btn{background:#e2e8f0;color:#0f172a;border-radius:999px;padding:8px 12px}.category-pill{background:#eef2ff;color:#312e81}.attendance-tools{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.attendance-list{display:grid;gap:8px}.attendance-item{display:grid;grid-template-columns:32px 1fr 160px;gap:10px;align-items:center;border:1px solid #e5e7eb;border-radius:10px;padding:10px}.attendance-item input[type=checkbox]{width:auto}.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.stat-tile{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:12px}.full{grid-column:1/-1}.bw-hero{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center}.bw-score{font-size:2.2rem;font-weight:800}.bw-steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px}.bw-step{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:10px}.bw-grid{display:grid;gap:14px}.bw-card{border:1px solid #e5e7eb;border-radius:14px;padding:14px;background:#fff}.bw-card-head{display:flex;gap:10px;align-items:flex-start;justify-content:space-between}.bw-card h3{margin:.1rem 0 .35rem}.bw-theme{font-size:.85rem;color:#475569;font-weight:700;text-transform:uppercase;letter-spacing:.03em}.bw-status{display:inline-block;border-radius:999px;padding:5px 9px;font-weight:700;font-size:.85rem;white-space:nowrap}.bw-status.complete{background:#dcfce7;color:#166534}.bw-status.pending{background:#fef3c7;color:#92400e}.bw-status.none{background:#f1f5f9;color:#334155}.bw-form{display:grid;gap:8px;margin-top:12px;background:#f8fafc;border-radius:12px;padding:12px}.bw-comments{margin-top:10px;border-left:4px solid #e2e8f0;padding-left:10px}.bw-muted-line{color:#64748b;font-size:.92rem}.ticket{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fff;margin:10px 0}.ticket-head{display:flex;gap:10px;align-items:center;justify-content:space-between}.ticket.open{border-left:5px solid #2563eb}.ticket.in_progress{border-left:5px solid #f59e0b}.ticket.closed{border-left:5px solid #16a34a}.ticket.cancelled{border-left:5px solid #64748b}.matrix-wrap{overflow:auto;max-width:100%;border:1px solid #e5e7eb;border-radius:12px}.matrix{min-width:980px}.matrix th{position:sticky;top:0;z-index:3}.matrix th:first-child,.matrix td:first-child{position:sticky;left:0;background:#fff;z-index:2;box-shadow:2px 0 0 #e5e7eb}.matrix th:first-child{z-index:4;background:#f1f5f9}.matrix-cell{min-width:220px}.inline-form{display:grid;gap:6px}.inline-form select,.inline-form textarea,.inline-form input{font-size:.9rem;padding:7px}.status-pill{display:inline-block;border-radius:999px;padding:4px 8px;font-size:.82rem;font-weight:700}.status-open{background:#dbeafe;color:#1e40af}.status-in_progress,.status-pending_approval{background:#fef3c7;color:#92400e}.status-complete,.status-closed{background:#dcfce7;color:#166534}.status-not_completed,.status-cancelled{background:#f1f5f9;color:#334155}.asset-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.asset-field{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px}.asset-field span{display:block;color:#64748b;font-size:.85rem}.asset-field strong{display:block;margin-top:3px}.actions-board{display:grid;gap:12px}footer{text-align:center;color:#64748b;padding:24px}@media(max-width:800px){.two{grid-template-columns:1fr}.event-row{display:block}.calendar{grid-template-columns:1fr}.calendar-head{display:none}table{font-size:.9rem}}';
     exit;
 }
 if (route() === 'email_open') {
@@ -713,7 +833,7 @@ if (route() === 'email_open') {
         $r = first('SELECT * FROM email_recipients WHERE tracking_id=? AND tracking_enabled=1',[$tid]);
         if ($r) {
             exec_sql('UPDATE email_recipients SET open_count=open_count+1, opened_at=COALESCE(opened_at, datetime("now")), last_opened_at=datetime("now"), updated_at=datetime("now") WHERE id=?',[$r['id']]);
-            exec_sql('INSERT INTO email_opens (email_recipient_id, opened_at, ip_address, user_agent, created_at) VALUES (?, datetime("now"), ?, ?, datetime("now"))',[$r['id'], $_SERVER['REMOTE_ADDR'] ?? null, $_SERVER['HTTP_USER_AGENT'] ?? null]);
+            exec_sql('INSERT INTO email_opens (email_recipient_id, opened_at, ip_address, user_agent, created_at) VALUES (?, datetime("now"), ?, ?, datetime("now"))',[$r['id'], client_ip(), $_SERVER['HTTP_USER_AGENT'] ?? null]);
         }
     }
     header('Content-Type: image/gif');
@@ -882,8 +1002,82 @@ if (route() === 'users') {
 
 if (route() === 'equipment') {
     require_permission('view_equipment'); audit('equipment_database.view'); page_header('Equipment');
-    if ($_SERVER['REQUEST_METHOD']==='POST') { require_permission('edit_equipment'); require_csrf(); exec_sql('INSERT INTO equipment (asset_number,name,category,manufacturer,model,serial_number_encrypted,location,condition,value,maintenance_due_at,notes_encrypted,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime("now"),datetime("now"))',[trim($_POST['asset_number']),trim($_POST['name']),trim($_POST['category']),trim($_POST['manufacturer']),trim($_POST['model']),encrypt_value(trim($_POST['serial_number'])),trim($_POST['location']),trim($_POST['condition']),(float)($_POST['value']?:0),trim($_POST['maintenance_due_at']),encrypt_value(trim($_POST['notes']))]); audit('equipment.create','equipment',(int)db()->lastInsertId()); flash('Equipment added.'); redirect('equipment'); }
-    $rows=all('SELECT * FROM equipment ORDER BY asset_number'); echo '<div class="card"><h1>Equipment database</h1><table><tr><th>Asset</th><th>Name</th><th>Model</th><th>Location</th><th>Condition</th><th>Maintenance due</th></tr>'; foreach($rows as $r) echo '<tr><td>'.e($r['asset_number']).'</td><td>'.e($r['name']).'</td><td>'.e($r['manufacturer'].' '.$r['model']).'</td><td>'.e($r['location']).'</td><td>'.e($r['condition']).'</td><td>'.e($r['maintenance_due_at']).'</td></tr>'; echo '</table></div><div class="card"><h2>Add equipment</h2><form method="post">'.csrf_field().'<div class="two"><input name="asset_number" placeholder="Asset number" required><input name="name" placeholder="Name" required><input name="category" placeholder="Category"><input name="manufacturer" placeholder="Manufacturer"><input name="model" placeholder="Model"><input name="serial_number" placeholder="Serial number"><input name="location" placeholder="Location"><input name="condition" placeholder="Condition"><input name="value" type="number" step="0.01" placeholder="Value"><input name="maintenance_due_at" type="date"></div><textarea name="notes" placeholder="Notes"></textarea><button>Add equipment</button></form></div>'; page_footer(); exit;
+    if ($_SERVER['REQUEST_METHOD']==='POST') {
+        require_permission('edit_equipment'); require_csrf();
+        exec_sql('INSERT INTO equipment (asset_number,name,category,manufacturer,model,serial_number_encrypted,location,condition,purchase_date,purchase_amount,value,maintenance_due_at,notes_encrypted,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,datetime("now"),datetime("now"))',[
+            trim($_POST['asset_number']),trim($_POST['name']),trim($_POST['category']),trim($_POST['manufacturer']),trim($_POST['model']),encrypt_value(trim($_POST['serial_number'])),trim($_POST['location']),trim($_POST['condition']),trim($_POST['purchase_date'] ?? ''),($_POST['purchase_amount'] !== '' ? (float)$_POST['purchase_amount'] : null),($_POST['value'] !== '' ? (float)$_POST['value'] : null),trim($_POST['maintenance_due_at']),encrypt_value(trim($_POST['notes']))
+        ]);
+        audit('equipment.create','equipment',(int)db()->lastInsertId()); flash('Equipment added.'); redirect('equipment');
+    }
+    $rows=all('SELECT * FROM equipment ORDER BY asset_number');
+    echo '<div class="card"><h1>Equipment / asset database</h1><p class="muted">Open an asset to view details and track maintenance tickets/history.</p><table><tr><th>Asset</th><th>Name</th><th>Model</th><th>Location</th><th>Condition</th><th>Purchased</th><th>Purchase amount</th><th>Current value</th><th>Maintenance due</th><th>Action</th></tr>';
+    foreach($rows as $r) echo '<tr><td>'.e($r['asset_number']).'</td><td>'.e($r['name']).'</td><td>'.e(trim(($r['manufacturer']??'').' '.($r['model']??''))).'</td><td>'.e($r['location']).'</td><td>'.e($r['condition']).'</td><td>'.e($r['purchase_date'] ?: 'Unknown').'</td><td>'.($r['purchase_amount']!==null && $r['purchase_amount']!=='' ? '£'.e(number_format((float)$r['purchase_amount'],2)) : 'Unknown').'</td><td>'.($r['value']!==null && $r['value']!=='' ? '£'.e(number_format((float)$r['value'],2)) : 'Unknown').'</td><td>'.e($r['maintenance_due_at']).'</td><td><a class="btn secondary" href="?route=equipment_view&id='.e($r['id']).'">Open</a></td></tr>';
+    echo '</table></div>';
+    if (has_permission('edit_equipment')) {
+        echo '<div class="card"><h2>Add equipment / asset</h2><form method="post">'.csrf_field().'<div class="two"><div><label>Asset number</label><input name="asset_number" required></div><div><label>Item name</label><input name="name" required></div><div><label>Category</label><input name="category" placeholder="Radio, antenna, laptop, PSU, coax, etc."></div><div><label>Manufacturer</label><input name="manufacturer"></div><div><label>Model</label><input name="model"></div><div><label>Serial number</label><input name="serial_number"></div><div><label>Storage/location</label><input name="location"></div><div><label>Condition</label><input name="condition" placeholder="Good, fair, needs repair, etc."></div><div><label>Date of purchase, if known</label><input name="purchase_date" type="date"></div><div><label>Amount purchased for, if known</label><input name="purchase_amount" type="number" step="0.01" placeholder="0.00"></div><div><label>Current/insurance value</label><input name="value" type="number" step="0.01" placeholder="0.00"></div><div><label>Maintenance due date</label><input name="maintenance_due_at" type="date"></div></div><label>Notes</label><textarea name="notes" placeholder="Any useful asset notes"></textarea><button>Add equipment</button></form></div>';
+    }
+    page_footer(); exit;
+}
+
+if (route() === 'equipment_view') {
+    require_permission('view_equipment');
+    $id=(int)($_GET['id']??0); $item=first('SELECT * FROM equipment WHERE id=?',[$id]); if(!$item) redirect('equipment');
+    audit('equipment.view','equipment',$id);
+    if ($_SERVER['REQUEST_METHOD']==='POST') { require_permission('edit_equipment'); require_csrf();
+        if (isset($_POST['add_ticket'])) {
+            exec_sql('INSERT INTO equipment_maintenance_tickets (equipment_id,title,status,priority,due_date,description_encrypted,action_taken_encrypted,cost,assigned_user_id,created_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,datetime("now"),datetime("now"))',[$id,trim($_POST['title']),'open',trim($_POST['priority'] ?? 'normal'),trim($_POST['due_date'] ?? ''),encrypt_value(trim($_POST['description'] ?? '')),encrypt_value(''),($_POST['cost'] !== '' ? (float)$_POST['cost'] : null),!empty($_POST['assigned_user_id'])?(int)$_POST['assigned_user_id']:null,$u['id']]);
+            audit('equipment.ticket_create','equipment',$id); flash('Maintenance ticket added.'); redirect('equipment_view&id='.$id);
+        }
+        if (isset($_POST['update_ticket'])) {
+            $tid=(int)$_POST['ticket_id']; $status=$_POST['status'] ?? 'open';
+            exec_sql('UPDATE equipment_maintenance_tickets SET status=?, priority=?, due_date=?, description_encrypted=?, action_taken_encrypted=?, cost=?, assigned_user_id=?, closed_at=CASE WHEN ?="closed" THEN COALESCE(closed_at, datetime("now")) ELSE NULL END, updated_at=datetime("now") WHERE id=? AND equipment_id=?',[$status,trim($_POST['priority'] ?? 'normal'),trim($_POST['due_date'] ?? ''),encrypt_value(trim($_POST['description'] ?? '')),encrypt_value(trim($_POST['action_taken'] ?? '')),($_POST['cost'] !== '' ? (float)$_POST['cost'] : null),!empty($_POST['assigned_user_id'])?(int)$_POST['assigned_user_id']:null,$status,$tid,$id]);
+            audit('equipment.ticket_update','equipment_maintenance_ticket',$tid); flash('Maintenance ticket updated.'); redirect('equipment_view&id='.$id);
+        }
+    }
+    page_header('Asset details');
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">'.e($item['asset_number']).' - '.e($item['name']).'</h1><a class="btn secondary" href="?route=equipment">Back to equipment</a></div><div class="asset-grid">';
+    $fields=['Category'=>$item['category'],'Manufacturer'=>$item['manufacturer'],'Model'=>$item['model'],'Serial number'=>decrypt_value($item['serial_number_encrypted']),'Location'=>$item['location'],'Condition'=>$item['condition'],'Date purchased'=>$item['purchase_date'] ?: 'Unknown','Amount purchased for'=>($item['purchase_amount']!==null && $item['purchase_amount']!=='' ? '£'.number_format((float)$item['purchase_amount'],2) : 'Unknown'),'Current/insurance value'=>($item['value']!==null && $item['value']!=='' ? '£'.number_format((float)$item['value'],2) : 'Unknown'),'Maintenance due'=>$item['maintenance_due_at'] ?: 'Not set'];
+    foreach($fields as $label=>$val) echo '<div class="asset-field"><span>'.e($label).'</span><strong>'.e($val).'</strong></div>';
+    echo '</div>'; if($item['notes_encrypted']) echo '<h3>Notes</h3><p>'.nl2br(e(decrypt_value($item['notes_encrypted']))).'</p>'; echo '</div>';
+    $users=all('SELECT u.id,u.email,m.first_name,m.last_name,m.callsign FROM users u LEFT JOIN members m ON m.id=u.member_id WHERE u.status="active" ORDER BY m.last_name,u.email');
+    if (has_permission('edit_equipment')) {
+        echo '<div class="card"><h2>Add maintenance ticket</h2><form method="post">'.csrf_field().'<input type="hidden" name="add_ticket" value="1"><div class="two"><div><label>Ticket title / fault</label><input name="title" required></div><div><label>Priority</label><select name="priority"><option>low</option><option selected>normal</option><option>high</option><option>urgent</option></select></div><div><label>Due date</label><input type="date" name="due_date"></div><div><label>Assign to user</label><select name="assigned_user_id"><option value="">Unassigned</option>'; foreach($users as $usr) echo '<option value="'.e($usr['id']).'">'.e(trim(($usr['first_name']??'').' '.($usr['last_name']??'')).($usr['callsign']?' - '.$usr['callsign']:'').' / '.$usr['email']).'</option>'; echo '</select></div><div><label>Estimated/current cost</label><input name="cost" type="number" step="0.01"></div></div><label>Description</label><textarea name="description" placeholder="Fault, maintenance needed, parts required, etc."></textarea><button>Create ticket</button></form></div>';
+    }
+    $tickets=all('SELECT t.*,u.email,m.first_name,m.last_name FROM equipment_maintenance_tickets t LEFT JOIN users u ON u.id=t.assigned_user_id LEFT JOIN members m ON m.id=u.member_id WHERE t.equipment_id=? ORDER BY CASE t.status WHEN "open" THEN 1 WHEN "in_progress" THEN 2 WHEN "closed" THEN 3 ELSE 4 END, datetime(t.created_at) DESC',[$id]);
+    echo '<div class="card"><h2>Maintenance tickets / history</h2>'; if(!$tickets) echo '<p>No maintenance tickets have been recorded for this item yet.</p>'; foreach($tickets as $t){ $cls=str_replace(' ','_',strtolower($t['status'])); echo '<div class="ticket '.e($cls).'"><div class="ticket-head"><div><strong>'.e($t['title']).'</strong><br><span class="muted">Created '.e($t['created_at']).' • Due '.e($t['due_date'] ?: 'not set').' • Assigned to '.e(trim(($t['first_name']??'').' '.($t['last_name']??'')) ?: ($t['email'] ?: 'Unassigned')).'</span></div><span class="status-pill status-'.e($cls).'">'.e($t['status']).'</span></div><p>'.nl2br(e(decrypt_value($t['description_encrypted']))).'</p>'; if($t['action_taken_encrypted']) echo '<p><strong>Action/history:</strong><br>'.nl2br(e(decrypt_value($t['action_taken_encrypted']))).'</p>'; if(has_permission('edit_equipment')){ echo '<details><summary>Edit ticket</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="update_ticket" value="1"><input type="hidden" name="ticket_id" value="'.e($t['id']).'"><label>Status</label><select name="status"><option '.($t['status']==='open'?'selected':'').'>open</option><option '.($t['status']==='in_progress'?'selected':'').'>in_progress</option><option '.($t['status']==='closed'?'selected':'').'>closed</option><option '.($t['status']==='cancelled'?'selected':'').'>cancelled</option></select><label>Priority</label><select name="priority"><option '.($t['priority']==='low'?'selected':'').'>low</option><option '.($t['priority']==='normal'?'selected':'').'>normal</option><option '.($t['priority']==='high'?'selected':'').'>high</option><option '.($t['priority']==='urgent'?'selected':'').'>urgent</option></select><label>Due date</label><input type="date" name="due_date" value="'.e($t['due_date']).'"><label>Assign to user</label><select name="assigned_user_id"><option value="">Unassigned</option>'; foreach($users as $usr) echo '<option value="'.e($usr['id']).'" '.((int)$t['assigned_user_id']===(int)$usr['id']?'selected':'').'>'.e(trim(($usr['first_name']??'').' '.($usr['last_name']??'')).($usr['callsign']?' - '.$usr['callsign']:'').' / '.$usr['email']).'</option>'; echo '</select><label>Description</label><textarea name="description">'.e(decrypt_value($t['description_encrypted'])).'</textarea><label>Action taken / history</label><textarea name="action_taken">'.e(decrypt_value($t['action_taken_encrypted'])).'</textarea><label>Cost</label><input name="cost" type="number" step="0.01" value="'.e($t['cost']).'"><button>Update ticket</button></form></details>'; } echo '</div>'; }
+    echo '</div>';
+    page_footer(); exit;
+}
+
+if (route() === 'committee_actions') {
+    require_permission('view_committee_actions'); audit('committee_actions.view'); page_header('Committee actions');
+    $users=all('SELECT u.id,u.email,m.first_name,m.last_name,m.callsign FROM users u LEFT JOIN members m ON m.id=u.member_id WHERE u.status="active" ORDER BY m.last_name,u.email');
+    $members=all('SELECT id,first_name,last_name,callsign FROM members WHERE membership_status IN ("active","honorary","life_member") ORDER BY last_name,first_name');
+    if ($_SERVER['REQUEST_METHOD']==='POST') { require_permission('manage_committee_actions'); require_csrf();
+        if (isset($_POST['add_action'])) {
+            exec_sql('INSERT INTO committee_actions (title,status,priority,action_required,description_encrypted,due_date,assigned_user_id,assigned_member_id,created_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,datetime("now"),datetime("now"))',[
+                trim($_POST['title']),'open',trim($_POST['priority'] ?? 'normal'),trim($_POST['action_required']),encrypt_value(trim($_POST['description'] ?? '')),trim($_POST['due_date'] ?? ''),!empty($_POST['assigned_user_id'])?(int)$_POST['assigned_user_id']:null,!empty($_POST['assigned_member_id'])?(int)$_POST['assigned_member_id']:null,$u['id']
+            ]);
+            audit('committee_action.create','committee_action',(int)db()->lastInsertId()); flash('Committee action created.'); redirect('committee_actions');
+        }
+        if (isset($_POST['update_action'])) {
+            $aid=(int)$_POST['action_id']; $status=$_POST['status'] ?? 'open';
+            exec_sql('UPDATE committee_actions SET title=?, status=?, priority=?, action_required=?, description_encrypted=?, due_date=?, assigned_user_id=?, assigned_member_id=?, completed_at=CASE WHEN ?="closed" THEN COALESCE(completed_at, datetime("now")) ELSE NULL END, updated_at=datetime("now") WHERE id=?',[
+                trim($_POST['title']),$status,trim($_POST['priority'] ?? 'normal'),trim($_POST['action_required']),encrypt_value(trim($_POST['description'] ?? '')),trim($_POST['due_date'] ?? ''),!empty($_POST['assigned_user_id'])?(int)$_POST['assigned_user_id']:null,!empty($_POST['assigned_member_id'])?(int)$_POST['assigned_member_id']:null,$status,$aid
+            ]);
+            audit('committee_action.update','committee_action',$aid); flash('Committee action updated.'); redirect('committee_actions');
+        }
+    }
+    echo '<div class="card"><h1>Committee actions</h1><p class="muted">Track committee tasks/actions in a simple ticket-style list.</p></div>';
+    if (has_permission('manage_committee_actions')) {
+        echo '<div class="card"><h2>Create action</h2><form method="post">'.csrf_field().'<input type="hidden" name="add_action" value="1"><div class="two"><div><label>Action title</label><input name="title" required></div><div><label>Priority</label><select name="priority"><option>low</option><option selected>normal</option><option>high</option><option>urgent</option></select></div><div><label>Due date</label><input type="date" name="due_date"></div><div><label>Assign to user</label><select name="assigned_user_id"><option value="">Unassigned</option>'; foreach($users as $usr) echo '<option value="'.e($usr['id']).'">'.e(trim(($usr['first_name']??'').' '.($usr['last_name']??'')).($usr['callsign']?' - '.$usr['callsign']:'').' / '.$usr['email']).'</option>'; echo '</select></div><div><label>Assign to member</label><select name="assigned_member_id"><option value="">None</option>'; foreach($members as $m) echo '<option value="'.e($m['id']).'">'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'' )).'</option>'; echo '</select></div></div><label>Action required</label><input name="action_required" required placeholder="What needs doing?"><label>Description</label><textarea name="description" placeholder="Notes, background, decisions, next steps"></textarea><button>Create action</button></form></div>';
+    }
+    $actions=all('SELECT ca.*,u.email,m.first_name user_first,m.last_name user_last,am.first_name member_first,am.last_name member_last,am.callsign member_callsign FROM committee_actions ca LEFT JOIN users u ON u.id=ca.assigned_user_id LEFT JOIN members m ON m.id=u.member_id LEFT JOIN members am ON am.id=ca.assigned_member_id ORDER BY CASE ca.status WHEN "open" THEN 1 WHEN "in_progress" THEN 2 WHEN "closed" THEN 3 ELSE 4 END, date(ca.due_date) ASC, datetime(ca.created_at) DESC');
+    echo '<div class="card"><h2>Action tickets</h2><div class="actions-board">';
+    if(!$actions) echo '<p>No committee actions have been created yet.</p>';
+    foreach($actions as $a){ $cls=str_replace(' ','_',strtolower($a['status'])); $assignedUser=trim(($a['user_first']??'').' '.($a['user_last']??'')) ?: ($a['email'] ?: 'Unassigned'); $assignedMember=trim(($a['member_first']??'').' '.($a['member_last']??'')).($a['member_callsign']?' - '.$a['member_callsign']:''); echo '<div class="ticket '.e($cls).'"><div class="ticket-head"><div><strong>'.e($a['title']).'</strong><br><span class="muted">Created '.e($a['created_at']).' • Due '.e($a['due_date'] ?: 'not set').' • Assigned to '.e($assignedUser).($assignedMember?' • Member: '.e($assignedMember):'').'</span></div><span class="status-pill status-'.e($cls).'">'.e($a['status']).'</span></div><p><strong>Action:</strong> '.e($a['action_required']).'</p><p>'.nl2br(e(decrypt_value($a['description_encrypted']))).'</p>'; if(has_permission('manage_committee_actions')){ echo '<details><summary>Edit action</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="update_action" value="1"><input type="hidden" name="action_id" value="'.e($a['id']).'"><label>Title</label><input name="title" value="'.e($a['title']).'" required><label>Status</label><select name="status"><option '.($a['status']==='open'?'selected':'').'>open</option><option '.($a['status']==='in_progress'?'selected':'').'>in_progress</option><option '.($a['status']==='closed'?'selected':'').'>closed</option><option '.($a['status']==='cancelled'?'selected':'').'>cancelled</option></select><label>Priority</label><select name="priority"><option '.($a['priority']==='low'?'selected':'').'>low</option><option '.($a['priority']==='normal'?'selected':'').'>normal</option><option '.($a['priority']==='high'?'selected':'').'>high</option><option '.($a['priority']==='urgent'?'selected':'').'>urgent</option></select><label>Due date</label><input type="date" name="due_date" value="'.e($a['due_date']).'"><label>Assign to user</label><select name="assigned_user_id"><option value="">Unassigned</option>'; foreach($users as $usr) echo '<option value="'.e($usr['id']).'" '.((int)$a['assigned_user_id']===(int)$usr['id']?'selected':'').'>'.e(trim(($usr['first_name']??'').' '.($usr['last_name']??'')).($usr['callsign']?' - '.$usr['callsign']:'').' / '.$usr['email']).'</option>'; echo '</select><label>Assign to member</label><select name="assigned_member_id"><option value="">None</option>'; foreach($members as $m) echo '<option value="'.e($m['id']).'" '.((int)$a['assigned_member_id']===(int)$m['id']?'selected':'').'>'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'' )).'</option>'; echo '</select><label>Action required</label><input name="action_required" value="'.e($a['action_required']).'" required><label>Description</label><textarea name="description">'.e(decrypt_value($a['description_encrypted'])).'</textarea><button>Update action</button></form></details>'; } echo '</div>'; }
+    echo '</div></div>';
+    page_footer(); exit;
 }
 
 if (route() === 'event_attachment') {
@@ -1046,7 +1240,7 @@ if (route() === 'brickworks') {
     require_permission('view_own_brickworks'); page_header('Brickworks'); audit('brickworks.progress.view');
     $participant=first('SELECT * FROM brickworks_participants WHERE member_id=?',[$u['member_id']]);
     if (!$participant && $_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['join'])) { require_csrf(); exec_sql('INSERT INTO brickworks_participants (member_id,status,joined_at,created_at,updated_at) VALUES (?,"active",datetime("now"),datetime("now"),datetime("now"))',[$u['member_id']]); $pid=(int)db()->lastInsertId(); foreach(all('SELECT id FROM brickworks_criteria WHERE active=1') as $c) exec_sql('INSERT OR IGNORE INTO brickworks_progress (participant_id,criterion_id,created_at,updated_at) VALUES (?,?,datetime("now"),datetime("now"))',[$pid,$c['id']]); assign_role((int)$u['id'],'brickworks_participant',(int)$u['id'],'Joined Brickworks'); audit('brickworks.join','member',(int)$u['member_id']); flash('You have joined Brickworks.'); redirect('brickworks'); }
-    if (!$participant) { echo '<div class="card"><h1>Brickworks Scheme</h1><p>You are not signed up yet.</p><form method="post">'.csrf_field().'<input type="hidden" name="join" value="1"><button>Join Brickworks</button></form></div>'; page_footer(); exit; }
+    if (!$participant) { $manageButton = (has_permission('review_brickworks_evidence') || has_permission('manage_brickworks_criteria')) ? '<a class="btn secondary" href="?route=brickworks_manage">Brickworks management</a>' : ''; echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Brickworks Scheme</h1>'.$manageButton.'</div><p>You are not signed up yet.</p><form method="post">'.csrf_field().'<input type="hidden" name="join" value="1"><button>Join Brickworks</button></form></div>'; page_footer(); exit; }
     if ($_SERVER['REQUEST_METHOD']==='POST') { require_csrf();
         $progress_id=(int)$_POST['progress_id']; $p=first('SELECT bp.* FROM brickworks_progress bp JOIN brickworks_participants b ON b.id=bp.participant_id WHERE bp.id=? AND b.member_id=?',[$progress_id,$u['member_id']]);
         if ($p && isset($_POST['submit_evidence'])) {
@@ -1066,7 +1260,8 @@ if (route() === 'brickworks') {
     $pending=(int)first('SELECT COUNT(*) c FROM brickworks_progress WHERE participant_id=? AND status="pending_approval"',[$participant['id']])['c'];
     $award=brickworks_award($complete);
     $pct=$totalCriteria?min(100,round($complete/$totalCriteria*100)):0;
-    echo '<div class="card bw-hero"><div><h1>Brickworks Scheme</h1><p class="muted">Track your criteria, upload evidence and see reviewer feedback in one place.</p><div class="progressbar"><span style="width:'.e($pct).'%"></span></div><div class="bw-steps"><div class="bw-step"><span class="muted">Completed</span><br><strong>'.e($complete).' / '.e($totalCriteria).'</strong></div><div class="bw-step"><span class="muted">Pending approval</span><br><strong>'.e($pending).'</strong></div><div class="bw-step"><span class="muted">Current award</span><br><strong>'.e($award ?: 'None yet').'</strong></div></div></div><div class="bw-score">'.e($pct).'%</div></div>';
+    $manageButton = (has_permission('review_brickworks_evidence') || has_permission('manage_brickworks_criteria')) ? '<a class="btn" href="?route=brickworks_manage">Brickworks management</a>' : '';
+    echo '<div class="card bw-hero"><div><div class="toolbar"><h1 style="margin-right:auto">Brickworks Scheme</h1>'.$manageButton.'</div><p class="muted">Track your criteria, upload evidence and see reviewer feedback in one place.</p><div class="progressbar"><span style="width:'.e($pct).'%"></span></div><div class="bw-steps"><div class="bw-step"><span class="muted">Completed</span><br><strong>'.e($complete).' / '.e($totalCriteria).'</strong></div><div class="bw-step"><span class="muted">Pending approval</span><br><strong>'.e($pending).'</strong></div><div class="bw-step"><span class="muted">Current award</span><br><strong>'.e($award ?: 'None yet').'</strong></div></div></div><div class="bw-score">'.e($pct).'%</div></div>';
     $rows=all('SELECT bp.*,bc.title,bc.description,bc.evidence_guidance,bt.name theme FROM brickworks_progress bp JOIN brickworks_criteria bc ON bc.id=bp.criterion_id JOIN brickworks_themes bt ON bt.id=bc.theme_id WHERE bp.participant_id=? ORDER BY bt.sort_order,bc.sort_order',[$participant['id']]);
     echo '<div class="card"><div class="toolbar"><h2 style="margin-right:auto">Criteria</h2><span class="pill">'.e(count($rows)).' items</span></div><div class="bw-grid">';
     foreach($rows as $r){
@@ -1084,7 +1279,60 @@ if (route() === 'brickworks') {
         echo '</section>';
     }
     echo '</div></div>';
-    if(has_permission('review_brickworks_evidence')) echo '<div class="card"><p><a class="btn" href="?route=brickworks_review">Review Brickworks evidence</a></p></div>';
+    if(has_permission('review_brickworks_evidence')) echo '<div class="card"><p><a class="btn" href="?route=brickworks_manage">Open Brickworks management</a> <a class="btn secondary" href="?route=brickworks_review">Pending only</a></p></div>';
+    page_footer(); exit;
+}
+
+if (route() === 'brickworks_evidence') {
+    require_permission('review_brickworks_evidence');
+    $id=(int)($_GET['id'] ?? 0);
+    $ev=first('SELECT * FROM brickworks_evidence WHERE id=?',[$id]);
+    if(!$ev){ http_response_code(404); exit('Evidence not found'); }
+    audit('brickworks.evidence.download','brickworks_evidence',$id);
+    $path=decrypt_value($ev['encrypted_file_path']);
+    if(!$path || !is_file($path)){ http_response_code(404); exit('File missing'); }
+    header('Content-Type: '.($ev['mime_type'] ?: 'application/octet-stream'));
+    header('Content-Disposition: attachment; filename="'.addslashes($ev['original_filename']).'"');
+    header('Content-Length: '.filesize($path));
+    readfile($path); exit;
+}
+
+if (route() === 'brickworks_manage') {
+    require_permission('review_brickworks_evidence');
+    page_header('Brickworks Management'); audit('brickworks.manage.view');
+    // Make sure each participant has a progress row for every active criterion.
+    $criteria=all('SELECT bc.*,bt.name theme FROM brickworks_criteria bc JOIN brickworks_themes bt ON bt.id=bc.theme_id WHERE bc.active=1 ORDER BY bt.sort_order,bc.sort_order');
+    $participants=all('SELECT b.*,m.first_name,m.last_name,m.callsign,m.id member_id FROM brickworks_participants b JOIN members m ON m.id=b.member_id ORDER BY m.last_name,m.first_name');
+    foreach($participants as $part){ foreach($criteria as $c){ exec_sql('INSERT OR IGNORE INTO brickworks_progress (participant_id,criterion_id,created_at,updated_at) VALUES (?,?,datetime("now"),datetime("now"))',[$part['id'],$c['id']]); } }
+    if ($_SERVER['REQUEST_METHOD']==='POST') { require_csrf();
+        $progressId=(int)($_POST['progress_id'] ?? 0);
+        $status=$_POST['status'] ?? 'not_completed';
+        if (!in_array($status, ['not_completed','pending_approval','complete'], true)) $status='not_completed';
+        $completedAt = $status === 'complete' ? (trim($_POST['completed_at'] ?? '') ?: date('Y-m-d')) : null;
+        exec_sql('UPDATE brickworks_progress SET status=?, reviewer_comment_encrypted=?, completed_at=?, reviewed_by_user_id=?, reviewed_at=datetime("now"), updated_at=datetime("now") WHERE id=?',[$status,encrypt_value(trim($_POST['reviewer_comment'] ?? '')),$completedAt,$u['id'],$progressId]);
+        audit('brickworks.status.update','brickworks_progress',$progressId,'success',null,['status'=>$status]); flash('Brickworks progress updated.'); redirect('brickworks_manage');
+    }
+    $progressRows=all('SELECT bp.*,b.member_id,bc.title FROM brickworks_progress bp JOIN brickworks_participants b ON b.id=bp.participant_id JOIN brickworks_criteria bc ON bc.id=bp.criterion_id ORDER BY b.member_id,bc.sort_order');
+    $progress=[]; foreach($progressRows as $pr){ $progress[(int)$pr['participant_id']][(int)$pr['criterion_id']]=$pr; }
+    $evidenceRows=all('SELECT be.*,bp.participant_id,bp.criterion_id FROM brickworks_evidence be JOIN brickworks_progress bp ON bp.id=be.progress_id ORDER BY be.created_at DESC');
+    $evidence=[]; foreach($evidenceRows as $er){ $evidence[(int)$er['participant_id']][(int)$er['criterion_id']][]=$er; }
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Brickworks management</h1><a class="btn secondary" href="?route=brickworks">Back to Brickworks</a><a class="btn secondary" href="?route=brickworks_review">Pending only</a></div><p class="muted">Members are listed down the left. Criteria run left to right across the top. Use each cell to approve, return for more evidence, or reset a criterion.</p></div>';
+    echo '<div class="card"><div class="matrix-wrap"><table class="matrix"><tr><th>Member</th>';
+    foreach($criteria as $c){ echo '<th><span class="small">'.e($c['theme']).'</span><br>'.e($c['title']).'</th>'; }
+    echo '</tr>';
+    foreach($participants as $part){ $memberName=trim($part['first_name'].' '.$part['last_name']); echo '<tr><td><strong>'.e($memberName).'</strong><br><span class="muted">'.e($part['callsign']).'</span></td>';
+        foreach($criteria as $c){ $pr=$progress[(int)$part['id']][(int)$c['id']] ?? null; if(!$pr){ echo '<td class="matrix-cell">Missing progress row</td>'; continue; }
+            $status=$pr['status'] ?: 'not_completed'; $cls=str_replace(' ','_',strtolower($status)); $label=$status==='complete'?'Complete - '.$pr['completed_at']:($status==='pending_approval'?'Pending approval':'Not completed');
+            $memberComment=decrypt_value($pr['member_comment_encrypted']); $reviewerComment=decrypt_value($pr['reviewer_comment_encrypted']); $files=$evidence[(int)$part['id']][(int)$c['id']] ?? [];
+            echo '<td class="matrix-cell"><span class="status-pill status-'.e($cls).'">'.e($label).'</span>';
+            if($memberComment) echo '<p class="small"><strong>Member note:</strong><br>'.nl2br(e($memberComment)).'</p>';
+            if($reviewerComment) echo '<p class="small"><strong>Reviewer:</strong><br>'.nl2br(e($reviewerComment)).'</p>';
+            if($files){ echo '<details><summary>Evidence ('.e(count($files)).')</summary><ul>'; foreach($files as $file) echo '<li><a href="?route=brickworks_evidence&id='.e($file['id']).'">'.e($file['original_filename']).'</a><br><span class="muted small">'.e($file['created_at']).'</span></li>'; echo '</ul></details>'; }
+            echo '<form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="progress_id" value="'.e($pr['id']).'"><label>Status</label><select name="status"><option value="not_completed" '.($status==='not_completed'?'selected':'').'>Not completed</option><option value="pending_approval" '.($status==='pending_approval'?'selected':'').'>In progress / pending approval</option><option value="complete" '.($status==='complete'?'selected':'').'>Complete</option></select><label>Completed date</label><input type="date" name="completed_at" value="'.e($pr['completed_at'] ?: date('Y-m-d')).'"><label>Reviewer comment</label><textarea name="reviewer_comment">'.e($reviewerComment).'</textarea><button>Save</button></form></td>';
+        }
+        echo '</tr>';
+    }
+    echo '</table></div></div>';
     page_footer(); exit;
 }
 
