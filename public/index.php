@@ -857,8 +857,42 @@ function seed_brickworks(): void {
 }
 function assign_role(int $user_id, string $role_name, ?int $by=null, ?string $reason=null): void {
     $role = first('SELECT * FROM roles WHERE name=?',[$role_name]); if (!$role) return;
+    $already = first('SELECT 1 AS x FROM user_roles WHERE user_id=? AND role_id=?', [$user_id, $role['id']]);
     exec_sql('INSERT OR IGNORE INTO user_roles (user_id, role_id, assigned_by_user_id, assigned_at) VALUES (?,?,?,datetime("now"))', [$user_id,$role['id'],$by]);
-    exec_sql('INSERT INTO user_role_history (user_id, role_id, action, changed_by_user_id, changed_at, reason) VALUES (?,?,"assigned",?,datetime("now"),?)', [$user_id,$role['id'],$by,$reason]);
+    if (!$already) {
+        exec_sql('INSERT INTO user_role_history (user_id, role_id, action, changed_by_user_id, changed_at, reason) VALUES (?,?,"assigned",?,datetime("now"),?)', [$user_id,$role['id'],$by,$reason]);
+    }
+}
+function remove_role(int $user_id, string $role_name, ?int $by=null, ?string $reason=null): void {
+    $role = first('SELECT * FROM roles WHERE name=?',[$role_name]); if (!$role) return;
+    $had = first('SELECT 1 AS x FROM user_roles WHERE user_id=? AND role_id=?', [$user_id, $role['id']]);
+    exec_sql('DELETE FROM user_roles WHERE user_id=? AND role_id=?', [$user_id,$role['id']]);
+    if ($had) {
+        exec_sql('INSERT INTO user_role_history (user_id, role_id, action, changed_by_user_id, changed_at, reason) VALUES (?,?,"removed",?,datetime("now"),?)', [$user_id,$role['id'],$by,$reason]);
+    }
+}
+function set_user_roles(int $user_id, array $role_names, int $by, string $reason='Admin updated roles'): array {
+    $validRoles = array_column(all('SELECT name FROM roles ORDER BY id'), 'name');
+    $role_names = array_values(array_unique(array_intersect($role_names, $validRoles)));
+    if (!in_array('member', $role_names, true)) $role_names[] = 'member';
+
+    $targetCurrent = user_roles($user_id);
+    $actorCurrent = user_roles($by);
+
+    // Safety: do not let an admin remove their own final admin role and lock themselves out.
+    if ($user_id === $by && in_array('admin', $targetCurrent, true) && !in_array('admin', $role_names, true)) {
+        $adminCount = (int)(first('SELECT COUNT(DISTINCT ur.user_id) AS c FROM user_roles ur JOIN roles r ON r.id=ur.role_id JOIN users u ON u.id=ur.user_id WHERE r.name="admin" AND u.status="active"')['c'] ?? 0);
+        if ($adminCount <= 1) $role_names[] = 'admin';
+    }
+
+    $added=[]; $removed=[];
+    foreach ($validRoles as $rn) {
+        $has = in_array($rn, $targetCurrent, true);
+        $want = in_array($rn, $role_names, true);
+        if ($want && !$has) { assign_role($user_id, $rn, $by, $reason); $added[]=$rn; }
+        if (!$want && $has) { remove_role($user_id, $rn, $by, $reason); $removed[]=$rn; }
+    }
+    return ['added'=>$added,'removed'=>$removed,'final'=>user_roles($user_id)];
 }
 function attendance_stats(int $member_id): array {
     $signed = first('SELECT COUNT(*) c FROM event_attendance WHERE member_id=? AND status IN ("signed_up","attended","did_not_attend")',[$member_id])['c'] ?? 0;
@@ -1141,16 +1175,65 @@ if (route() === 'member_view') {
 if (route() === 'users') {
     require_permission('manage_users'); page_header('Users'); audit('users.view');
     if ($_SERVER['REQUEST_METHOD']==='POST') { require_csrf();
-        if (isset($_POST['reset_password'])) { require_permission('reset_passwords'); $new=$_POST['new_password']; if(strlen($new)<10){flash('Password must be at least 10 chars.');redirect('users');} exec_sql('UPDATE users SET password_hash=?, force_password_change=1, updated_at=datetime("now") WHERE id=?',[password_hash($new,PASSWORD_DEFAULT),(int)$_POST['user_id']]); audit('user.password_changed_by_admin','user',(int)$_POST['user_id']); flash('Password reset.'); redirect('users'); }
-        $member_id = null;
-        if (!empty($_POST['member_id'])) $member_id=(int)$_POST['member_id'];
-        exec_sql('INSERT INTO users (member_id,email,password_hash,status,force_password_change,created_at,updated_at) VALUES (?,?,?,"active",1,datetime("now"),datetime("now"))',[$member_id,strtolower(trim($_POST['email'])),password_hash($_POST['password'],PASSWORD_DEFAULT)]);
-        $uid=(int)db()->lastInsertId(); assign_role($uid,'member',(int)$u['id'],'Admin created user');
-        audit('user.created','user',$uid); flash('User created.'); redirect('users');
+        if (isset($_POST['reset_password'])) {
+            require_permission('reset_passwords');
+            $new=$_POST['new_password'];
+            if(strlen($new)<10){flash('Password must be at least 10 chars.');redirect('users');}
+            exec_sql('UPDATE users SET password_hash=?, force_password_change=1, updated_at=datetime("now") WHERE id=?',[password_hash($new,PASSWORD_DEFAULT),(int)$_POST['user_id']]);
+            audit('user.password_changed_by_admin','user',(int)$_POST['user_id']);
+            flash('Password reset.'); redirect('users');
+        }
+        if (isset($_POST['update_roles'])) {
+            require_permission('manage_roles');
+            $targetUserId = (int)$_POST['user_id'];
+            $selectedRoles = $_POST['roles'] ?? [];
+            if (!is_array($selectedRoles)) $selectedRoles = [];
+            $result = set_user_roles($targetUserId, array_map('strval', $selectedRoles), (int)$u['id'], trim($_POST['role_change_reason'] ?? 'Admin updated roles'));
+            audit('user.roles_updated','user',$targetUserId,'success',null,['added'=>$result['added'],'removed'=>$result['removed'],'final'=>$result['final']]);
+            flash('User roles updated.'); redirect('users');
+        }
+        if (isset($_POST['create_user'])) {
+            $member_id = null;
+            if (!empty($_POST['member_id'])) $member_id=(int)$_POST['member_id'];
+            exec_sql('INSERT INTO users (member_id,email,password_hash,status,force_password_change,created_at,updated_at) VALUES (?,?,?,"active",1,datetime("now"),datetime("now"))',[$member_id,strtolower(trim($_POST['email'])),password_hash($_POST['password'],PASSWORD_DEFAULT)]);
+            $uid=(int)db()->lastInsertId(); assign_role($uid,'member',(int)$u['id'],'Admin created user');
+            audit('user.created','user',$uid); flash('User created.'); redirect('users');
+        }
     }
+    $canRoles = has_permission('manage_roles');
+    $allRoles = all('SELECT name, display_name, description FROM roles ORDER BY CASE name WHEN "member" THEN 1 WHEN "committee" THEN 2 WHEN "member_db" THEN 3 WHEN "brickworks_reviewer" THEN 4 WHEN "equipment_manager" THEN 5 WHEN "event_manager" THEN 6 WHEN "treasurer" THEN 7 WHEN "admin" THEN 99 ELSE 50 END, display_name');
     $users=all('SELECT u.*,m.first_name,m.last_name,m.callsign FROM users u LEFT JOIN members m ON m.id=u.member_id ORDER BY u.created_at DESC');
-    echo '<div class="card"><h1>Users</h1><table><tr><th>Email</th><th>Member</th><th>Status</th><th>Roles</th><th>Reset password</th></tr>'; foreach($users as $usr){ echo '<tr><td>'.e($usr['email']).'</td><td>'.e(trim(($usr['first_name']??'').' '.($usr['last_name']??'')).' '.($usr['callsign']?'('.$usr['callsign'].')':'')).'</td><td>'.e($usr['status']).'</td><td>'.e(implode(', ',user_roles((int)$usr['id']))).'</td><td><form method="post">'.csrf_field().'<input type="hidden" name="reset_password" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><input name="new_password" placeholder="New temp password"><button>Reset</button></form></td></tr>'; } echo '</table></div>';
-    $members=all('SELECT id,first_name,last_name,callsign FROM members ORDER BY last_name'); echo '<div class="card"><h2>Create user</h2><form method="post">'.csrf_field().'<label>Link to member</label><select name="member_id"><option value="">None</option>'; foreach($members as $m) echo '<option value="'.e($m['id']).'">'.e($m['first_name'].' '.$m['last_name'].' '.$m['callsign']).'</option>'; echo '</select><label>Email</label><input type="email" name="email" required><label>Temporary password</label><input name="password" required minlength="10"><button>Create user</button></form></div>';
+    echo '<div class="card"><h1>Users</h1><p class="muted">Admins can create users, reset passwords and manage user roles. The Member role is kept as the base role for all active accounts.</p><table><tr><th>Email</th><th>Member</th><th>Status</th><th>Roles</th><th>Reset password</th></tr>';
+    foreach($users as $usr){
+        $currentRoles = user_roles((int)$usr['id']);
+        echo '<tr><td>'.e($usr['email']).'</td><td>'.e(trim(($usr['first_name']??'').' '.($usr['last_name']??'')).' '.($usr['callsign']?'('.$usr['callsign'].')':'')).'</td><td>'.e($usr['status']).'</td><td>'.e(implode(', ',$currentRoles));
+        if ($canRoles) {
+            echo '<details class="role-editor"><summary>Change roles</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="update_roles" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><div class="role-grid">';
+            foreach($allRoles as $role){
+                $checked = in_array($role['name'], $currentRoles, true) ? 'checked' : '';
+                $disabled = ($role['name']==='member') ? 'disabled' : '';
+                // Disabled checkboxes are not submitted, so add a hidden member role value.
+                if ($role['name']==='member') {
+                    echo '<input type="hidden" name="roles[]" value="member">';
+                }
+                echo '<label class="check"><input type="checkbox" name="roles[]" value="'.e($role['name']).'" '.$checked.' '.$disabled.'> '.e($role['display_name']).'</label>';
+            }
+            echo '</div><label>Reason / note</label><input name="role_change_reason" placeholder="Optional reason for role change"><button>Save roles</button></form></details>';
+        }
+        echo '</td><td><form method="post">'.csrf_field().'<input type="hidden" name="reset_password" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><input name="new_password" placeholder="New temp password"><button>Reset</button></form></td></tr>';
+    }
+    echo '</table></div>';
+
+    if ($canRoles) {
+        echo '<div class="card"><h2>Role guide</h2><table><tr><th>Role</th><th>Purpose</th></tr>';
+        foreach($allRoles as $role){ echo '<tr><td>'.e($role['display_name']).'</td><td>'.e($role['description'] ?: $role['name']).'</td></tr>'; }
+        echo '</table></div>';
+    }
+
+    $members=all('SELECT id,first_name,last_name,callsign FROM members ORDER BY last_name');
+    echo '<div class="card"><h2>Create user</h2><form method="post">'.csrf_field().'<input type="hidden" name="create_user" value="1"><label>Link to member</label><select name="member_id"><option value="">None</option>';
+    foreach($members as $m) echo '<option value="'.e($m['id']).'">'.e($m['first_name'].' '.$m['last_name'].' '.$m['callsign']).'</option>';
+    echo '</select><label>Email</label><input type="email" name="email" required><label>Temporary password</label><input name="password" required minlength="10"><button>Create user</button></form></div>';
     page_footer(); exit;
 }
 
