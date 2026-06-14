@@ -24,3 +24,7 @@ Bulk emails with more than one recipient are sent using BCC for member privacy.
 ## Dashboard events update
 
 Dashboard now shows only the next three events within the next month. User roles and attendance summary have been removed from the dashboard to keep it cleaner.
+
+## Dashboard layout
+
+Dashboard order adjusted so Notifications appear in the top dashboard grid and Next events appears below.

@@ -1313,11 +1313,11 @@ if (route() === 'dashboard') {
     $notices = all('SELECT * FROM notifications WHERE (user_id=? OR member_id=? OR (user_id IS NULL AND member_id IS NULL)) AND read_at IS NULL AND (expires_at IS NULL OR expires_at > datetime("now")) ORDER BY created_at DESC LIMIT 10',[$u['id'],$u['member_id']]);
     $upcomingEvents = all('SELECT * FROM events WHERE start_at >= datetime("now") AND start_at < datetime("now", "+1 month") ORDER BY start_at ASC LIMIT 3');
     echo '<h1>Dashboard</h1><div class="grid"><div class="card"><h2>Membership</h2><p><strong>Status:</strong> '.e($member['membership_status'] ?? '').'</p><p><strong>Renewal due:</strong> '.e($member['renewal_date'] ?: 'Not set').'</p><p><strong>Callsign:</strong> '.e($member['callsign'] ?: 'Not set').'</p></div>';
+    echo '<div class="card"><h2>Notifications</h2>'; if (!$notices) echo '<p>No unread notifications.</p>'; else foreach ($notices as $n) echo '<p><strong>'.e($n['title']).'</strong><br>'.e($n['message']).'</p>'; echo '</div></div>';
     echo '<div class="card"><h2>Next events</h2><p class="muted">Next 3 events within the next month.</p>';
     if (!$upcomingEvents) { echo '<p>No upcoming events in the next month.</p>'; }
     else { foreach ($upcomingEvents as $ev) { echo '<p><strong><a href="?route=event_view&id='.e($ev['id']).'">'.e($ev['title']).'</a></strong><br><span class="muted">'.e(date('D j M Y H:i', strtotime($ev['start_at']))).($ev['location'] ? ' • '.e($ev['location']) : '').'</span><br><span class="pill category-pill">'.e($ev['event_type'] ?: 'Other').'</span></p>'; } }
-    echo '<p><a class="btn secondary" href="?route=events">View programme</a></p></div></div>';
-    echo '<div class="card"><h2>Notifications</h2>'; if (!$notices) echo '<p>No unread notifications.</p>'; else foreach ($notices as $n) echo '<p><strong>'.e($n['title']).'</strong><br>'.e($n['message']).'</p>'; echo '</div>';
+    echo '<p><a class="btn secondary" href="?route=events">View programme</a></p></div>';
     $totalCriteria = (int)(first('SELECT COUNT(*) c FROM brickworks_criteria WHERE active=1')['c'] ?? 0);
     $leaders = all('SELECT m.first_name,m.last_name,m.callsign,b.id participant_id,COUNT(CASE WHEN bp.status="complete" THEN 1 END) complete_count,COUNT(CASE WHEN bp.status="pending_approval" THEN 1 END) pending_count FROM brickworks_participants b JOIN members m ON m.id=b.member_id LEFT JOIN brickworks_progress bp ON bp.participant_id=b.id GROUP BY b.id,m.first_name,m.last_name,m.callsign ORDER BY complete_count DESC,pending_count DESC,m.callsign ASC LIMIT 10');
     echo '<div class="card"><h2>Brickworks leaderboard</h2>';
