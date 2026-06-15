@@ -29,17 +29,6 @@ Dashboard now shows only the next three events within the next month. User roles
 
 Dashboard order adjusted so Notifications appear in the top dashboard grid and Next events appears below.
 
-## Legacy CSV import
+## Login and password recovery
 
-Added `scripts/import-legacy-csv.php` for one-time import of old Events, Assets/Equipment, and Attendance CSV exports.
-
-See `docs/LEGACY-CSV-IMPORT.md`.
-
-## Programme filtering
-
-The Programme page now has Current & future and Past tabs.
-
-- Current & future events show nearest first.
-- Past events show most recent first.
-- Events can be searched by title, description or location.
-- Events can be filtered by event type.
+The login page has been restyled with a responsive centred sign-in card. Users can now use **Forgot password?** to request a self-service password reset link. Reset links use the existing secure token system and expire after 48 hours.
