@@ -1616,15 +1616,19 @@ function delete_member_record(int $member_id, int $actor_user_id): array {
 }
 
 function attendance_stats(int $member_id): array {
-    // Attendance is calculated against the total number of past member sessions
-    // since the member's start/join date. If no start date is recorded, all past
-    // member sessions are used. DISTINCT event IDs are used so duplicated legacy
-    // attendance rows cannot create impossible percentages.
+    // Attendance is calculated as:
+    // attended completed sessions / total completed sessions since the member's start date.
+    //
+    // Future sessions are deliberately excluded. A session is only counted once it has
+    // ended. If end_at is empty, start_at is used as the fallback completion time.
+    // DISTINCT event IDs are used so duplicated legacy attendance rows cannot create
+    // impossible percentages.
     $member = first('SELECT date_joined, joined_before_system FROM members WHERE id=?', [$member_id]) ?: [];
     $startDate = trim((string)($member['date_joined'] ?? ''));
     $hasStartDate = $startDate !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $startDate);
 
-    $eventWhere = 'visibility="members" AND start_at IS NOT NULL AND start_at <= datetime("now")';
+    $completedExpr = 'datetime(COALESCE(NULLIF(end_at, ""), start_at))';
+    $eventWhere = 'visibility="members" AND start_at IS NOT NULL AND ' . $completedExpr . ' <= datetime("now")';
     $eventParams = [];
     if ($hasStartDate) {
         $eventWhere .= ' AND date(start_at) >= date(?)';
@@ -1633,7 +1637,8 @@ function attendance_stats(int $member_id): array {
 
     $events = (int)(first('SELECT COUNT(*) c FROM events WHERE ' . $eventWhere, $eventParams)['c'] ?? 0);
 
-    $attWhere = 'ea.member_id=? AND ea.attended=1 AND e.visibility="members" AND e.start_at IS NOT NULL AND e.start_at <= datetime("now")';
+    $attCompletedExpr = 'datetime(COALESCE(NULLIF(e.end_at, ""), e.start_at))';
+    $attWhere = 'ea.member_id=? AND ea.attended=1 AND e.visibility="members" AND e.start_at IS NOT NULL AND ' . $attCompletedExpr . ' <= datetime("now")';
     $attParams = [$member_id];
     if ($hasStartDate) {
         $attWhere .= ' AND date(e.start_at) >= date(?)';
@@ -1641,7 +1646,7 @@ function attendance_stats(int $member_id): array {
     }
     $att = (int)(first('SELECT COUNT(DISTINCT ea.event_id) c FROM event_attendance ea JOIN events e ON e.id=ea.event_id WHERE ' . $attWhere, $attParams)['c'] ?? 0);
 
-    $signedWhere = 'ea.member_id=? AND ea.status IN ("signed_up","attended","did_not_attend") AND e.visibility="members" AND e.start_at IS NOT NULL AND e.start_at <= datetime("now")';
+    $signedWhere = 'ea.member_id=? AND ea.status IN ("signed_up","attended","did_not_attend") AND e.visibility="members" AND e.start_at IS NOT NULL AND ' . $attCompletedExpr . ' <= datetime("now")';
     $signedParams = [$member_id];
     if ($hasStartDate) {
         $signedWhere .= ' AND date(e.start_at) >= date(?)';
@@ -2232,7 +2237,7 @@ if (route() === 'member_view') {
     echo '</div><form method="post">'.csrf_field().'<div class="two">';
     if (can_edit_membership_number()) echo '<div><label>Membership number</label><input name="membership_number" value="'.e($m['membership_number']).'"></div>'; else echo '<div><label>Membership number</label><p><strong>'.e($m['membership_number'] ?: 'Not set').'</strong><br><span class="muted">Only admin users can change this.</span></p></div>';
     echo '<div><label>Callsign</label><input name="callsign" value="'.e($m['callsign']).'"></div><div><label>First name</label><input name="first_name" value="'.e($m['first_name']).'"></div><div><label>Surname</label><input name="last_name" value="'.e($m['last_name']).'"></div><div><label>Email address</label><input type="email" name="email" value="'.e($m['email']).'"></div><div><label>Licence level</label><input name="licence_level" value="'.e($m['licence_level']).'"></div><div><label>Phone number</label><input name="phone" value="'.e(decrypt_value($m['phone_encrypted'])).'"></div><div class="full"><label>Address</label><textarea name="address">'.e(decrypt_value($m['address_encrypted'])).'</textarea></div><div class="full"><h2>Emergency contact</h2></div><div><label>Emergency contact name</label><input name="emergency_contact_name" value="'.e(decrypt_value($m['emergency_contact_name_encrypted'] ?? '')).'"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship" value="'.e(decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '')).'"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone" value="'.e(decrypt_value($m['emergency_contact_phone_encrypted'] ?? '')).'"></div><div><label>Membership type</label><input name="membership_type" value="'.e($m['membership_type']).'"></div><div><label>Date joined</label><input type="date" name="date_joined" value="'.e($m['date_joined']).'"><label class="small"><input type="checkbox" name="joined_before_system" '.(!empty($m['joined_before_system'])?'checked':'').'> Not on record / joined before system</label></div><div><label>Renewal date</label><input type="date" name="renewal_date" value="'.e($m['renewal_date']).'"></div><div><label>Membership status</label><select name="membership_status">'; foreach(['pending','active','expired','former','suspended','honorary','life_member'] as $s) echo '<option '.($m['membership_status']===$s?'selected':'').'>'.e($s).'</option>'; echo '</select></div></div><h2>Consents</h2><p class="muted">Visible and editable by Member DB users and admins.</p>'.render_consent_checkboxes($id).'<label>Private notes</label><textarea name="notes">'.e(decrypt_value($m['notes_encrypted'])).'</textarea><button>Save member</button></form></div>';
-    echo '<div class="grid"><div class="card"><h2>Attendance</h2><p>Attended sessions: '.e($stats['attended']).'</p><p>Total sessions since start date: '.e($stats['sessions_since_start']).'</p><p>Attendance: '.e($stats['attendance_percent']===null?'N/A':$stats['attendance_percent'].'%').'</p><p class="muted">Start date used: '.e($stats['attendance_start_date'] ?: 'No join date recorded - using all past sessions').'</p></div>';
+    echo '<div class="grid"><div class="card"><h2>Attendance</h2><p>Attended sessions: '.e($stats['attended']).'</p><p>Completed sessions since start date: '.e($stats['sessions_since_start']).'</p><p>Attendance: '.e($stats['attendance_percent']===null?'N/A':$stats['attendance_percent'].'%').'</p><p class="muted">Start date used: '.e($stats['attendance_start_date'] ?: 'No join date recorded - using all past sessions').'</p></div>';
     $payments=all('SELECT * FROM subscription_payments WHERE member_id=? ORDER BY subscription_year DESC',[$id]); echo '<div class="card"><h2>Payment/subs history</h2><table><tr><th>Year</th><th>Due</th><th>Paid</th><th>Date</th><th>Status</th></tr>'; foreach($payments as $p) echo '<tr><td>'.e($p['subscription_year']).'</td><td>£'.e(number_format($p['amount_due'],2)).'</td><td>£'.e(number_format($p['amount_paid'],2)).'</td><td>'.e($p['payment_date']).'</td><td>'.e($p['status']).'</td></tr>'; echo '</table></div></div>';
     echo '<div class="card"><h2>Add subs/payment record</h2><form method="post">'.csrf_field().'<input type="hidden" name="add_payment" value="1"><div class="two"><input type="number" name="subscription_year" value="'.date('Y').'" required><input type="number" step="0.01" name="amount_due" placeholder="Amount due" required><input type="number" step="0.01" name="amount_paid" placeholder="Amount paid" required><input type="date" name="payment_date"><input name="payment_method" placeholder="Payment method"><input name="payment_reference" placeholder="Payment reference"><input name="receipt_number" placeholder="Receipt number"><select name="status"><option>unpaid</option><option>part-paid</option><option>paid</option><option>waived</option><option>refunded</option></select></div><textarea name="notes" placeholder="Notes"></textarea><button>Add payment record</button></form></div>';
     $rh=all('SELECT urh.*,r.display_name FROM user_role_history urh JOIN users us ON us.id=urh.user_id JOIN roles r ON r.id=urh.role_id WHERE us.member_id=? ORDER BY changed_at DESC',[$id]); echo '<div class="card"><h2>Role history</h2><table><tr><th>Role</th><th>Action</th><th>Changed</th><th>Reason</th></tr>'; foreach($rh as $r) echo '<tr><td>'.e($r['display_name']).'</td><td>'.e($r['action']).'</td><td>'.e($r['changed_at']).'</td><td>'.e($r['reason']).'</td></tr>'; echo '</table></div>';
