@@ -1,60 +1,31 @@
-# CADARS Members System
 
-Self-hosted membership system for Chepstow & District Amateur Radio Society.
 
-## Email sending
+## Footer and policy links
 
-The Email system config page supports:
+The system footer now includes:
 
-- PHP mail()
-- Resend API
-- SMTP settings stored for future SMTP wiring
+- Created and Maintained By Sean Crabbe (sean@defenderonfrequency.uk)
+- GDPR policy link
+- Data retention policy link
+- V2 Club Management and Information System with last updated date
 
-For Resend API:
+## Mobile usability
 
-1. Go to Committee > Emails.
-2. Click Email system config as an admin.
-3. Set Mail method to Resend API.
-4. Enter the Resend API key.
-5. Set the From email to an address/domain allowed in Resend.
-6. Save and send a test email.
+Mobile-only responsive CSS has been added. Desktop/laptop layout is unchanged, while phones get improved navigation, tables, buttons, forms, email composer, attendance register, Brickworks cards, and footer spacing.
 
-Bulk emails with more than one recipient are sent using BCC for member privacy.
+## Role and menu permissions update
 
-## Dashboard events update
+Navigation and permissions have been split into Committee and Admin areas.
 
-Dashboard now shows only the next three events within the next month. User roles and attendance summary have been removed from the dashboard to keep it cleaner.
+- Admin menu is visible only to Admin users and contains Users, Audit logs and Email settings.
+- Admin users retain full access and all permissions.
+- Chair, Vice Chair, Secretary and Treasurer get operational access to all non-admin areas.
+- Committee members can manage attendance, actions and events.
+- Member DB User can view/edit the membership database.
+- Equipment Manager can view/edit the asset list.
+- Event Manager can create/edit/delete events.
+- Brickworks Reviewer is the only non-admin role that can approve/comment on Brickworks criteria.
 
-## Dashboard layout
+## Attendance calculation update
 
-Dashboard order adjusted so Notifications appear in the top dashboard grid and Next events appears below.
-
-## Legacy CSV import
-
-Added `scripts/import-legacy-csv.php` for one-time import of old Events, Assets/Equipment, and Attendance CSV exports.
-
-See `docs/LEGACY-CSV-IMPORT.md`.
-
-## Programme filtering
-
-The Programme page now has Current & future and Past tabs.
-
-- Current & future events show nearest first.
-- Past events show most recent first.
-- Events can be searched by title, description or location.
-- Events can be filtered by event type.
-
-## Programme UI, mobile and performance update
-
-- Programme page has a modern event-card layout while keeping the existing workflow.
-- Mobile-only CSS has been expanded for Programme, Users, tables, forms, modals, email and attendance screens.
-- Users page Role guide is now a clear table with each role and what access it gives.
-- SQLite performance tuning added: WAL mode, busy timeout, cache size, temp memory store, normal sync and targeted indexes.
-- Runtime seed/index setup now runs only when the internal setup version changes instead of on every page load.
-
-## Members UI and attendance percentage fix
-
-- Membership database now uses the same modern card-based style as assets/actions.
-- Add member is now its own page linked from the member list header.
-- Member list has summary stats, search/status filtering and modern member cards.
-- Attendance percentages now count distinct events and are capped at 100%, fixing impossible values such as 15000%.
+Member attendance is now calculated as attended past sessions divided by total past member sessions since the member's recorded join/start date. If no join date is recorded, all past member sessions are used. The display now shows attended / total sessions and remains capped at 100%.
