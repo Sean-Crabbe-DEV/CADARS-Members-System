@@ -1,39 +1,56 @@
+# CADARS Members System
 
+Self-hosted membership system for Chepstow & District Amateur Radio Society.
 
-## Footer and policy links
+## Email sending
 
-The system footer now includes:
+The Email system config page supports:
 
-- Created and Maintained By Sean Crabbe (sean@defenderonfrequency.uk)
-- GDPR policy link
-- Data retention policy link
-- V2 Club Management and Information System with last updated date
+- PHP mail()
+- Resend API
+- SMTP settings stored for future SMTP wiring
 
-## Mobile usability
+For Resend API:
 
-Mobile-only responsive CSS has been added. Desktop/laptop layout is unchanged, while phones get improved navigation, tables, buttons, forms, email composer, attendance register, Brickworks cards, and footer spacing.
+1. Go to Committee > Emails.
+2. Click Email system config as an admin.
+3. Set Mail method to Resend API.
+4. Enter the Resend API key.
+5. Set the From email to an address/domain allowed in Resend.
+6. Save and send a test email.
 
-## Role and menu permissions update
+Bulk emails with more than one recipient are sent using BCC for member privacy.
 
-Navigation and permissions have been split into Committee and Admin areas.
+## Dashboard events update
 
-- Admin menu is visible only to Admin users and contains Users, Audit logs and Email settings.
-- Admin users retain full access and all permissions.
-- Chair, Vice Chair, Secretary and Treasurer get operational access to all non-admin areas.
-- Committee members can manage attendance, actions and events.
-- Member DB User can view/edit the membership database.
-- Equipment Manager can view/edit the asset list.
-- Event Manager can create/edit/delete events.
-- Brickworks Reviewer is the only non-admin role that can approve/comment on Brickworks criteria.
+Dashboard now shows only the next three events within the next month. User roles and attendance summary have been removed from the dashboard to keep it cleaner.
 
-## Attendance calculation update
+## Dashboard layout
 
-Member attendance is now calculated as attended past sessions divided by total past member sessions since the member's recorded join/start date. If no join date is recorded, all past member sessions are used. The display now shows attended / total sessions and remains capped at 100%.
+Dashboard order adjusted so Notifications appear in the top dashboard grid and Next events appears below.
 
-## Email recipient list update
+## Login and password recovery
 
-The email page now shows all member records rather than only active opted-in members. Members without an email address or who have explicitly opted out of email communications remain visible but are disabled for sending.
+The login page has been restyled with a responsive centred sign-in card. Users can now use **Forgot password?** to request a self-service password reset link. Reset links use the existing secure token system and expire after 48 hours.
 
-## Email consent removal
+## User admin and officer roles
 
-Email communications consent checks have been removed from the email page. All member records now appear automatically in the email recipient list. Members without an email address are shown but disabled for sending.
+Added officer roles:
+
+- Chair
+- Vice Chair
+- Secretary
+
+The Users admin page has been redesigned into a more spacious card layout with clearer role chips, role management panels, invite/reset actions and user summary stats.
+
+## User admin layout
+
+Invite new user and Create manual user have been moved to their own pages. The Users page now has top action buttons for those workflows, keeping the user admin list cleaner and less cramped.
+
+## Attendance future-session exclusion
+
+Attendance now excludes future sessions completely. A session is only counted once its end time has passed; if no end time is recorded, the start time is used as the fallback.
+
+## Email Reply-To update
+
+Emails sent from the email page now set Reply-To to the sending user's email address plus any active user/member with the Secretary role. The linked member email is preferred for the Secretary role, falling back to the user account email.

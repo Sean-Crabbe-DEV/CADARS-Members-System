@@ -38,6 +38,51 @@ function save_app_config(array $updates): void {
     file_put_contents(CONFIG_PATH, '<?php return ' . var_export($cfg, true) . ';');
 }
 
+function normalise_email_list($emails): array {
+    if (is_array($emails)) $parts = $emails;
+    else $parts = preg_split('/[,;]+/', (string)$emails) ?: [];
+    $clean = [];
+    foreach ($parts as $email) {
+        $email = trim((string)$email);
+        $email = str_replace(["\r","\n"], '', $email);
+        if ($email !== '' && filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $clean[strtolower($email)] = $email;
+        }
+    }
+    return array_values($clean);
+}
+
+function email_reply_to_for_sender(array $senderUser, array $cfg, string $fallbackFrom): string {
+    $emails = [];
+
+    $senderEmail = trim((string)($senderUser['email'] ?? ''));
+    if ($senderEmail !== '') $emails[] = $senderEmail;
+
+    // Include any active user/member with the Secretary role. Prefer the linked
+    // member email where available, falling back to the user account email.
+    try {
+        $secretaries = all('SELECT DISTINCT COALESCE(NULLIF(m.email,""), u.email) email
+            FROM users u
+            JOIN user_roles ur ON ur.user_id=u.id
+            JOIN roles r ON r.id=ur.role_id
+            LEFT JOIN members m ON m.id=u.member_id
+            WHERE u.status="active"
+              AND r.name="secretary"
+              AND (ur.expires_at IS NULL OR ur.expires_at > datetime("now"))');
+        foreach ($secretaries as $sec) {
+            if (!empty($sec['email'])) $emails[] = $sec['email'];
+        }
+    } catch (Throwable $e) {}
+
+    // Fallbacks only apply if neither the sender nor secretary has a usable email.
+    if (!normalise_email_list($emails)) {
+        if (!empty($cfg['email_reply_to'])) $emails[] = $cfg['email_reply_to'];
+        $emails[] = $fallbackFrom;
+    }
+
+    return implode(', ', normalise_email_list($emails));
+}
+
 function send_configured_email(array $cfg, array $to, array $bcc, string $subject, string $html, string $fromName, string $fromAddress, string $replyTo, array $attachments=[]): array {
     $method = $cfg['email_method'] ?? 'php_mail';
     $to = array_values(array_filter(array_map('trim', $to)));
@@ -46,6 +91,8 @@ function send_configured_email(array $cfg, array $to, array $bcc, string $subjec
     $fromName = str_replace(["\r","\n"], '', $fromName);
     $fromAddress = str_replace(["\r","\n"], '', $fromAddress);
     $replyTo = str_replace(["\r","\n"], '', $replyTo);
+    $replyToAddresses = normalise_email_list($replyTo);
+    $replyTo = implode(', ', $replyToAddresses);
 
     if (!$to) return ['ok' => false, 'error' => 'No To recipient supplied.'];
 
@@ -73,7 +120,7 @@ function send_configured_email(array $cfg, array $to, array $bcc, string $subjec
             'html' => $html,
         ];
         if ($bcc) $payload['bcc'] = $bcc;
-        if ($replyTo) $payload['reply_to'] = $replyTo;
+        if ($replyToAddresses) $payload['reply_to'] = count($replyToAddresses) === 1 ? $replyToAddresses[0] : $replyToAddresses;
         if ($preparedAttachments) {
             $payload['attachments'] = [];
             foreach ($preparedAttachments as $a) {
@@ -3139,7 +3186,7 @@ if (route() === 'emails') {
             $emailAttachments=all('SELECT * FROM email_attachments WHERE email_id=? ORDER BY id ASC',[$email_id]);
             $fromAddress = trim($cfg['email_from_address'] ?: ('noreply@' . ($_SERVER['HTTP_HOST'] ?? 'localhost')));
             $fromName = trim($cfg['email_from_name'] ?: ($cfg['society_name'] ?? 'Membership System'));
-            $replyTo = trim($cfg['email_reply_to'] ?: $fromAddress);
+            $replyTo = email_reply_to_for_sender($u, $cfg, $fromAddress);
             $safeFromName = str_replace(["\r","\n"], '', $fromName);
             $safeFromAddress = str_replace(["\r","\n"], '', $fromAddress);
             $safeReplyTo = str_replace(["\r","\n"], '', $replyTo);
@@ -3171,7 +3218,7 @@ if (route() === 'emails') {
             }
             $overallStatus = $failCount === 0 ? 'sent' : ($successCount > 0 ? 'partial_failed' : 'failed');
             exec_sql('UPDATE emails SET status=?, sent_at=CASE WHEN ?=1 THEN datetime("now") ELSE sent_at END, updated_at=datetime("now") WHERE id=?',[$overallStatus,$successCount>0?1:0,$email_id]);
-            audit('email.sent','email',$email_id,$successCount>0?'success':'failed',$lastError,['recipient_count'=>count($recips),'success_count'=>$successCount,'fail_count'=>$failCount,'bcc_used'=>count($recips)>1,'individual_bcc'=>count($recips)>1,'open_tracking_enabled'=>$trackingGloballyEnabled,'method'=>$cfg['email_method'] ?? 'php_mail','attachment_count'=>count($emailAttachments)]);
+            audit('email.sent','email',$email_id,$successCount>0?'success':'failed',$lastError,['recipient_count'=>count($recips),'success_count'=>$successCount,'fail_count'=>$failCount,'bcc_used'=>count($recips)>1,'individual_bcc'=>count($recips)>1,'open_tracking_enabled'=>$trackingGloballyEnabled,'method'=>$cfg['email_method'] ?? 'php_mail','attachment_count'=>count($emailAttachments),'reply_to'=>$safeReplyTo]);
             flash('Email send attempted using '.(($cfg['email_method'] ?? 'php_mail') === 'resend' ? 'Resend API' : 'PHP mail').'. Multiple-recipient sends are sent as individual BCC emails so recipient addresses stay private and open tracking can work per member.'); redirect('emails');
         }
         audit('email.draft_created','email',$email_id,'success',null,['recipient_count'=>count($members),'recipient_mode'=>$recipientMode]);
@@ -3198,7 +3245,7 @@ if (route() === 'emails') {
         $disabledClass = $canEmail ? '' : ' disabled';
         echo '<label class="email-member-card'.$disabledClass.'" data-name="'.strtolower(e($m['first_name'].' '.$m['last_name'].' '.$m['email'].' '.$m['callsign'].' '.$m['membership_status'])).'" data-payment="'.e($paymentGroup).'" data-committee="'.((int)$m['is_committee'] ? '1' : '0').'" data-can-email="'.($canEmail?'1':'0').'"><input class="email-member-check" type="checkbox" name="member_ids[]" value="'.e($m['id']).'" '.$disabled.'><span class="email-check-ui">✓</span><span class="email-member-main"><strong>'.$name.'</strong>'.($callsign?'<span class="email-callsign">'.$callsign.'</span>':'').'<small>'.$email.' • '.e($m['membership_status'] ?: 'unknown').' • '.e($emailStatus).'</small></span><span class="email-badge '.e($paymentGroup).'">'.e($badgeText).'</span></label>';
     }
-    echo '</div></aside><section class="email-compose"><div class="email-fields"><div class="email-row"><label>To:</label><input id="emailToSummary" value="0 members selected" readonly></div><div class="email-row"><label>From:</label><input value="'.e($fromName).' <'.e($fromAddress).'>" readonly></div><div class="email-row"><label>Subject:</label><input name="subject" placeholder="Email subject..." required></div></div><div class="email-toolbar"><label class="email-attach-btn">📎 Attach<input type="file" name="attachment" id="emailAttachment"></label><span id="emailAttachName" class="email-help">Use <code>{member_name}</code> to personalise each email.</span></div><textarea class="email-message" name="body_html" placeholder="Write your message here... Use {member_name} to personalise for each recipient." required></textarea><div class="email-sendbar"><span class="muted">All member records are shown automatically. Members without an email address are visible but cannot be selected. No recipients are selected by default. Use All or filters to select recipients.</span><div><button class="secondary" type="submit">Save draft</button> <button name="send_now" value="1">Send now</button></div></div></section></div></form></div>';
+    echo '</div></aside><section class="email-compose"><div class="email-fields"><div class="email-row"><label>To:</label><input id="emailToSummary" value="0 members selected" readonly></div><div class="email-row"><label>From:</label><input value="'.e($fromName).' <'.e($fromAddress).'>" readonly></div><div class="email-row"><label>Reply-To:</label><input value="'.e(email_reply_to_for_sender($u, $cfg, $fromAddress)).'" readonly></div><div class="email-row"><label>Subject:</label><input name="subject" placeholder="Email subject..." required></div></div><div class="email-toolbar"><label class="email-attach-btn">📎 Attach<input type="file" name="attachment" id="emailAttachment"></label><span id="emailAttachName" class="email-help">Use <code>{member_name}</code> to personalise each email.</span></div><textarea class="email-message" name="body_html" placeholder="Write your message here... Use {member_name} to personalise for each recipient." required></textarea><div class="email-sendbar"><span class="muted">All member records are shown automatically. Members without an email address are visible but cannot be selected. No recipients are selected by default. Use All or filters to select recipients.</span><div><button class="secondary" type="submit">Save draft</button> <button name="send_now" value="1">Send now</button></div></div></section></div></form></div>';
 
     echo '<div class="card"><h2>Recent emails</h2><table><tr><th>Subject</th><th>Status</th><th>Sent</th><th>Recipients</th><th>Opens</th></tr>';
     foreach($emails as $em){ $rc=first('SELECT COUNT(*) c, SUM(open_count) opens FROM email_recipients WHERE email_id=?',[$em['id']]); echo '<tr><td>'.e($em['subject']).'</td><td>'.e($em['status']).'</td><td>'.e($em['sent_at']).'</td><td>'.e($rc['c']).'</td><td>'.e($rc['opens'] ?: 0).'</td></tr>'; }
