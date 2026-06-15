@@ -29,24 +29,25 @@ Dashboard now shows only the next three events within the next month. User roles
 
 Dashboard order adjusted so Notifications appear in the top dashboard grid and Next events appears below.
 
-## Login and password recovery
+## Legacy CSV import
 
-The login page has been restyled with a responsive centred sign-in card. Users can now use **Forgot password?** to request a self-service password reset link. Reset links use the existing secure token system and expire after 48 hours.
+Added `scripts/import-legacy-csv.php` for one-time import of old Events, Assets/Equipment, and Attendance CSV exports.
 
-## User admin and officer roles
+See `docs/LEGACY-CSV-IMPORT.md`.
 
-Added officer roles:
+## Programme filtering
 
-- Chair
-- Vice Chair
-- Secretary
+The Programme page now has Current & future and Past tabs.
 
-The Users admin page has been redesigned into a more spacious card layout with clearer role chips, role management panels, invite/reset actions and user summary stats.
+- Current & future events show nearest first.
+- Past events show most recent first.
+- Events can be searched by title, description or location.
+- Events can be filtered by event type.
 
-## User admin layout
+## Programme UI, mobile and performance update
 
-Invite new user and Create manual user have been moved to their own pages. The Users page now has top action buttons for those workflows, keeping the user admin list cleaner and less cramped.
-
-## Users page header update
-
-The Invite new user and Create manual user buttons now sit in the User accounts card header where the user count badge previously was.
+- Programme page has a modern event-card layout while keeping the existing workflow.
+- Mobile-only CSS has been expanded for Programme, Users, tables, forms, modals, email and attendance screens.
+- Users page Role guide is now a clear table with each role and what access it gives.
+- SQLite performance tuning added: WAL mode, busy timeout, cache size, temp memory store, normal sync and targeted indexes.
+- Runtime seed/index setup now runs only when the internal setup version changes instead of on every page load.
