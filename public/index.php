@@ -356,8 +356,15 @@ function record_action_history(int $action_id, string $type, string $note='', ar
     ]);
 }
 function has_role(string $role): bool { $u=current_user(); return $u ? in_array($role, user_roles((int)$u['id']), true) : false; }
-function is_committee_or_admin(): bool { return has_role('committee') || has_role('chair') || has_role('vice_chair') || has_role('secretary') || has_role('admin'); }
-function can_manage_events(): bool { return is_committee_or_admin(); }
+function is_officer(): bool { return has_role('chair') || has_role('vice_chair') || has_role('secretary') || has_role('treasurer'); }
+function is_committee_or_admin(): bool { return has_role('committee') || is_officer() || has_role('admin'); }
+function can_manage_events(): bool { return has_permission('manage_events'); }
+function can_view_committee_menu(): bool {
+    foreach (['track_attendance','send_member_emails','view_equipment','view_committee_actions','view_membership_db','manage_events'] as $p) {
+        if (has_permission($p)) return true;
+    }
+    return false;
+}
 function event_categories(): array {
     return ['Club Night','Shack Night','Field Day','Special Event Station','Rallies','Talk','Social','Other'];
 }
@@ -825,15 +832,20 @@ function page_header(string $title): void {
         }
         echo '<nav class="main-nav">';
         echo '<a href="?route=dashboard">Dashboard</a><a href="?route=events">Programme</a><a href="?route=directory">Directory</a><a href="?route=brickworks">Brickworks</a>';
-        if (is_committee_or_admin()) {
+        if (can_view_committee_menu()) {
             echo '<div class="dropdown"><button type="button" class="nav-drop" aria-haspopup="true">Committee ▾</button><div class="dropdown-menu">';
             if (has_permission('view_membership_db')) echo '<a href="?route=members">Members</a>';
             if (has_permission('track_attendance')) echo '<a href="?route=attendance">Attendance</a><a href="?route=attendance_stats">Attendance stats</a>';
             if (has_permission('send_member_emails')) echo '<a href="?route=emails">Emails</a>';
             if (has_permission('view_equipment')) echo '<a href="?route=equipment">Equipment / assets</a>';
             if (has_permission('view_committee_actions')) echo '<a href="?route=committee_actions">Actions</a>';
-            if (has_permission('manage_users')) echo '<a href="?route=users">Users</a>';
-            if (has_permission('view_audit_logs')) echo '<a href="?route=audit">Audit logs</a>';
+            echo '</div></div>';
+        }
+        if (is_admin_user()) {
+            echo '<div class="dropdown"><button type="button" class="nav-drop" aria-haspopup="true">Admin ▾</button><div class="dropdown-menu">';
+            echo '<a href="?route=users">Users</a>';
+            echo '<a href="?route=audit">Audit logs</a>';
+            echo '<a href="?route=email_config">Email settings</a>';
             echo '</div></div>';
         }
         echo '<div class="dropdown user-menu"><button type="button" class="nav-drop">' . e($displayName) . ' ▾</button><div class="dropdown-menu dropdown-right"><a href="?route=profile">My Profile</a><a href="?route=logout">Logout</a></div></div>';
@@ -1343,22 +1355,28 @@ function seed_roles_permissions(): void {
     foreach ($permissions as $p) exec_sql('INSERT OR IGNORE INTO permissions (name, description, created_at, updated_at) VALUES (?, ?, datetime("now"), datetime("now"))', [$p,$p]);
     $rolePerms = [
         'member' => ['view_own_profile','edit_own_profile','view_events','signup_events','view_internal_directory','search_internal_directory','manage_own_directory_preferences','manage_own_email_preferences','view_own_brickworks','join_brickworks','submit_brickworks_evidence'],
-        'committee' => ['view_events','manage_events','track_attendance','view_committee_actions','manage_committee_actions','view_equipment','edit_equipment','manage_equipment_loans'],
-        'chair' => ['view_events','manage_events','track_attendance','view_committee_actions','manage_committee_actions','view_equipment','edit_equipment','manage_equipment_loans','send_member_emails','send_event_emails','view_email_reports'],
-        'vice_chair' => ['view_events','manage_events','track_attendance','view_committee_actions','manage_committee_actions','view_equipment','edit_equipment','manage_equipment_loans','send_event_emails'],
-        'secretary' => ['view_events','manage_events','track_attendance','view_committee_actions','manage_committee_actions','view_equipment','edit_equipment','manage_equipment_loans','send_member_emails','send_event_emails','view_email_reports'],
+        'committee' => ['view_events','manage_events','track_attendance','view_committee_actions','manage_committee_actions'],
+        'chair' => ['view_events','manage_events','track_attendance','view_committee_actions','manage_committee_actions','view_equipment','edit_equipment','manage_equipment_loans','view_membership_db','edit_membership_db','manage_subscriptions','export_member_data','send_member_emails','send_role_emails','send_event_emails','send_subs_reminders','send_brickworks_emails','view_email_reports','view_email_open_tracking','manage_email_attachments'],
+        'vice_chair' => ['view_events','manage_events','track_attendance','view_committee_actions','manage_committee_actions','view_equipment','edit_equipment','manage_equipment_loans','view_membership_db','edit_membership_db','manage_subscriptions','export_member_data','send_member_emails','send_role_emails','send_event_emails','send_subs_reminders','send_brickworks_emails','view_email_reports','view_email_open_tracking','manage_email_attachments'],
+        'secretary' => ['view_events','manage_events','track_attendance','view_committee_actions','manage_committee_actions','view_equipment','edit_equipment','manage_equipment_loans','view_membership_db','edit_membership_db','manage_subscriptions','export_member_data','send_member_emails','send_role_emails','send_event_emails','send_subs_reminders','send_brickworks_emails','view_email_reports','view_email_open_tracking','manage_email_attachments'],
+        'treasurer' => ['view_events','manage_events','track_attendance','view_committee_actions','manage_committee_actions','view_equipment','edit_equipment','manage_equipment_loans','view_membership_db','edit_membership_db','manage_subscriptions','export_member_data','send_member_emails','send_role_emails','send_event_emails','send_subs_reminders','send_brickworks_emails','view_email_reports','view_email_open_tracking','manage_email_attachments'],
         'equipment_manager' => ['view_equipment','edit_equipment','manage_equipment_loans','view_equipment_audit_logs'],
-        'event_manager' => ['manage_events','track_attendance','view_committee_actions','manage_committee_actions','send_event_emails'],
-        'member_db' => ['view_membership_db','edit_membership_db','manage_subscriptions','export_member_data','view_member_audit_logs','send_member_emails','send_subs_reminders','view_email_reports','view_email_open_tracking'],
-        'brickworks_reviewer' => ['view_brickworks_participants','review_brickworks_evidence','approve_brickworks_criteria','export_brickworks_reports','send_brickworks_emails'],
-        'treasurer' => ['view_membership_db','manage_subscriptions','send_subs_reminders'],
+        'event_manager' => ['view_events','manage_events'],
+        'member_db' => ['view_membership_db','edit_membership_db','manage_subscriptions','export_member_data','send_member_emails','send_subs_reminders','view_email_reports','view_email_open_tracking'],
+        'brickworks_reviewer' => ['view_brickworks_participants','review_brickworks_evidence','approve_brickworks_criteria','manage_brickworks_criteria','export_brickworks_reports','send_brickworks_emails'],
+        'brickworks_participant' => ['view_own_brickworks','submit_brickworks_evidence'],
         'admin' => $permissions
     ];
+    $controlledRoles = array_keys($rolePerms);
+    foreach ($controlledRoles as $roleName) {
+        $roleRow = first('SELECT id FROM roles WHERE name=?', [$roleName]);
+        if ($roleRow) exec_sql('DELETE FROM role_permissions WHERE role_id=?', [$roleRow['id']]);
+    }
     foreach ($rolePerms as $role=>$perms) {
         $rid = first('SELECT id FROM roles WHERE name=?',[$role])['id'];
         foreach ($perms as $perm) {
-            $pid = first('SELECT id FROM permissions WHERE name=?',[$perm])['id'];
-            exec_sql('INSERT OR IGNORE INTO role_permissions (role_id, permission_id) VALUES (?,?)',[$rid,$pid]);
+            $pid = first('SELECT id FROM permissions WHERE name=?',[$perm])['id'] ?? null;
+            if ($pid) exec_sql('INSERT OR IGNORE INTO role_permissions (role_id, permission_id) VALUES (?,?)',[$rid,$pid]);
         }
     }
 }

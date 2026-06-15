@@ -1,48 +1,27 @@
-# CADARS Members System
 
-Self-hosted membership system for Chepstow & District Amateur Radio Society.
 
-## Email sending
+## Footer and policy links
 
-The Email system config page supports:
+The system footer now includes:
 
-- PHP mail()
-- Resend API
-- SMTP settings stored for future SMTP wiring
+- Created and Maintained By Sean Crabbe (sean@defenderonfrequency.uk)
+- GDPR policy link
+- Data retention policy link
+- V2 Club Management and Information System with last updated date
 
-For Resend API:
+## Mobile usability
 
-1. Go to Committee > Emails.
-2. Click Email system config as an admin.
-3. Set Mail method to Resend API.
-4. Enter the Resend API key.
-5. Set the From email to an address/domain allowed in Resend.
-6. Save and send a test email.
+Mobile-only responsive CSS has been added. Desktop/laptop layout is unchanged, while phones get improved navigation, tables, buttons, forms, email composer, attendance register, Brickworks cards, and footer spacing.
 
-Bulk emails with more than one recipient are sent using BCC for member privacy.
+## Role and menu permissions update
 
-## Dashboard events update
+Navigation and permissions have been split into Committee and Admin areas.
 
-Dashboard now shows only the next three events within the next month. User roles and attendance summary have been removed from the dashboard to keep it cleaner.
-
-## Dashboard layout
-
-Dashboard order adjusted so Notifications appear in the top dashboard grid and Next events appears below.
-
-## Login and password recovery
-
-The login page has been restyled with a responsive centred sign-in card. Users can now use **Forgot password?** to request a self-service password reset link. Reset links use the existing secure token system and expire after 48 hours.
-
-## User admin and officer roles
-
-Added officer roles:
-
-- Chair
-- Vice Chair
-- Secretary
-
-The Users admin page has been redesigned into a more spacious card layout with clearer role chips, role management panels, invite/reset actions and user summary stats.
-
-## User admin layout
-
-Invite new user and Create manual user have been moved to their own pages. The Users page now has top action buttons for those workflows, keeping the user admin list cleaner and less cramped.
+- Admin menu is visible only to Admin users and contains Users, Audit logs and Email settings.
+- Admin users retain full access and all permissions.
+- Chair, Vice Chair, Secretary and Treasurer get operational access to all non-admin areas.
+- Committee members can manage attendance, actions and events.
+- Member DB User can view/edit the membership database.
+- Equipment Manager can view/edit the asset list.
+- Event Manager can create/edit/delete events.
+- Brickworks Reviewer is the only non-admin role that can approve/comment on Brickworks criteria.
