@@ -2117,9 +2117,8 @@ if (route() === 'users') {
 
     echo '<div class="card users-hero"><div><h1>Users</h1><p class="muted">Create accounts, send invites, reset passwords and manage user roles. Invite/reset links let users set their own password securely.</p></div><div class="users-stats"><div><strong>'.e(count($users)).'</strong><span>Total users</span></div><div><strong>'.e($activeCount).'</strong><span>Active</span></div><div><strong>'.e($adminCount).'</strong><span>Admins</span></div><div><strong>'.e($setupRequired).'</strong><span>Setup required</span></div></div></div>';
 
-    echo '<div class="card"><div class="toolbar"><a class="btn" href="?route=user_invite">Invite new user</a><a class="btn secondary" href="?route=user_create">Create manual user</a></div></div>';
     echo '<div class="users-layout" style="grid-template-columns:1fr">';
-    echo '<section class="users-main"><div class="card users-list-card"><div class="toolbar"><h2 style="margin-right:auto">User accounts</h2><span class="pill">'.e(count($users)).' users</span></div><div class="users-admin-list">';
+    echo '<section class="users-main"><div class="card users-list-card"><div class="toolbar"><h2 style="margin-right:auto">User accounts</h2><a class="btn" href="?route=user_invite">Invite new user</a><a class="btn secondary" href="?route=user_create">Create manual user</a></div><div class="users-admin-list">';
     foreach($users as $usr){
         $currentRoles = user_roles((int)$usr['id']);
         $memberName = trim(($usr['first_name']??'').' '.($usr['last_name']??''));
