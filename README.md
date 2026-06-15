@@ -24,3 +24,22 @@ Bulk emails with more than one recipient are sent using BCC for member privacy.
 ## Dashboard events update
 
 Dashboard now shows only the next three events within the next month. User roles and attendance summary have been removed from the dashboard to keep it cleaner.
+
+## Dashboard layout
+
+Dashboard order adjusted so Notifications appear in the top dashboard grid and Next events appears below.
+
+## Legacy CSV import
+
+Added `scripts/import-legacy-csv.php` for one-time import of old Events, Assets/Equipment, and Attendance CSV exports.
+
+See `docs/LEGACY-CSV-IMPORT.md`.
+
+## Programme filtering
+
+The Programme page now has Current & future and Past tabs.
+
+- Current & future events show nearest first.
+- Past events show most recent first.
+- Events can be searched by title, description or location.
+- Events can be filtered by event type.

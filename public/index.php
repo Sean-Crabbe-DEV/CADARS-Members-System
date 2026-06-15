@@ -2214,19 +2214,77 @@ if (route() === 'events') {
         audit('event.create','event',$event_id); flash('Event added and is now available in attendance tracking.'); redirect('event_view&id='.$event_id);
     }
     $view = $_GET['view'] ?? 'list';
+    $view = in_array($view, ['list','calendar'], true) ? $view : 'list';
+
+    $section = $_GET['section'] ?? 'current';
+    $section = in_array($section, ['current','past'], true) ? $section : 'current';
+
     $month = preg_match('/^\d{4}-\d{2}$/', $_GET['month'] ?? '') ? $_GET['month'] : date('Y-m');
-    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Programme</h1><a class="btn secondary" href="?route=events&view=list">List view</a><a class="btn secondary" href="?route=events&view=calendar&month='.e($month).'">Calendar view</a>';
+
+    $search = trim((string)($_GET['q'] ?? ''));
+    $selectedType = trim((string)($_GET['type'] ?? ''));
+    if ($selectedType !== '' && !in_array($selectedType, event_categories(), true)) {
+        $selectedType = '';
+    }
+
+    $baseFilters = [];
+    if ($selectedType !== '') $baseFilters['type'] = $selectedType;
+    if ($search !== '') $baseFilters['q'] = $search;
+
+    $listLink = '?'.http_build_query(array_merge(['route'=>'events','view'=>'list','section'=>$section], $baseFilters));
+    $calendarLink = '?'.http_build_query(array_merge(['route'=>'events','view'=>'calendar','section'=>$section,'month'=>$month], $baseFilters));
+    $currentLink = '?'.http_build_query(array_merge(['route'=>'events','view'=>$view,'section'=>'current','month'=>$month], $baseFilters));
+    $pastLink = '?'.http_build_query(array_merge(['route'=>'events','view'=>$view,'section'=>'past','month'=>$month], $baseFilters));
+
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Programme</h1><a class="btn secondary" href="'.e($listLink).'">List view</a><a class="btn secondary" href="'.e($calendarLink).'">Calendar view</a>';
     if (can_manage_events()) echo '<button type="button" onclick="document.getElementById(\'addEventDialog\').showModal()">Add event</button>';
     echo '</div><p class="muted">Click an event to open the full details, attachments, timings and location.</p></div>';
+
+    echo '<div class="card">';
+    echo '<div class="toolbar" style="margin-bottom:12px">';
+    echo '<a class="btn '.($section === 'current' ? '' : 'secondary').'" href="'.e($currentLink).'">Current & future</a>';
+    echo '<a class="btn '.($section === 'past' ? '' : 'secondary').'" href="'.e($pastLink).'">Past</a>';
+    echo '</div>';
+    echo '<form method="get" class="toolbar">';
+    echo '<input type="hidden" name="route" value="events">';
+    echo '<input type="hidden" name="view" value="'.e($view).'">';
+    echo '<input type="hidden" name="section" value="'.e($section).'">';
+    if ($view === 'calendar') echo '<input type="hidden" name="month" value="'.e($month).'">';
+    echo '<div style="min-width:240px;flex:1"><label>Search events</label><input name="q" value="'.e($search).'" placeholder="Search title, description or location"></div>';
+    echo '<div style="min-width:220px"><label>Filter by event type</label><select name="type"><option value="">All event types</option>'.event_category_options($selectedType).'</select></div>';
+    echo '<div style="align-self:end"><button>Apply filters</button></div>';
+    echo '<div style="align-self:end"><a class="btn secondary" href="?route=events&view='.e($view).'&section='.e($section).($view==='calendar'?'&month='.e($month):'').'">Clear</a></div>';
+    echo '</form>';
+    echo '</div>';
+
+    $filterSql = '';
+    $filterParams = [];
+    if ($selectedType !== '') {
+        $filterSql .= ' AND e.event_type = ?';
+        $filterParams[] = $selectedType;
+    }
+    if ($search !== '') {
+        $filterSql .= ' AND (e.title LIKE ? OR e.description LIKE ? OR e.location LIKE ?)';
+        $like = '%' . $search . '%';
+        $filterParams[] = $like;
+        $filterParams[] = $like;
+        $filterParams[] = $like;
+    }
+
     if ($view === 'calendar') {
         $start = new DateTime($month . '-01');
         $firstDay = clone $start;
         $gridStart = clone $firstDay; $gridStart->modify('-'.(((int)$firstDay->format('N'))-1).' days');
         $gridEnd = clone $gridStart; $gridEnd->modify('+41 days');
         $prev=(clone $start)->modify('-1 month')->format('Y-m'); $next=(clone $start)->modify('+1 month')->format('Y-m');
-        $events = all('SELECT * FROM events WHERE date(start_at) BETWEEN ? AND ? ORDER BY start_at ASC',[$gridStart->format('Y-m-d'),$gridEnd->format('Y-m-d')]);
+
+        $prevLink='?'.http_build_query(array_merge(['route'=>'events','view'=>'calendar','section'=>$section,'month'=>$prev], $baseFilters));
+        $nextLink='?'.http_build_query(array_merge(['route'=>'events','view'=>'calendar','section'=>$section,'month'=>$next], $baseFilters));
+
+        $events = all('SELECT e.* FROM events e WHERE date(e.start_at) BETWEEN ? AND ?'.$filterSql.' ORDER BY e.start_at ASC', array_merge([$gridStart->format('Y-m-d'),$gridEnd->format('Y-m-d')], $filterParams));
         $byDate=[]; foreach($events as $ev){ $byDate[substr($ev['start_at'],0,10)][]=$ev; }
-        echo '<div class="card"><div class="toolbar"><a class="btn secondary" href="?route=events&view=calendar&month='.e($prev).'">‹ Previous</a><h2 style="margin-right:auto">'.e($start->format('F Y')).'</h2><a class="btn secondary" href="?route=events&view=calendar&month='.e($next).'">Next ›</a></div><div class="calendar">';
+
+        echo '<div class="card"><div class="toolbar"><a class="btn secondary" href="'.e($prevLink).'">‹ Previous</a><h2 style="margin-right:auto">'.e($start->format('F Y')).'</h2><a class="btn secondary" href="'.e($nextLink).'">Next ›</a></div><div class="calendar">';
         foreach(['Mon','Tue','Wed','Thu','Fri','Sat','Sun'] as $d) echo '<div class="calendar-head">'.$d.'</div>';
         $day=clone $gridStart;
         for($i=0;$i<42;$i++){
@@ -2237,10 +2295,32 @@ if (route() === 'events') {
         }
         echo '</div></div>';
     } else {
-        $rows=all('SELECT e.*,COUNT(a.id) attendee_count FROM events e LEFT JOIN event_attendance a ON a.event_id=e.id AND a.status IN ("signed_up","attended") GROUP BY e.id ORDER BY e.start_at ASC');
-        echo '<div class="card"><h2>Event list</h2><div class="event-list">';
-        if (!$rows) echo '<p>No events have been added yet.</p>';
-        foreach($rows as $ev){ echo '<div class="event-row"><div><h3><a href="?route=event_view&id='.e($ev['id']).'">'.e($ev['title']).'</a></h3><p class="muted"><span class="pill category-pill">'.e($ev['event_type'] ?: 'Other').'</span> • '.e(date('D j M Y H:i', strtotime($ev['start_at']))).($ev['end_at']?' to '.e(date('H:i', strtotime($ev['end_at']))):'').'</p><p>'.nl2br(e(mb_strimwidth((string)$ev['description'],0,220,'…'))).'</p><p><strong>Location:</strong> '.e($ev['location'] ?: 'TBC').' • <strong>Signed up:</strong> '.e($ev['attendee_count']).'</p></div><div class="event-actions"><a class="btn" href="?route=event_view&id='.e($ev['id']).'">Open</a></div></div>'; }
+        if ($section === 'past') {
+            $dateSql = 'e.start_at < datetime("now")';
+            $orderSql = 'e.start_at DESC';
+            $heading = 'Past events';
+            $empty = 'No past events match the selected filters.';
+        } else {
+            $dateSql = 'e.start_at >= datetime("now")';
+            $orderSql = 'e.start_at ASC';
+            $heading = 'Current & future events';
+            $empty = 'No current or future events match the selected filters.';
+        }
+
+        $rows=all('SELECT e.*,COUNT(a.id) attendee_count FROM events e LEFT JOIN event_attendance a ON a.event_id=e.id AND a.status IN ("signed_up","attended") WHERE '.$dateSql.$filterSql.' GROUP BY e.id ORDER BY '.$orderSql, $filterParams);
+
+        echo '<div class="card"><h2>'.e($heading).'</h2>';
+        if ($search || $selectedType) {
+            echo '<p class="muted">Showing filtered results';
+            if ($selectedType) echo ' for <strong>'.e($selectedType).'</strong>';
+            if ($search) echo ' matching <strong>'.e($search).'</strong>';
+            echo '.</p>';
+        }
+        echo '<div class="event-list">';
+        if (!$rows) echo '<p>'.e($empty).'</p>';
+        foreach($rows as $ev){
+            echo '<div class="event-row"><div><h3><a href="?route=event_view&id='.e($ev['id']).'">'.e($ev['title']).'</a></h3><p class="muted"><span class="pill category-pill">'.e($ev['event_type'] ?: 'Other').'</span> • '.e(date('D j M Y H:i', strtotime($ev['start_at']))).($ev['end_at']?' to '.e(date('H:i', strtotime($ev['end_at']))):'').'</p><p>'.nl2br(e(mb_strimwidth((string)$ev['description'],0,220,'…'))).'</p><p><strong>Location:</strong> '.e($ev['location'] ?: 'TBC').' • <strong>Signed up:</strong> '.e($ev['attendee_count']).'</p></div><div class="event-actions"><a class="btn" href="?route=event_view&id='.e($ev['id']).'">Open</a></div></div>';
+        }
         echo '</div></div>';
     }
     if(can_manage_events()) {
