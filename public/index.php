@@ -38,7 +38,7 @@ function save_app_config(array $updates): void {
     file_put_contents(CONFIG_PATH, '<?php return ' . var_export($cfg, true) . ';');
 }
 
-function send_configured_email(array $cfg, array $to, array $bcc, string $subject, string $html, string $fromName, string $fromAddress, string $replyTo): array {
+function send_configured_email(array $cfg, array $to, array $bcc, string $subject, string $html, string $fromName, string $fromAddress, string $replyTo, array $attachments=[]): array {
     $method = $cfg['email_method'] ?? 'php_mail';
     $to = array_values(array_filter(array_map('trim', $to)));
     $bcc = array_values(array_filter(array_map('trim', $bcc)));
@@ -48,6 +48,19 @@ function send_configured_email(array $cfg, array $to, array $bcc, string $subjec
     $replyTo = str_replace(["\r","\n"], '', $replyTo);
 
     if (!$to) return ['ok' => false, 'error' => 'No To recipient supplied.'];
+
+    $preparedAttachments = [];
+    foreach ($attachments as $a) {
+        $path = $a['path'] ?? $a['file_path'] ?? '';
+        if (!$path && !empty($a['stored_filename'])) $path = PRIVATE_PATH . '/email-attachments/' . $a['stored_filename'];
+        if (!$path || !is_file($path)) continue;
+        $preparedAttachments[] = [
+            'filename' => preg_replace('/[\r\n"]+/', '', (string)($a['filename'] ?? $a['original_filename'] ?? basename($path))),
+            'mime_type' => (string)($a['mime_type'] ?? mime_content_type($path) ?: 'application/octet-stream'),
+            'path' => $path,
+            'content' => file_get_contents($path),
+        ];
+    }
 
     if ($method === 'resend') {
         $apiKey = trim((string)($cfg['resend_api_key'] ?? ''));
@@ -61,6 +74,16 @@ function send_configured_email(array $cfg, array $to, array $bcc, string $subjec
         ];
         if ($bcc) $payload['bcc'] = $bcc;
         if ($replyTo) $payload['reply_to'] = $replyTo;
+        if ($preparedAttachments) {
+            $payload['attachments'] = [];
+            foreach ($preparedAttachments as $a) {
+                $payload['attachments'][] = [
+                    'filename' => $a['filename'],
+                    'content' => base64_encode((string)$a['content']),
+                    'content_type' => $a['mime_type'],
+                ];
+            }
+        }
 
         $json = json_encode($payload);
         $headers = [
@@ -107,6 +130,32 @@ function send_configured_email(array $cfg, array $to, array $bcc, string $subjec
         return ['ok' => false, 'error' => 'Resend API request failed' . ($status ? ' HTTP ' . $status : '') . ': ' . substr((string)$response, 0, 500)];
     }
 
+    if ($preparedAttachments) {
+        $boundary = '=_CADARS_' . bin2hex(random_bytes(16));
+        $headers = "MIME-Version: 1.0\r\n";
+        $headers .= 'From: ' . $fromName . ' <' . $fromAddress . ">\r\n";
+        $headers .= 'Reply-To: ' . $replyTo . "\r\n";
+        if ($bcc) $headers .= 'Bcc: ' . implode(', ', $bcc) . "\r\n";
+        $headers .= 'Content-Type: multipart/mixed; boundary="' . $boundary . '"' . "\r\n";
+
+        $message = "--{$boundary}\r\n";
+        $message .= "Content-Type: text/html; charset=UTF-8\r\n";
+        $message .= "Content-Transfer-Encoding: 8bit\r\n\r\n";
+        $message .= $html . "\r\n";
+
+        foreach ($preparedAttachments as $a) {
+            $message .= "--{$boundary}\r\n";
+            $message .= 'Content-Type: ' . $a['mime_type'] . '; name="' . $a['filename'] . '"' . "\r\n";
+            $message .= "Content-Transfer-Encoding: base64\r\n";
+            $message .= 'Content-Disposition: attachment; filename="' . $a['filename'] . '"' . "\r\n\r\n";
+            $message .= chunk_split(base64_encode((string)$a['content'])) . "\r\n";
+        }
+        $message .= "--{$boundary}--\r\n";
+
+        $ok = @mail(implode(', ', $to), $subject, $message, $headers);
+        return ['ok' => (bool)$ok, 'error' => $ok ? null : 'mail() failed or is not configured.'];
+    }
+
     $headers = "MIME-Version: 1.0\r\nContent-type: text/html; charset=UTF-8\r\n";
     $headers .= 'From: ' . $fromName . ' <' . $fromAddress . ">\r\n";
     $headers .= 'Reply-To: ' . $replyTo . "\r\n";
@@ -115,7 +164,6 @@ function send_configured_email(array $cfg, array $to, array $bcc, string $subjec
     $ok = @mail(implode(', ', $to), $subject, $html, $headers);
     return ['ok' => (bool)$ok, 'error' => $ok ? null : 'mail() failed or is not configured.'];
 }
-
 
 function app_base_url(): string {
     $cfg = app_config();
@@ -542,13 +590,17 @@ function member_joined_display(array $m): string {
 function consent_labels(): array {
     return [
         'email_comms' => 'Email communications',
+        'automated_notifications' => 'Automated / notification emails',
         'text_comms' => 'Text messages',
         'whatsapp_community' => 'Opt into WhatsApp community'
     ];
 }
 function get_member_consent(int $member_id, string $type): bool {
     $row = first('SELECT granted FROM member_consents WHERE member_id=? AND consent_type=? ORDER BY updated_at DESC, id DESC LIMIT 1', [$member_id, $type]);
-    return $row ? (bool)$row['granted'] : false;
+    if ($row) return (bool)$row['granted'];
+    // Default for normal email communications is yes unless explicitly withdrawn.
+    // Automated/notification emails and other consent types remain disabled by default.
+    return $type === 'email_comms';
 }
 function set_member_consent(int $member_id, string $type, bool $granted, ?int $by_user_id=null): void {
     $existing = first('SELECT id FROM member_consents WHERE member_id=? AND consent_type=? ORDER BY id DESC LIMIT 1', [$member_id, $type]);
@@ -560,8 +612,13 @@ function set_member_consent(int $member_id, string $type, bool $granted, ?int $b
 }
 function render_consent_checkboxes(int $member_id): string {
     $html = '';
+    $notes = [
+        'email_comms' => 'Default yes unless explicitly withdrawn.',
+        'automated_notifications' => 'Default off. Used for future automated/system notification emails.',
+    ];
     foreach (consent_labels() as $type=>$label) {
-        $html .= '<label><input type="checkbox" name="consent_' . e($type) . '" ' . (get_member_consent($member_id, $type) ? 'checked' : '') . '> ' . e($label) . '</label>';
+        $note = isset($notes[$type]) ? '<small class="muted"> ' . e($notes[$type]) . '</small>' : '';
+        $html .= '<label><input type="checkbox" name="consent_' . e($type) . '" ' . (get_member_consent($member_id, $type) ? 'checked' : '') . '> ' . e($label) . $note . '</label>';
     }
     return $html;
 }
@@ -841,7 +898,7 @@ function import_members_from_rows(array $rows, bool $updateExisting, bool $impor
                 $summary['created']++;
             }
 
-            foreach (['email_comms','text_comms','whatsapp_community'] as $consentType) {
+            foreach (['email_comms','automated_notifications','text_comms','whatsapp_community'] as $consentType) {
                 if (array_key_exists($consentType, $map)) set_member_consent($mid, $consentType, import_yes_value(import_get($row,$map,$consentType)), $actorUserId);
             }
 
@@ -1686,7 +1743,7 @@ if (route() === 'assets.css') {
 @media(max-width:720px){.asset-grid,.grid,.two,.stat-grid,.users-stats{grid-template-columns:1fr!important}.user-admin-card{grid-template-columns:1fr!important}.user-actions-panel{display:grid;grid-template-columns:1fr}.role-grid{grid-template-columns:1fr!important}.toolbar{gap:8px}.toolbar h1,.toolbar h2{width:100%}.calendar{grid-template-columns:1fr!important}.calendar-day{min-height:auto}.calendar-head{display:none}.modal{width:calc(100vw - 24px);max-height:90vh;overflow:auto}.email-layout,.attendance-modern-head,.attendance-modern-controls,.attendance-modern-row{grid-template-columns:1fr!important}.email-member-list{max-height:360px}.main-nav{gap:8px}.dropdown-menu{z-index:2000}}.dashboard-hero,.directory-hero,.brickworks-hero{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;background:linear-gradient(135deg,#101827,#263858);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:0 12px 30px #0f172a22}.dashboard-hero h1,.directory-hero h1,.brickworks-hero h1{margin:.15rem 0;font-size:2rem}.dashboard-hero p,.directory-hero p,.brickworks-hero p{margin:0;color:#dbeafe}.dashboard-hero-actions,.brickworks-join{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.dashboard-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.dash-card{background:#fff;border-radius:16px;border:1px solid #e5e7eb;box-shadow:0 1px 8px #0000000d;padding:18px;margin-bottom:16px}.dash-card-head{display:flex;gap:12px;align-items:flex-start;justify-content:space-between;margin-bottom:12px}.dash-card-head h2{margin:0}.dash-card-head p{margin:.25rem 0 0}.dash-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.dash-meta div{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:12px}.dash-meta span{display:block;color:#64748b;font-size:.86rem}.dash-meta strong{display:block;margin-top:4px}.notice-list{display:grid;gap:10px}.notice-item{border:1px solid #e5e7eb;background:#f8fafc;border-radius:12px;padding:12px}.notice-item strong{display:block}.notice-item span{display:block;color:#475569;margin-top:4px}.empty-state{display:grid;gap:4px;padding:18px;border:1px dashed #cbd5e1;background:#f8fafc;border-radius:14px;color:#64748b}.empty-state strong{color:#0f172a}.dash-event-grid{display:grid;gap:10px}.dash-event-card{display:grid;grid-template-columns:auto 1fr auto;gap:14px;align-items:center;border:1px solid #e5e7eb;border-radius:14px;padding:14px;text-decoration:none;color:inherit;background:#fff}.dash-event-card:hover{background:#f8fafc}.dash-event-card h3{margin:6px 0 4px}.modern-leaderboard .leaderboard-row{border:1px solid #e5e7eb;border-radius:12px;padding:12px;margin-bottom:10px}.directory-count{display:grid;place-items:center;background:#ffffff22;border:1px solid #ffffff40;border-radius:16px;padding:16px 22px}.directory-count strong{font-size:2rem}.directory-count span{text-transform:uppercase;font-size:.78rem;letter-spacing:.06em;color:#dbeafe}.directory-filter{padding:0;overflow:hidden}.directory-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}.directory-card-item{display:flex;gap:12px;align-items:center;border:1px solid #e5e7eb;border-radius:14px;padding:14px;background:#fff}.directory-card-item:hover{background:#f8fafc}.directory-avatar{width:44px;height:44px;min-width:44px;border-radius:999px;background:#e0e7ff;color:#3730a3;display:grid;place-items:center;font-weight:800}.directory-card-item strong{display:block}.directory-card-item span{display:block;color:#64748b;margin-top:3px;font-weight:700}.brickworks-score{width:150px;height:150px;border-radius:999px;background:#ffffff18;border:1px solid #ffffff44;display:grid;place-items:center;text-align:center}.brickworks-score strong{font-size:2.4rem}.brickworks-score span{display:block;color:#dbeafe;text-transform:uppercase;font-size:.8rem;letter-spacing:.06em}.brickworks-progress{background:#334155;margin:14px 0}.brickworks-progress span{background:#60a5fa}.brickworks-hero .bw-step{background:#ffffff14;border-color:#ffffff30}.brickworks-hero .bw-step span{display:block;color:#dbeafe;font-size:.86rem}.brickworks-hero .bw-step strong{display:block;margin-top:4px;color:#fff}.brickworks-list-card{padding:0;overflow:hidden}.brickworks-list-card>.dash-card-head{padding:18px;border-bottom:1px solid #e5e7eb;margin:0}.brickworks-list-card .bw-grid{padding:16px}.bw-card{transition:.15s ease}.bw-card:hover{box-shadow:0 8px 22px #0f172a12;transform:translateY(-1px)}.bw-card.complete{border-left:5px solid #22c55e}.bw-card.pending{border-left:5px solid #f59e0b}.bw-card.none{border-left:5px solid #94a3b8}.brickworks-manager-card .toolbar{align-items:center}
 @media(max-width:720px){.dashboard-hero,.directory-hero,.brickworks-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.dashboard-hero h1,.directory-hero h1,.brickworks-hero h1{font-size:1.55rem}.dashboard-hero-actions,.brickworks-join{display:grid;grid-template-columns:1fr;width:100%}.dashboard-grid{grid-template-columns:1fr}.dash-card{padding:14px;border-radius:14px}.dash-card-head{display:grid;grid-template-columns:1fr;gap:8px}.dash-event-card{grid-template-columns:56px 1fr}.dash-event-card .programme-open{display:none}.directory-count{place-items:start}.directory-grid{grid-template-columns:1fr}.directory-card-item{padding:12px}.brickworks-score{width:100%;height:auto;border-radius:14px;padding:14px;display:block}.brickworks-score strong{font-size:2rem}.brickworks-list-card .bw-grid{padding:12px}.bw-card-head{display:grid;grid-template-columns:1fr}.bw-status{width:max-content}.brickworks-manager-card .toolbar{display:grid}.programme-filter{grid-template-columns:1fr}.programme-filter-actions{grid-template-columns:1fr 1fr;display:grid}.leaderboard-row{grid-template-columns:36px 1fr!important}.leaderboard-row>div:last-child{grid-column:2}.empty-state{padding:14px}}.asset-hero,.action-hero{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;background:linear-gradient(135deg,#101827,#263858);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:0 12px 30px #0f172a22}.asset-hero h1,.action-hero h1{margin:.15rem 0;font-size:2rem}.asset-hero p,.action-hero p{margin:0;color:#dbeafe}.asset-hero-stats,.action-mini-stats{display:flex;gap:10px;flex-wrap:wrap}.asset-hero-stats div{background:#ffffff18;border:1px solid #ffffff40;border-radius:14px;padding:12px 16px;min-width:110px}.asset-hero-stats strong{display:block;font-size:1.35rem}.asset-hero-stats span{display:block;color:#dbeafe;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}.asset-list-card,.action-list-card,.maintenance-list-card{padding:0;overflow:hidden}.asset-list-card>.dash-card-head,.action-list-card>.dash-card-head,.maintenance-list-card>.dash-card-head{padding:18px;border-bottom:1px solid #e5e7eb;margin:0}.asset-card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px;padding:16px}.asset-card-modern{border:1px solid #e5e7eb;border-radius:16px;background:#fff;overflow:hidden;transition:.15s ease}.asset-card-modern:hover{box-shadow:0 10px 25px #0f172a14;transform:translateY(-1px);background:#f8fafc}.asset-card-modern a{display:block;color:inherit;text-decoration:none;padding:16px}.asset-card-top{display:flex;gap:12px;align-items:flex-start;justify-content:space-between;margin-bottom:12px}.asset-card-top h3{margin:.25rem 0 0}.asset-number{font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:#64748b;font-weight:800}.asset-card-meta{display:grid;grid-template-columns:110px 1fr;gap:7px 10px;margin-bottom:12px}.asset-card-meta span{color:#64748b;font-size:.86rem}.asset-card-meta strong{font-size:.92rem}.asset-form-card{border-top:4px solid #2563eb}.asset-detail-hero .asset-hero-stats div{min-width:150px}.asset-detail-card{margin-top:0}.maintenance-list-card .ticket{margin:14px 16px}.action-hero-icon{width:76px;height:76px;border-radius:999px;background:#ffffff18;border:1px solid #ffffff40;display:grid;place-items:center;font-size:2rem;font-weight:900}.action-form-card{border-top:4px solid #2563eb}.action-list-card .actions-board{padding:16px}.action-mini-stats span{background:#f8fafc;border:1px solid #e5e7eb;border-radius:999px;padding:8px 11px;color:#475569;font-size:.9rem}.action-mini-stats strong{color:#0f172a}.action-ticket{border-radius:16px;padding:16px;margin:0;background:#fff;transition:.15s ease}.action-ticket:hover{box-shadow:0 10px 24px #0f172a12;transform:translateY(-1px)}.ticket-kicker{display:block;font-size:.76rem;text-transform:uppercase;letter-spacing:.06em;color:#64748b;font-weight:900;margin-bottom:3px}.action-ticket-body{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:12px;margin:12px 0}.action-ticket details{border-top:1px solid #e5e7eb;padding-top:10px;margin-top:10px}.status-good{background:#dcfce7;color:#166534}.status-needs_repair,.status-needs_attention,.status-faulty,.status-poor{background:#fee2e2;color:#991b1b}.status-fair{background:#fef3c7;color:#92400e}.status-unknown{background:#f1f5f9;color:#334155}
 @media(max-width:720px){.asset-hero,.action-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.asset-hero h1,.action-hero h1{font-size:1.55rem}.asset-hero-stats,.action-mini-stats{display:grid;grid-template-columns:1fr;width:100%}.asset-hero-stats div{min-width:0}.asset-card-grid{grid-template-columns:1fr;padding:12px}.asset-card-meta{grid-template-columns:1fr;gap:3px}.asset-card-meta strong{margin-bottom:8px}.asset-card-top{display:grid;grid-template-columns:1fr;gap:8px}.action-list-card .actions-board{padding:12px}.action-ticket{padding:13px}.ticket-head{display:grid!important;grid-template-columns:1fr;gap:8px}.action-ticket-body{padding:10px}.maintenance-list-card .ticket{margin:12px}.action-hero-icon{display:none}.asset-form-card .two,.action-form-card .two{grid-template-columns:1fr!important}}.action-header-side{display:grid;gap:10px;justify-items:end}.action-header-side .btn{width:max-content}@media(max-width:720px){.action-header-side{justify-items:stretch}.action-header-side .btn{width:100%;box-sizing:border-box}.asset-list-card>.dash-card-head{display:grid;grid-template-columns:1fr;gap:10px}.asset-list-card>.dash-card-head .btn{width:100%;box-sizing:border-box}}.member-hero{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;background:linear-gradient(135deg,#101827,#263858);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:0 12px 30px #0f172a22}.member-hero h1{margin:.15rem 0;font-size:2rem}.member-hero p{margin:0;color:#dbeafe}.member-hero-stats{display:flex;gap:10px;flex-wrap:wrap}.member-hero-stats div{background:#ffffff18;border:1px solid #ffffff40;border-radius:14px;padding:12px 16px;min-width:105px}.member-hero-stats strong{display:block;font-size:1.35rem}.member-hero-stats span{display:block;color:#dbeafe;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}.member-filter-card{padding:0;overflow:hidden}.member-list-card{padding:0;overflow:hidden}.member-list-card>.dash-card-head{padding:18px;border-bottom:1px solid #e5e7eb;margin:0}.member-header-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.member-card-grid{display:grid;gap:12px;padding:16px}.member-card-modern{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:start;border:1px solid #e5e7eb;border-radius:16px;background:#fff;padding:16px;transition:.15s ease}.member-card-modern:hover{box-shadow:0 10px 25px #0f172a14;transform:translateY(-1px);background:#f8fafc}.member-card-main{display:grid;grid-template-columns:54px 1fr;gap:14px;min-width:0}.member-avatar{width:54px;height:54px;border-radius:999px;background:#e0e7ff;color:#3730a3;display:grid;place-items:center;font-weight:900}.member-card-top{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.member-card-top h3{margin:0}.member-card-meta{display:grid;grid-template-columns:90px 1fr;gap:5px 10px;margin-top:10px}.member-card-meta span{color:#64748b;font-size:.86rem}.member-card-meta strong{font-size:.92rem}.member-card-actions{display:grid;gap:8px;justify-items:end}.member-attendance{display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center;margin-top:12px}.member-attendance span{display:block;color:#64748b;font-size:.86rem}.member-attendance strong{display:block}.member-form-card{border-top:4px solid #2563eb}.member-detail-hero .member-hero-stats div{min-width:140px}.member-detail-card{margin-top:0}.status-active,.status-honorary,.status-life_member{background:#dcfce7;color:#166534}.status-pending{background:#fef3c7;color:#92400e}.status-expired,.status-suspended{background:#fee2e2;color:#991b1b}.status-former{background:#f1f5f9;color:#334155}
-@media(max-width:720px){.member-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.member-hero h1{font-size:1.55rem}.member-hero-stats{display:grid;grid-template-columns:1fr;width:100%}.member-hero-stats div{min-width:0}.member-list-card>.dash-card-head{display:grid;grid-template-columns:1fr;gap:10px}.member-header-actions{display:grid;grid-template-columns:1fr;width:100%}.member-header-actions .btn{width:100%;box-sizing:border-box}.member-card-grid{padding:12px}.member-card-modern{grid-template-columns:1fr;padding:13px}.member-card-main{grid-template-columns:44px 1fr;gap:11px}.member-avatar{width:44px;height:44px}.member-card-actions{display:grid;grid-template-columns:1fr;justify-items:stretch}.member-card-actions .btn,.member-card-actions button{width:100%;box-sizing:border-box}.member-card-meta{grid-template-columns:1fr;gap:3px}.member-card-meta strong{margin-bottom:7px}.member-attendance{grid-template-columns:1fr}.member-form-card .two{grid-template-columns:1fr!important}}.member-attendance small{display:block;color:#64748b;margin-top:2px;font-size:.78rem}.user-detail-action select{max-width:100%}.user-detail-action summary{cursor:pointer;font-weight:700;color:#334155}';
+@media(max-width:720px){.member-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.member-hero h1{font-size:1.55rem}.member-hero-stats{display:grid;grid-template-columns:1fr;width:100%}.member-hero-stats div{min-width:0}.member-list-card>.dash-card-head{display:grid;grid-template-columns:1fr;gap:10px}.member-header-actions{display:grid;grid-template-columns:1fr;width:100%}.member-header-actions .btn{width:100%;box-sizing:border-box}.member-card-grid{padding:12px}.member-card-modern{grid-template-columns:1fr;padding:13px}.member-card-main{grid-template-columns:44px 1fr;gap:11px}.member-avatar{width:44px;height:44px}.member-card-actions{display:grid;grid-template-columns:1fr;justify-items:stretch}.member-card-actions .btn,.member-card-actions button{width:100%;box-sizing:border-box}.member-card-meta{grid-template-columns:1fr;gap:3px}.member-card-meta strong{margin-bottom:7px}.member-attendance{grid-template-columns:1fr}.member-form-card .two{grid-template-columns:1fr!important}}.member-attendance small{display:block;color:#64748b;margin-top:2px;font-size:.78rem}';
     exit;
 }
 if (route() === 'email_open') {
@@ -2320,48 +2377,6 @@ if (route() === 'users') {
             flash(!empty($send['ok']) ? 'Invite email sent.' : ('Invite email failed: ' . ($send['error'] ?? 'unknown error')));
             redirect('users');
         }
-        if (isset($_POST['update_user_member_link'])) {
-            require_permission('manage_users');
-            $targetUserId = (int)($_POST['user_id'] ?? 0);
-            $target = first('SELECT u.*,m.first_name,m.last_name,m.callsign FROM users u LEFT JOIN members m ON m.id=u.member_id WHERE u.id=?', [$targetUserId]);
-            if (!$target) { flash('User not found.'); redirect('users'); }
-
-            $newMemberId = null;
-            if (trim((string)($_POST['member_id'] ?? '')) !== '') {
-                $newMemberId = (int)$_POST['member_id'];
-                $newMember = first('SELECT id,first_name,last_name,callsign FROM members WHERE id=?', [$newMemberId]);
-                if (!$newMember) { flash('Selected member not found.'); redirect('users'); }
-
-                $alreadyLinked = first('SELECT u.email,m.first_name,m.last_name,m.callsign FROM users u LEFT JOIN members m ON m.id=u.member_id WHERE u.member_id=? AND u.id<>?', [$newMemberId,$targetUserId]);
-                if ($alreadyLinked) {
-                    $linkedName = trim(($alreadyLinked['first_name'] ?? '').' '.($alreadyLinked['last_name'] ?? ''));
-                    flash('That member is already linked to another user: ' . ($alreadyLinked['email'] ?? $linkedName));
-                    redirect('users');
-                }
-            }
-
-            $oldLabel = trim(($target['first_name'] ?? '').' '.($target['last_name'] ?? ''));
-            if (!empty($target['callsign'])) $oldLabel .= ' ('.$target['callsign'].')';
-            if ($oldLabel === '') $oldLabel = 'No linked member';
-
-            $newLabel = 'No linked member';
-            if ($newMemberId !== null) {
-                $newMember = $newMember ?? first('SELECT id,first_name,last_name,callsign FROM members WHERE id=?', [$newMemberId]);
-                $newLabel = trim(($newMember['first_name'] ?? '').' '.($newMember['last_name'] ?? ''));
-                if (!empty($newMember['callsign'])) $newLabel .= ' ('.$newMember['callsign'].')';
-            }
-
-            exec_sql('UPDATE users SET member_id=?, updated_at=datetime("now") WHERE id=?', [$newMemberId,$targetUserId]);
-            audit('user.member_link_updated','user',$targetUserId,'success',null,[
-                'field_changes'=>[
-                    'member_id'=>['label'=>'Linked member','old'=>$oldLabel,'new'=>$newLabel]
-                ],
-                'old_member_id'=>$target['member_id'] ?? null,
-                'new_member_id'=>$newMemberId
-            ]);
-            flash('Linked member updated.');
-            redirect('users');
-        }
         if (isset($_POST['update_roles'])) {
             require_permission('manage_roles');
             $targetUserId = (int)$_POST['user_id'];
@@ -2431,15 +2446,6 @@ if (route() === 'users') {
         echo '<form method="post">'.csrf_field().'<input type="hidden" name="send_invite_existing" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><button class="secondary">Send invite</button></form>';
         if ($canReset) echo '<form method="post">'.csrf_field().'<input type="hidden" name="send_reset_email" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><button>Send password reset</button></form>';
         if ($canReset) echo '<details class="user-detail-action"><summary>Manual temp password</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="reset_password" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><label>New temporary password</label><input name="new_password" placeholder="Minimum 10 characters"><button>Set temp password</button></form></details>';
-        echo '<details class="user-detail-action"><summary>Change linked member</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="update_user_member_link" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><label>Linked member</label><select name="member_id"><option value="">No linked member</option>';
-        foreach($members as $linkedMember){
-            $selected = ((int)($usr['member_id'] ?? 0) === (int)$linkedMember['id']) ? 'selected' : '';
-            $label = trim($linkedMember['first_name'].' '.$linkedMember['last_name']);
-            if ($linkedMember['callsign']) $label .= ' - '.$linkedMember['callsign'];
-            if ($linkedMember['email']) $label .= ' / '.$linkedMember['email'];
-            echo '<option value="'.e($linkedMember['id']).'" '.$selected.'>'.e($label).'</option>';
-        }
-        echo '</select><button>Save linked member</button></form></details>';
         if (is_admin_user() && (int)$usr['id'] !== (int)$u['id']) echo '<form method="post" onsubmit="return confirm(&quot;Delete this user account? This cannot be undone. The linked member record will not be deleted.&quot;)">'.csrf_field().'<input type="hidden" name="delete_user" value="1"><input type="hidden" name="user_id" value="'.e($usr['id']).'"><button class="danger">Delete user</button></form>';
         echo '</div>';
         if ($canRoles) {
@@ -3141,6 +3147,7 @@ if (route() === 'emails') {
         }
         if (isset($_POST['send_now'])) {
             $recips=all('SELECT * FROM email_recipients WHERE email_id=?',[$email_id]);
+            $emailAttachments=all('SELECT * FROM email_attachments WHERE email_id=? ORDER BY id ASC',[$email_id]);
             $fromAddress = trim($cfg['email_from_address'] ?: ('noreply@' . ($_SERVER['HTTP_HOST'] ?? 'localhost')));
             $fromName = trim($cfg['email_from_name'] ?: ($cfg['society_name'] ?? 'Membership System'));
             $replyTo = trim($cfg['email_reply_to'] ?: $fromAddress);
@@ -3160,12 +3167,12 @@ if (route() === 'emails') {
                     $personalBody .= '<img src="'.$base.'/?route=email_open&id='.e($r['tracking_id']).'" width="1" height="1" style="display:none" alt="">';
                 }
                 if (count($recips) === 1) {
-                    $send=send_configured_email($cfg, [$r['email_address']], [], $_POST['subject'], $personalBody, $safeFromName, $safeFromAddress, $safeReplyTo);
+                    $send=send_configured_email($cfg, [$r['email_address']], [], $_POST['subject'], $personalBody, $safeFromName, $safeFromAddress, $safeReplyTo, $emailAttachments);
                     $statusOk='sent';
                 } else {
                     // Privacy rule: when multiple members are selected, each member is sent an individual BCC email.
                     // This keeps recipient addresses hidden while still allowing a unique tracking pixel per recipient.
-                    $send=send_configured_email($cfg, [$safeFromAddress], [$r['email_address']], $_POST['subject'], $personalBody, $safeFromName, $safeFromAddress, $safeReplyTo);
+                    $send=send_configured_email($cfg, [$safeFromAddress], [$r['email_address']], $_POST['subject'], $personalBody, $safeFromName, $safeFromAddress, $safeReplyTo, $emailAttachments);
                     $statusOk='sent_bcc';
                 }
                 $sentOk=(bool)($send['ok'] ?? false);
@@ -3175,7 +3182,7 @@ if (route() === 'emails') {
             }
             $overallStatus = $failCount === 0 ? 'sent' : ($successCount > 0 ? 'partial_failed' : 'failed');
             exec_sql('UPDATE emails SET status=?, sent_at=CASE WHEN ?=1 THEN datetime("now") ELSE sent_at END, updated_at=datetime("now") WHERE id=?',[$overallStatus,$successCount>0?1:0,$email_id]);
-            audit('email.sent','email',$email_id,$successCount>0?'success':'failed',$lastError,['recipient_count'=>count($recips),'success_count'=>$successCount,'fail_count'=>$failCount,'bcc_used'=>count($recips)>1,'individual_bcc'=>count($recips)>1,'open_tracking_enabled'=>$trackingGloballyEnabled,'method'=>$cfg['email_method'] ?? 'php_mail']);
+            audit('email.sent','email',$email_id,$successCount>0?'success':'failed',$lastError,['recipient_count'=>count($recips),'success_count'=>$successCount,'fail_count'=>$failCount,'bcc_used'=>count($recips)>1,'individual_bcc'=>count($recips)>1,'open_tracking_enabled'=>$trackingGloballyEnabled,'method'=>$cfg['email_method'] ?? 'php_mail','attachment_count'=>count($emailAttachments)]);
             flash('Email send attempted using '.(($cfg['email_method'] ?? 'php_mail') === 'resend' ? 'Resend API' : 'PHP mail').'. Multiple-recipient sends are sent as individual BCC emails so recipient addresses stay private and open tracking can work per member.'); redirect('emails');
         }
         audit('email.draft_created','email',$email_id,'success',null,['recipient_count'=>count($members),'recipient_mode'=>$recipientMode]);
@@ -3196,9 +3203,9 @@ if (route() === 'emails') {
         $paymentGroup = str_contains($subsStatus, 'paid') && $subsStatus !== 'unpaid' ? 'paid' : ($subsStatus === 'pending' ? 'pending' : 'unpaid');
         $badgeText = $paymentGroup === 'paid' ? 'Paid' : ($paymentGroup === 'pending' ? 'Pending' : 'Unpaid');
         $name=e($m['first_name'].' '.$m['last_name']); $email=e($m['email']); $callsign=e($m['callsign'] ?: '');
-        echo '<label class="email-member-card" data-name="'.strtolower(e($m['first_name'].' '.$m['last_name'].' '.$m['email'].' '.$m['callsign'])).'" data-payment="'.e($paymentGroup).'" data-committee="'.((int)$m['is_committee'] ? '1' : '0').'"><input class="email-member-check" type="checkbox" name="member_ids[]" value="'.e($m['id']).'" checked><span class="email-check-ui">✓</span><span class="email-member-main"><strong>'.$name.'</strong>'.($callsign?'<span class="email-callsign">'.$callsign.'</span>':'').'<small>'.$email.'</small></span><span class="email-badge '.e($paymentGroup).'">'.e($badgeText).'</span></label>';
+        echo '<label class="email-member-card" data-name="'.strtolower(e($m['first_name'].' '.$m['last_name'].' '.$m['email'].' '.$m['callsign'])).'" data-payment="'.e($paymentGroup).'" data-committee="'.((int)$m['is_committee'] ? '1' : '0').'"><input class="email-member-check" type="checkbox" name="member_ids[]" value="'.e($m['id']).'"><span class="email-check-ui">✓</span><span class="email-member-main"><strong>'.$name.'</strong>'.($callsign?'<span class="email-callsign">'.$callsign.'</span>':'').'<small>'.$email.'</small></span><span class="email-badge '.e($paymentGroup).'">'.e($badgeText).'</span></label>';
     }
-    echo '</div></aside><section class="email-compose"><div class="email-fields"><div class="email-row"><label>To:</label><input id="emailToSummary" value="0 members selected" readonly></div><div class="email-row"><label>From:</label><input value="'.e($fromName).' <'.e($fromAddress).'>" readonly></div><div class="email-row"><label>Subject:</label><input name="subject" placeholder="Email subject..." required></div></div><div class="email-toolbar"><label class="email-attach-btn">📎 Attach<input type="file" name="attachment" id="emailAttachment"></label><span id="emailAttachName" class="email-help">Use <code>{member_name}</code> to personalise each email.</span></div><textarea class="email-message" name="body_html" placeholder="Write your message here... Use {member_name} to personalise for each recipient." required></textarea><div class="email-sendbar"><span class="muted">Multiple-recipient emails are sent using BCC for member privacy.</span><div><button class="secondary" type="submit">Save draft</button> <button name="send_now" value="1">Send now</button></div></div></section></div></form></div>';
+    echo '</div></aside><section class="email-compose"><div class="email-fields"><div class="email-row"><label>To:</label><input id="emailToSummary" value="0 members selected" readonly></div><div class="email-row"><label>From:</label><input value="'.e($fromName).' <'.e($fromAddress).'>" readonly></div><div class="email-row"><label>Subject:</label><input name="subject" placeholder="Email subject..." required></div></div><div class="email-toolbar"><label class="email-attach-btn">📎 Attach<input type="file" name="attachment" id="emailAttachment"></label><span id="emailAttachName" class="email-help">Use <code>{member_name}</code> to personalise each email.</span></div><textarea class="email-message" name="body_html" placeholder="Write your message here... Use {member_name} to personalise for each recipient." required></textarea><div class="email-sendbar"><span class="muted">No recipients are selected by default. Use All or filters to select recipients. Multiple-recipient emails are sent using BCC for member privacy.</span><div><button class="secondary" type="submit">Save draft</button> <button name="send_now" value="1">Send now</button></div></div></section></div></form></div>';
 
     echo '<div class="card"><h2>Recent emails</h2><table><tr><th>Subject</th><th>Status</th><th>Sent</th><th>Recipients</th><th>Opens</th></tr>';
     foreach($emails as $em){ $rc=first('SELECT COUNT(*) c, SUM(open_count) opens FROM email_recipients WHERE email_id=?',[$em['id']]); echo '<tr><td>'.e($em['subject']).'</td><td>'.e($em['status']).'</td><td>'.e($em['sent_at']).'</td><td>'.e($rc['c']).'</td><td>'.e($rc['opens'] ?: 0).'</td></tr>'; }

@@ -36,3 +36,12 @@ The login page has been restyled with a responsive centred sign-in card. Users c
 ## User linked member update
 
 The Users admin page now allows admins to change which member record is linked to an existing user account, or unlink the user from a member record. Changes are audit logged with old and new linked member values.
+
+## Email attachment and consent update
+
+- Email attachments are now passed to the configured sender.
+- Resend API sends attachments as base64 payload attachments.
+- PHP mail sends attachments using multipart/mixed email.
+- Email compose opens with no recipients selected.
+- Normal email communications consent now defaults to yes unless explicitly withdrawn.
+- Added Automated / notification emails consent, disabled by default.
