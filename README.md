@@ -33,20 +33,6 @@ Dashboard order adjusted so Notifications appear in the top dashboard grid and N
 
 The login page has been restyled with a responsive centred sign-in card. Users can now use **Forgot password?** to request a self-service password reset link. Reset links use the existing secure token system and expire after 48 hours.
 
-## User admin and officer roles
+## User linked member update
 
-Added officer roles:
-
-- Chair
-- Vice Chair
-- Secretary
-
-The Users admin page has been redesigned into a more spacious card layout with clearer role chips, role management panels, invite/reset actions and user summary stats.
-
-## User admin layout
-
-Invite new user and Create manual user have been moved to their own pages. The Users page now has top action buttons for those workflows, keeping the user admin list cleaner and less cramped.
-
-## Attendance future-session exclusion
-
-Attendance now excludes future sessions completely. A session is only counted once its end time has passed; if no end time is recorded, the start time is used as the fallback.
+The Users admin page now allows admins to change which member record is linked to an existing user account, or unlink the user from a member record. Changes are audit logged with old and new linked member values.
