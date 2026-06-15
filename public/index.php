@@ -158,13 +158,7 @@ function db(): PDO {
     if ($pdo) return $pdo;
     $pdo = new PDO('sqlite:' . DB_PATH);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    // SQLite tuning for the small self-hosted CT/VPS setup. WAL improves concurrent reads during updates.
     $pdo->exec('PRAGMA foreign_keys = ON');
-    $pdo->exec('PRAGMA busy_timeout = 5000');
-    $pdo->exec('PRAGMA journal_mode = WAL');
-    $pdo->exec('PRAGMA synchronous = NORMAL');
-    $pdo->exec('PRAGMA temp_store = MEMORY');
-    $pdo->exec('PRAGMA cache_size = -20000');
     return $pdo;
 }
 
@@ -206,31 +200,21 @@ function decrypt_value(?string $cipher): ?string {
 
 function current_user(): ?array {
     if (empty($_SESSION['user_id'])) return null;
-    static $cache = [];
-    $id = (int)$_SESSION['user_id'];
-    if (array_key_exists($id, $cache)) return $cache[$id];
     $stmt = db()->prepare('SELECT * FROM users WHERE id = ? AND status = "active"');
-    $stmt->execute([$id]);
+    $stmt->execute([$_SESSION['user_id']]);
     $u = $stmt->fetch(PDO::FETCH_ASSOC);
-    return $cache[$id] = ($u ?: null);
-}
-function clear_user_access_cache(): void {
-    unset($GLOBALS['__role_cache'], $GLOBALS['__permission_cache']);
+    return $u ?: null;
 }
 function require_login(): array { $u = current_user(); if (!$u) redirect('login'); return $u; }
 function user_roles(int $user_id): array {
-    if (!isset($GLOBALS['__role_cache'])) $GLOBALS['__role_cache'] = [];
-    if (array_key_exists($user_id, $GLOBALS['__role_cache'])) return $GLOBALS['__role_cache'][$user_id];
     $stmt = db()->prepare('SELECT r.name FROM roles r JOIN user_roles ur ON ur.role_id = r.id WHERE ur.user_id = ? AND (ur.expires_at IS NULL OR ur.expires_at > datetime("now"))');
     $stmt->execute([$user_id]);
-    return $GLOBALS['__role_cache'][$user_id] = array_column($stmt->fetchAll(PDO::FETCH_ASSOC), 'name');
+    return array_column($stmt->fetchAll(PDO::FETCH_ASSOC), 'name');
 }
 function user_permissions(int $user_id): array {
-    if (!isset($GLOBALS['__permission_cache'])) $GLOBALS['__permission_cache'] = [];
-    if (array_key_exists($user_id, $GLOBALS['__permission_cache'])) return $GLOBALS['__permission_cache'][$user_id];
     $stmt = db()->prepare('SELECT DISTINCT p.name FROM permissions p JOIN role_permissions rp ON rp.permission_id = p.id JOIN user_roles ur ON ur.role_id = rp.role_id WHERE ur.user_id = ? AND (ur.expires_at IS NULL OR ur.expires_at > datetime("now"))');
     $stmt->execute([$user_id]);
-    return $GLOBALS['__permission_cache'][$user_id] = array_column($stmt->fetchAll(PDO::FETCH_ASSOC), 'name');
+    return array_column($stmt->fetchAll(PDO::FETCH_ASSOC), 'name');
 }
 function has_permission(string $permission): bool {
     $u = current_user(); if (!$u) return false;
@@ -293,44 +277,51 @@ function audit(string $action, ?string $entity_type=null, ?int $entity_id=null, 
         ]);
     } catch (Throwable $e) { /* never break app because logging failed */ }
 }
-function audit_value_to_text($value): string {
-    if ($value === null) return 'not set';
-    if (is_bool($value)) return $value ? 'yes' : 'no';
-    if (is_array($value)) return json_encode($value, JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE);
-    $value = (string)$value;
-    return $value === '' ? 'blank' : $value;
+
+function audit_value($value) {
+    if ($value === null) return null;
+    if (is_bool($value)) return $value ? 'Yes' : 'No';
+    if (is_array($value)) return $value;
+    return (string)$value;
 }
-function audit_change_html(array $meta): string {
-    $changes = $meta['changes'] ?? $meta['field_changes'] ?? $meta['changed_fields'] ?? null;
-    if (!$changes && isset($meta['old'], $meta['new'])) $changes = ['value' => ['old'=>$meta['old'], 'new'=>$meta['new']]];
-    if (!$changes || !is_array($changes)) return '';
-    $html = '<div class="audit-changes"><strong>Changes</strong><table class="audit-change-table"><tr><th>Field</th><th>Old</th><th>New</th></tr>';
-    foreach ($changes as $field=>$change) {
-        if (is_array($change) && (array_key_exists('old',$change) || array_key_exists('new',$change))) {
-            $old = audit_value_to_text($change['old'] ?? null);
-            $new = audit_value_to_text($change['new'] ?? null);
-        } elseif (is_array($change) && count($change) === 2) {
-            $vals = array_values($change); $old = audit_value_to_text($vals[0]); $new = audit_value_to_text($vals[1]);
-        } else {
-            $old = ''; $new = audit_value_to_text($change);
+function audit_field_changes(array $old, array $new, array $fieldLabels=[]): array {
+    $changes = [];
+    foreach ($new as $field => $newValue) {
+        $oldValue = $old[$field] ?? null;
+        if (audit_value($oldValue) !== audit_value($newValue)) {
+            $changes[$field] = [
+                'label' => $fieldLabels[$field] ?? ucwords(str_replace('_', ' ', (string)$field)),
+                'old' => audit_value($oldValue),
+                'new' => audit_value($newValue),
+            ];
         }
-        $html .= '<tr><td>'.e((string)$field).'</td><td><code>'.e($old).'</code></td><td><code>'.e($new).'</code></td></tr>';
     }
-    return $html . '</table></div>';
+    return $changes;
 }
-function audit_meta_summary_html(array $meta): string {
-    $skip = ['changes','field_changes','changed_fields','ip_details'];
+function audit_metadata_html(?string $json): string {
+    if (!$json) return '';
+    $data = json_decode($json, true);
+    if (!is_array($data)) return '<pre class="audit-meta">'.e($json).'</pre>';
     $html = '';
-    foreach ($meta as $k=>$v) {
-        if (in_array($k, $skip, true)) continue;
-        if (is_array($v)) continue;
-        $html .= '<span class="audit-kv"><b>'.e((string)$k).':</b> '.e(audit_value_to_text($v)).'</span>';
+    $changes = $data['field_changes'] ?? $data['changes'] ?? null;
+    if (is_array($changes) && $changes) {
+        $html .= '<details class="audit-details"><summary>View changes</summary><table class="audit-change-table"><tr><th>Field</th><th>Old</th><th>New</th></tr>';
+        foreach ($changes as $field=>$change) {
+            if (is_array($change) && (array_key_exists('old', $change) || array_key_exists('new', $change) || array_key_exists('from', $change) || array_key_exists('to', $change))) {
+                $label = $change['label'] ?? ucwords(str_replace('_',' ',(string)$field));
+                $old = $change['old'] ?? ($change['from'] ?? null);
+                $new = $change['new'] ?? ($change['to'] ?? null);
+                $html .= '<tr><td>'.e($label).'</td><td>'.nl2br(e(is_array($old) ? json_encode($old) : (string)$old)).'</td><td>'.nl2br(e(is_array($new) ? json_encode($new) : (string)$new)).'</td></tr>';
+            }
+        }
+        $html .= '</table></details>';
+        unset($data['field_changes'], $data['changes']);
     }
+    $clean = $data;
+    unset($clean['ip_details']);
+    if ($clean) $html .= '<details class="audit-details"><summary>More data</summary><pre class="audit-meta">'.e(json_encode($clean, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES)).'</pre></details>';
+    if (!empty($data['ip_details'])) $html .= '<details class="audit-details"><summary>IP details</summary><pre class="audit-meta">'.e(json_encode($data['ip_details'], JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES)).'</pre></details>';
     return $html;
-}
-function audit_json_details_html(array $meta, string $title='More data'): string {
-    if (!$meta) return '';
-    return '<details class="audit-details"><summary>'.e($title).'</summary><pre>'.e(json_encode($meta, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE)).'</pre></details>';
 }
 function first(string $sql, array $args=[]): ?array { $s=db()->prepare($sql); $s->execute($args); $r=$s->fetch(PDO::FETCH_ASSOC); return $r ?: null; }
 function all(string $sql, array $args=[]): array { $s=db()->prepare($sql); $s->execute($args); return $s->fetchAll(PDO::FETCH_ASSOC); }
@@ -407,9 +398,6 @@ function table_has_column(string $table, string $column): bool {
     return false;
 }
 function ensure_schema_updates(): void {
-    static $done = false;
-    if ($done) return;
-    $done = true;
     if (!table_has_column('members', 'joined_before_system')) {
         db()->exec('ALTER TABLE members ADD COLUMN joined_before_system INTEGER NOT NULL DEFAULT 0');
     }
@@ -478,27 +466,6 @@ function ensure_schema_updates(): void {
         created_by_user_id INTEGER NULL,
         created_at TEXT NOT NULL
     )');
-    $indexes = [
-        'CREATE INDEX IF NOT EXISTS idx_members_name ON members(last_name, first_name)',
-        'CREATE INDEX IF NOT EXISTS idx_members_status ON members(membership_status)',
-        'CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)',
-        'CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_at)',
-        'CREATE INDEX IF NOT EXISTS idx_event_attendance_event ON event_attendance(event_id)',
-        'CREATE INDEX IF NOT EXISTS idx_event_attendance_member ON event_attendance(member_id)',
-        'CREATE INDEX IF NOT EXISTS idx_event_guests_event ON event_guests(event_id)',
-        'CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC)',
-        'CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action)',
-        'CREATE INDEX IF NOT EXISTS idx_audit_result ON audit_logs(result)',
-        'CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_logs(entity_type, entity_id)',
-        'CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, read_at)',
-        'CREATE INDEX IF NOT EXISTS idx_notifications_member ON notifications(member_id, read_at)',
-        'CREATE INDEX IF NOT EXISTS idx_email_recipients_email ON email_recipients(email_id)',
-        'CREATE INDEX IF NOT EXISTS idx_brickworks_progress_participant ON brickworks_progress(participant_id)',
-        'CREATE INDEX IF NOT EXISTS idx_brickworks_evidence_progress ON brickworks_evidence(progress_id)',
-        'CREATE INDEX IF NOT EXISTS idx_committee_actions_status_due ON committee_actions(status, due_date)',
-        'CREATE INDEX IF NOT EXISTS idx_equipment_tickets_equipment ON equipment_maintenance_tickets(equipment_id)'
-    ];
-    foreach ($indexes as $sql) db()->exec($sql);
 }
 function is_admin_user(): bool { return has_role('admin'); }
 function user_is_admin(int $user_id): bool { return in_array('admin', user_roles($user_id), true); }
@@ -539,6 +506,306 @@ function render_consent_checkboxes(int $member_id): string {
 }
 function save_consent_post(int $member_id, ?int $by_user_id): void {
     foreach (consent_labels() as $type=>$label) set_member_consent($member_id, $type, isset($_POST['consent_' . $type]), $by_user_id);
+}
+
+
+function import_yes_value($value): bool {
+    $v = strtolower(trim((string)$value));
+    return in_array($v, ['1','yes','y','true','on','paid','active','complete','completed'], true);
+}
+function import_clean_text($value): string {
+    if ($value === null) return '';
+    if (is_bool($value)) return $value ? 'Yes' : 'No';
+    return trim((string)$value);
+}
+function import_header_key($header): string {
+    $h = strtolower(trim((string)$header));
+    $h = str_replace(['/', '&', '+'], ' ', $h);
+    $h = preg_replace('/[^a-z0-9]+/', ' ', $h);
+    return trim(preg_replace('/\s+/', ' ', $h));
+}
+function import_excel_serial_date($value): string {
+    if (!is_numeric($value)) return '';
+    $serial = (float)$value;
+    if ($serial < 20000 || $serial > 80000) return '';
+    return gmdate('Y-m-d', (int)(($serial - 25569) * 86400));
+}
+function import_normalize_date($value): string {
+    $v = import_clean_text($value);
+    if ($v === '') return '';
+    if (is_numeric($v)) {
+        $d = import_excel_serial_date($v);
+        if ($d) return $d;
+    }
+    if (preg_match('/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/', $v, $m)) {
+        $year = (int)$m[3];
+        if ($year < 100) $year += 2000;
+        return sprintf('%04d-%02d-%02d', $year, (int)$m[2], (int)$m[1]);
+    }
+    if (preg_match('/^(\d{4})-(\d{1,2})-(\d{1,2})$/', $v, $m)) {
+        return sprintf('%04d-%02d-%02d', (int)$m[1], (int)$m[2], (int)$m[3]);
+    }
+    $ts = strtotime($v);
+    return $ts ? date('Y-m-d', $ts) : '';
+}
+function import_split_name(string $fullName): array {
+    $fullName = trim(preg_replace('/\s+/', ' ', $fullName));
+    if ($fullName === '') return ['', ''];
+    $parts = explode(' ', $fullName);
+    if (count($parts) === 1) return [$parts[0], ''];
+    $last = array_pop($parts);
+    return [implode(' ', $parts), $last];
+}
+function import_xlsx_rows(string $path): array {
+    if (!class_exists('ZipArchive')) throw new RuntimeException('XLSX import requires the PHP zip extension. Install with: apt install php-zip && systemctl restart php8.1-fpm');
+    $zip = new ZipArchive();
+    if ($zip->open($path) !== true) throw new RuntimeException('Could not open XLSX file.');
+
+    $shared = [];
+    $sharedXml = $zip->getFromName('xl/sharedStrings.xml');
+    if ($sharedXml !== false) {
+        $sx = @simplexml_load_string($sharedXml);
+        if ($sx) {
+            foreach ($sx->si as $si) {
+                if (isset($si->t)) $shared[] = (string)$si->t;
+                else {
+                    $txt = '';
+                    foreach ($si->r as $r) $txt .= (string)$r->t;
+                    $shared[] = $txt;
+                }
+            }
+        }
+    }
+
+    $sheetName = 'xl/worksheets/sheet1.xml';
+    $workbookXml = $zip->getFromName('xl/workbook.xml');
+    $relsXml = $zip->getFromName('xl/_rels/workbook.xml.rels');
+    if ($workbookXml !== false && $relsXml !== false) {
+        $wb = @simplexml_load_string($workbookXml);
+        $rels = @simplexml_load_string($relsXml);
+        if ($wb && $rels && isset($wb->sheets->sheet[0])) {
+            $attrs = $wb->sheets->sheet[0]->attributes('http://schemas.openxmlformats.org/officeDocument/2006/relationships');
+            $rid = (string)($attrs['id'] ?? '');
+            if ($rid) {
+                foreach ($rels->Relationship as $rel) {
+                    $a = $rel->attributes();
+                    if ((string)$a['Id'] === $rid) {
+                        $target = (string)$a['Target'];
+                        $sheetName = 'xl/' . ltrim($target, '/');
+                        if (!str_starts_with($sheetName, 'xl/worksheets/') && str_contains($target, 'worksheets/')) $sheetName = 'xl/' . $target;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    $sheetXml = $zip->getFromName($sheetName);
+    if ($sheetXml === false) $sheetXml = $zip->getFromName('xl/worksheets/sheet1.xml');
+    $zip->close();
+    if ($sheetXml === false) throw new RuntimeException('Could not find the first worksheet in the XLSX file.');
+
+    $sx = @simplexml_load_string($sheetXml);
+    if (!$sx) throw new RuntimeException('Could not read worksheet XML.');
+    $rows = [];
+    foreach ($sx->sheetData->row as $row) {
+        $out = [];
+        foreach ($row->c as $cell) {
+            $attrs = $cell->attributes();
+            $ref = (string)($attrs['r'] ?? 'A1');
+            preg_match('/^([A-Z]+)/i', $ref, $m);
+            $letters = strtoupper($m[1] ?? 'A');
+            $col = 0;
+            for ($i=0; $i<strlen($letters); $i++) $col = $col * 26 + (ord($letters[$i]) - 64);
+            $col--;
+            $type = (string)($attrs['t'] ?? '');
+            $val = '';
+            if ($type === 's') {
+                $idx = (int)($cell->v ?? 0);
+                $val = $shared[$idx] ?? '';
+            } elseif ($type === 'inlineStr') {
+                $val = (string)($cell->is->t ?? '');
+            } elseif ($type === 'b') {
+                $val = ((string)($cell->v ?? '0')) === '1' ? 'Yes' : 'No';
+            } else {
+                $val = (string)($cell->v ?? '');
+            }
+            $out[$col] = $val;
+        }
+        if ($out) {
+            ksort($out);
+            $max = max(array_keys($out));
+            $dense = [];
+            for ($i=0; $i<=$max; $i++) $dense[] = import_clean_text($out[$i] ?? '');
+            if (implode('', $dense) !== '') $rows[] = $dense;
+        }
+    }
+    return $rows;
+}
+function import_csv_rows(string $path): array {
+    $rows = [];
+    $handle = fopen($path, 'r');
+    if (!$handle) throw new RuntimeException('Could not open CSV file.');
+    while (($row = fgetcsv($handle)) !== false) {
+        if (!$rows && isset($row[0])) $row[0] = preg_replace('/^\xEF\xBB\xBF/', '', (string)$row[0]);
+        $clean = array_map('import_clean_text', $row);
+        if (implode('', $clean) !== '') $rows[] = $clean;
+    }
+    fclose($handle);
+    return $rows;
+}
+function import_spreadsheet_rows(string $path, string $filename): array {
+    $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+    if ($ext === 'xlsx') return import_xlsx_rows($path);
+    if (in_array($ext, ['csv','txt'], true)) return import_csv_rows($path);
+    throw new RuntimeException('Unsupported file type. Please upload .xlsx or .csv.');
+}
+function import_member_column_aliases(): array {
+    return [
+        'membership_number' => ['membership number','member number','membership no','member no','no'],
+        'full_name' => ['full name','name','member name'],
+        'first_name' => ['first name','firstname','forename'],
+        'last_name' => ['surname','last name','lastname'],
+        'email' => ['email','email address'],
+        'phone' => ['phone','phone number','mobile','mobile number','telephone'],
+        'address' => ['address'],
+        'callsign' => ['callsign','call sign','call'],
+        'licence_level' => ['licence level','license level','licence class','license class','class'],
+        'society_role' => ['society role','club role','role'],
+        'membership_type' => ['membership type','type'],
+        'payment_status' => ['payment status','subs status','subscription status'],
+        'payment_date' => ['payment date','paid date','latest payment date'],
+        'date_joined' => ['date joined','membership start','join date','joined'],
+        'joined_before_system' => ['joined before system date not on record','joined before system','date not on record'],
+        'active' => ['active'],
+        'renewal_date' => ['renewal date','renewal due'],
+        'membership_status' => ['membership status','status'],
+        'emergency_contact_name' => ['emergency contact name','emergency contact'],
+        'emergency_contact_relationship' => ['emergency contact relationship','relationship to member','relationship'],
+        'emergency_contact_phone' => ['emergency contact phone','emergency phone'],
+        'email_comms' => ['email communications consent','email comms','email communications'],
+        'text_comms' => ['text messages consent','text comms','text messages'],
+        'whatsapp_community' => ['whatsapp community consent','whatsapp community','whatsapp opt in'],
+    ];
+}
+function import_member_map_headers(array $headers): array {
+    $keys = array_map('import_header_key', $headers);
+    $map = [];
+    foreach (import_member_column_aliases() as $field=>$aliases) {
+        foreach ($aliases as $alias) {
+            $idx = array_search(import_header_key($alias), $keys, true);
+            if ($idx !== false) { $map[$field] = $idx; break; }
+        }
+    }
+    return $map;
+}
+function import_get(array $row, array $map, string $field): string {
+    return array_key_exists($field, $map) ? import_clean_text($row[$map[$field]] ?? '') : '';
+}
+function import_member_status(string $status, string $active): string {
+    $s = strtolower(trim($status));
+    $allowed = ['pending','active','expired','former','suspended','honorary','life_member'];
+    if (in_array($s, $allowed, true)) return $s;
+    if ($active !== '') return import_yes_value($active) ? 'active' : 'former';
+    return $s ?: 'active';
+}
+function ensure_member_support_rows(int $member_id): void {
+    exec_sql('INSERT OR IGNORE INTO member_directory_preferences (member_id, created_at, updated_at) VALUES (?,datetime("now"),datetime("now"))', [$member_id]);
+    exec_sql('INSERT OR IGNORE INTO member_email_preferences (member_id, created_at, updated_at) VALUES (?,datetime("now"),datetime("now"))', [$member_id]);
+}
+function import_members_from_rows(array $rows, bool $updateExisting, bool $importPayments, int $actorUserId): array {
+    $summary = ['created'=>0,'updated'=>0,'skipped'=>0,'payments'=>0,'errors'=>[]];
+    if (!$rows) { $summary['errors'][] = 'The spreadsheet appears to be empty.'; return $summary; }
+    $headerIndex = null; $map = [];
+    foreach ($rows as $i=>$r) {
+        $candidate = import_member_map_headers($r);
+        if (isset($candidate['email']) || isset($candidate['full_name']) || isset($candidate['first_name'])) { $headerIndex = $i; $map = $candidate; break; }
+    }
+    if ($headerIndex === null) { $summary['errors'][] = 'Could not find a header row. Expected columns such as Full Name, Email, Member Number, Phone or Callsign.'; return $summary; }
+    if (!isset($map['email']) && !isset($map['full_name']) && !isset($map['first_name'])) { $summary['errors'][] = 'The spreadsheet does not contain enough member data to import.'; return $summary; }
+
+    db()->beginTransaction();
+    try {
+        foreach (array_slice($rows, $headerIndex + 1) as $offset=>$row) {
+            $line = $headerIndex + $offset + 2;
+            $membershipNumber = import_get($row, $map, 'membership_number');
+            $fullName = import_get($row, $map, 'full_name');
+            $first = import_get($row, $map, 'first_name');
+            $last = import_get($row, $map, 'last_name');
+            if (($first === '' || $last === '') && $fullName !== '') {
+                [$splitFirst, $splitLast] = import_split_name($fullName);
+                if ($first === '') $first = $splitFirst;
+                if ($last === '') $last = $splitLast;
+            }
+            $email = import_get($row, $map, 'email');
+            $callsign = import_get($row, $map, 'callsign');
+            if ($first === '' && $last === '' && $email === '' && $callsign === '') continue;
+            if ($first === '' && $last === '') { $summary['skipped']++; $summary['errors'][] = "Row $line skipped: missing name."; continue; }
+            if ($email === '') { $email = strtolower(preg_replace('/[^a-z0-9]+/i', '.', trim($first.'.'.$last))) . '.missing-email@example.invalid'; }
+
+            $existing = null;
+            if ($membershipNumber !== '') $existing = first('SELECT * FROM members WHERE membership_number=?', [$membershipNumber]);
+            if (!$existing && $email !== '') $existing = first('SELECT * FROM members WHERE lower(email)=lower(?)', [$email]);
+
+            $licence = import_get($row, $map, 'licence_level');
+            $phone = import_get($row, $map, 'phone');
+            $address = import_get($row, $map, 'address');
+            $emName = import_get($row, $map, 'emergency_contact_name');
+            $emRel = import_get($row, $map, 'emergency_contact_relationship');
+            $emPhone = import_get($row, $map, 'emergency_contact_phone');
+            $emergencySummary = trim($emName . ' | ' . $emRel . ' | ' . $emPhone);
+            $dateJoined = import_normalize_date(import_get($row, $map, 'date_joined'));
+            $joinedBeforeSystem = import_yes_value(import_get($row, $map, 'joined_before_system')) || $dateJoined === '';
+            $renewalDate = import_normalize_date(import_get($row, $map, 'renewal_date'));
+            $membershipType = import_get($row, $map, 'membership_type') ?: import_get($row, $map, 'society_role');
+            $status = import_member_status(import_get($row, $map, 'membership_status'), import_get($row, $map, 'active'));
+
+            if ($existing) {
+                if (!$updateExisting) { $summary['skipped']++; continue; }
+                $oldAudit = [
+                    'membership_number'=>$existing['membership_number'] ?? '', 'first_name'=>$existing['first_name'] ?? '', 'last_name'=>$existing['last_name'] ?? '', 'callsign'=>$existing['callsign'] ?? '', 'licence_level'=>$existing['licence_level'] ?? '', 'email'=>$existing['email'] ?? '', 'phone'=>decrypt_value($existing['phone_encrypted'] ?? '') ?: '', 'address'=>decrypt_value($existing['address_encrypted'] ?? '') ?: '', 'emergency_contact_name'=>decrypt_value($existing['emergency_contact_name_encrypted'] ?? '') ?: '', 'emergency_contact_relationship'=>decrypt_value($existing['emergency_contact_relationship_encrypted'] ?? '') ?: '', 'emergency_contact_phone'=>decrypt_value($existing['emergency_contact_phone_encrypted'] ?? '') ?: '', 'date_joined'=>$existing['date_joined'] ?? '', 'joined_before_system'=>!empty($existing['joined_before_system']) ? 'Yes' : 'No', 'renewal_date'=>$existing['renewal_date'] ?? '', 'membership_status'=>$existing['membership_status'] ?? '', 'membership_type'=>$existing['membership_type'] ?? ''
+                ];
+                $newAudit = ['membership_number'=>$membershipNumber ?: ($existing['membership_number'] ?? ''), 'first_name'=>$first, 'last_name'=>$last, 'callsign'=>$callsign, 'licence_level'=>$licence, 'email'=>$email, 'phone'=>$phone, 'address'=>$address, 'emergency_contact_name'=>$emName, 'emergency_contact_relationship'=>$emRel, 'emergency_contact_phone'=>$emPhone, 'date_joined'=>$dateJoined, 'joined_before_system'=>$joinedBeforeSystem ? 'Yes' : 'No', 'renewal_date'=>$renewalDate, 'membership_status'=>$status, 'membership_type'=>$membershipType];
+                $finalNumber = can_edit_membership_number() && $membershipNumber !== '' ? $membershipNumber : ($existing['membership_number'] ?? null);
+                exec_sql('UPDATE members SET membership_number=?, first_name=?, last_name=?, callsign=?, licence_level=?, email=?, phone_encrypted=?, address_encrypted=?, emergency_contact_encrypted=?, emergency_contact_name_encrypted=?, emergency_contact_relationship_encrypted=?, emergency_contact_phone_encrypted=?, date_joined=?, joined_before_system=?, renewal_date=?, membership_status=?, membership_type=?, updated_at=datetime("now") WHERE id=?', [$finalNumber ?: null,$first,$last,$callsign,$licence,$email,encrypt_value($phone),encrypt_value($address),encrypt_value($emergencySummary),encrypt_value($emName),encrypt_value($emRel),encrypt_value($emPhone),$dateJoined,$joinedBeforeSystem?1:0,$renewalDate,$status,$membershipType,(int)$existing['id']]);
+                $mid = (int)$existing['id'];
+                ensure_member_support_rows($mid);
+                audit('member.import_update','member',$mid,'success',null,['row'=>$line,'field_changes'=>audit_field_changes($oldAudit,$newAudit)]);
+                $summary['updated']++;
+            } else {
+                exec_sql('INSERT INTO members (membership_number,first_name,last_name,callsign,licence_level,email,phone_encrypted,address_encrypted,emergency_contact_encrypted,emergency_contact_name_encrypted,emergency_contact_relationship_encrypted,emergency_contact_phone_encrypted,date_joined,joined_before_system,renewal_date,membership_status,membership_type,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime("now"),datetime("now"))', [$membershipNumber ?: null,$first,$last,$callsign,$licence,$email,encrypt_value($phone),encrypt_value($address),encrypt_value($emergencySummary),encrypt_value($emName),encrypt_value($emRel),encrypt_value($emPhone),$dateJoined,$joinedBeforeSystem?1:0,$renewalDate,$status,$membershipType]);
+                $mid = (int)db()->lastInsertId();
+                ensure_member_support_rows($mid);
+                audit('member.import_create','member',$mid,'success',null,['row'=>$line]);
+                $summary['created']++;
+            }
+
+            foreach (['email_comms','text_comms','whatsapp_community'] as $consentType) {
+                if (array_key_exists($consentType, $map)) set_member_consent($mid, $consentType, import_yes_value(import_get($row,$map,$consentType)), $actorUserId);
+            }
+
+            if ($importPayments) {
+                $paymentStatus = strtolower(import_get($row, $map, 'payment_status'));
+                $paymentDate = import_normalize_date(import_get($row, $map, 'payment_date'));
+                if ($paymentStatus !== '' || $paymentDate !== '') {
+                    $year = $paymentDate ? (int)substr($paymentDate, 0, 4) : (int)date('Y');
+                    $statusClean = in_array($paymentStatus, ['paid','unpaid','pending','part-paid','part_paid','waived','refunded'], true) ? str_replace('_','-',$paymentStatus) : ($paymentStatus ?: 'unpaid');
+                    $amountDue = 30.00;
+                    $amountPaid = $statusClean === 'paid' ? 30.00 : 0.00;
+                    $dup = first('SELECT id FROM subscription_payments WHERE member_id=? AND subscription_year=? AND status=? AND COALESCE(payment_date,"")=? AND payment_reference="Imported member spreadsheet"', [$mid,$year,$statusClean,$paymentDate]);
+                    if (!$dup) {
+                        exec_sql('INSERT INTO subscription_payments (member_id,subscription_year,amount_due,amount_paid,payment_date,payment_method,payment_reference,status,recorded_by_user_id,notes_encrypted,created_at,updated_at) VALUES (?,?,?,?,?,"Imported","Imported member spreadsheet",?,?,?,datetime("now"),datetime("now"))', [$mid,$year,$amountDue,$amountPaid,$paymentDate ?: null,$statusClean,$actorUserId,encrypt_value('Imported from member spreadsheet')]);
+                        $summary['payments']++;
+                    }
+                }
+            }
+        }
+        db()->commit();
+    } catch (Throwable $e) {
+        if (db()->inTransaction()) db()->rollBack();
+        $summary['errors'][] = 'Import failed: ' . $e->getMessage();
+    }
+    return $summary;
 }
 
 function page_header(string $title): void {
@@ -609,9 +876,6 @@ HTML;
 function flash(string $msg): void { $_SESSION['flash'] = $msg; }
 
 function create_schema(): void {
-    static $done = false;
-    if ($done) return;
-    $done = true;
     $pdo = db();
     $pdo->exec(<<<SQL
 CREATE TABLE IF NOT EXISTS users (
@@ -1041,9 +1305,6 @@ SQL);
 }
 
 function seed_roles_permissions(): void {
-    static $done = false;
-    if ($done) return;
-    $done = true;
     $roles = [
         'member' => 'Member',
         'committee' => 'Committee Member',
@@ -1080,9 +1341,6 @@ function seed_roles_permissions(): void {
     }
 }
 function seed_brickworks(): void {
-    static $done = false;
-    if ($done) return;
-    $done = true;
     $themes = ['Having a go','Getting involved','Taking part','Making','Promoting amateur radio'];
     foreach ($themes as $i=>$t) exec_sql('INSERT OR IGNORE INTO brickworks_themes (id, name, description, sort_order) VALUES (?, ?, ?, ?)', [$i+1, $t, $t, $i+1]);
     $criteria = [
@@ -1111,7 +1369,6 @@ function assign_role(int $user_id, string $role_name, ?int $by=null, ?string $re
     $role = first('SELECT * FROM roles WHERE name=?',[$role_name]); if (!$role) return;
     $already = first('SELECT 1 AS x FROM user_roles WHERE user_id=? AND role_id=?', [$user_id, $role['id']]);
     exec_sql('INSERT OR IGNORE INTO user_roles (user_id, role_id, assigned_by_user_id, assigned_at) VALUES (?,?,?,datetime("now"))', [$user_id,$role['id'],$by]);
-    clear_user_access_cache();
     if (!$already) {
         exec_sql('INSERT INTO user_role_history (user_id, role_id, action, changed_by_user_id, changed_at, reason) VALUES (?,?,"assigned",?,datetime("now"),?)', [$user_id,$role['id'],$by,$reason]);
     }
@@ -1120,7 +1377,6 @@ function remove_role(int $user_id, string $role_name, ?int $by=null, ?string $re
     $role = first('SELECT * FROM roles WHERE name=?',[$role_name]); if (!$role) return;
     $had = first('SELECT 1 AS x FROM user_roles WHERE user_id=? AND role_id=?', [$user_id, $role['id']]);
     exec_sql('DELETE FROM user_roles WHERE user_id=? AND role_id=?', [$user_id,$role['id']]);
-    clear_user_access_cache();
     if ($had) {
         exec_sql('INSERT INTO user_role_history (user_id, role_id, action, changed_by_user_id, changed_at, reason) VALUES (?,?,"removed",?,datetime("now"),?)', [$user_id,$role['id'],$by,$reason]);
     }
@@ -1283,7 +1539,7 @@ function brickworks_award(int $complete): ?string {
 
 if (route() === 'assets.css') {
     header('Content-Type: text/css');
-    echo 'body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#f6f7fb;color:#18202a}header{background:#101827;color:white;padding:18px 24px}header div{display:flex;gap:12px;align-items:end}header span{opacity:.7}.main-nav{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center}.main-nav a,.nav-drop{color:white;background:#24324a;padding:8px 10px;border-radius:8px;text-decoration:none;border:0;font:inherit;cursor:pointer}.dropdown{position:relative;padding-bottom:14px;margin-bottom:-14px}.dropdown::after{content:"";position:absolute;left:0;right:0;top:100%;height:14px}.dropdown-menu{display:none;position:absolute;z-index:999;top:calc(100% - 6px);left:0;min-width:220px;background:white;border-radius:10px;box-shadow:0 10px 25px #0003;padding:8px;margin-top:0}.dropdown:hover .dropdown-menu,.dropdown:focus-within .dropdown-menu,.dropdown.open .dropdown-menu{display:block}.dropdown-menu a{display:block;color:#18202a;background:white;padding:10px;border-radius:8px}.dropdown-menu a:hover{background:#f1f5f9}main{max-width:1180px;margin:24px auto;padding:0 18px}.site-footer{max-width:1180px;margin:28px auto 0;padding:18px;color:#64748b;text-align:center;border-top:1px solid #e5e7eb}.site-footer a{color:#1d4ed8;text-decoration:none}.site-footer a:hover{text-decoration:underline}.footer-main,.footer-links,.footer-version{margin:5px 0}.footer-main{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}.footer-version{font-size:.92rem}.card{background:white;border-radius:14px;padding:18px;margin:16px 0;box-shadow:0 1px 4px #0001}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}label{display:block;margin:10px 0 4px;font-weight:600}input,select,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd3df;border-radius:8px}textarea{min-height:110px}button,.btn{background:#1d4ed8;color:white;border:0;border-radius:8px;padding:10px 14px;text-decoration:none;display:inline-block;cursor:pointer}button.secondary,.btn.secondary{background:#475569}.btn.danger,button.danger{background:#b91c1c}table{width:100%;border-collapse:collapse;background:white}th,td{border-bottom:1px solid #e5e7eb;padding:10px;text-align:left;vertical-align:top}th{background:#f1f5f9}.flash{background:#dcfce7;border:1px solid #86efac;padding:12px;border-radius:10px}.danger-box,.card.danger{background:#fee2e2;border:1px solid #fecaca}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#e0e7ff}.muted{color:#64748b}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.event-list{display:grid;gap:12px}.event-row{display:flex;gap:18px;justify-content:space-between;align-items:flex-start;border:1px solid #e5e7eb;border-radius:12px;padding:14px;background:#fff}.event-actions{white-space:nowrap}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}.calendar-head{font-weight:700;text-align:center;background:#e2e8f0;border-radius:8px;padding:8px}.calendar-day{min-height:110px;background:white;border:1px solid #e5e7eb;border-radius:10px;padding:8px}.calendar-day.muted-day{background:#f8fafc;color:#94a3b8}.calendar-date{font-weight:700;margin-bottom:6px}.calendar-event{display:block;background:#dbeafe;color:#1e3a8a;text-decoration:none;border-radius:8px;padding:5px;margin:4px 0;font-size:.88rem}.leaderboard{counter-reset:rank}.leaderboard-row{display:grid;grid-template-columns:42px 1fr auto;gap:10px;align-items:center;border-bottom:1px solid #e5e7eb;padding:10px 0}.leaderboard-row:before{counter-increment:rank;content:counter(rank);background:#e0e7ff;border-radius:999px;width:30px;height:30px;display:grid;place-items:center;font-weight:700}.progressbar{height:10px;background:#e5e7eb;border-radius:999px;overflow:hidden}.progressbar span{display:block;height:100%;background:#1d4ed8}.small{font-size:.9rem}.status-complete{background:#dcfce7}.status-pending{background:#fef3c7}.status-none{background:#f1f5f9}.user-menu{margin-left:auto}.dropdown-right{right:0;left:auto}.modal{border:0;border-radius:16px;padding:0;max-width:820px;width:calc(100% - 32px);box-shadow:0 24px 80px #0005}.modal::backdrop{background:#0f172acc}.modal .card{margin:0;box-shadow:none}.modal-head{display:flex;align-items:center;gap:12px}.modal-head h2{margin-right:auto}.icon-btn{background:#e2e8f0;color:#0f172a;border-radius:999px;padding:8px 12px}.category-pill{background:#eef2ff;color:#312e81}.attendance-tools{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.attendance-list{display:grid;gap:8px}.attendance-item{display:grid;grid-template-columns:32px 1fr 160px;gap:10px;align-items:center;border:1px solid #e5e7eb;border-radius:10px;padding:10px}.attendance-item input[type=checkbox]{width:auto}.attendance-modern{padding:0;overflow:hidden;border-radius:18px}.attendance-modern-head{display:grid;grid-template-columns:1fr auto;gap:18px;padding:28px 32px 18px;align-items:start}.attendance-modern-head h2{font-size:1.9rem;margin:.1rem 0 .35rem}.attendance-date{font-size:1.25rem;color:#64748b;font-weight:650}.attendance-counts{display:flex;gap:28px;text-align:center;align-items:start}.attendance-counts span{display:block;color:#64748b;font-weight:650}.attendance-counts strong{font-size:1.45rem}.attendance-counts .present{color:#16a34a}.attendance-counts .guest{color:#ea580c}.attendance-counts .absent{color:#dc2626}.attendance-modern-controls{display:grid;grid-template-columns:1fr 220px auto auto;gap:14px;padding:18px 32px 28px;align-items:center}.attendance-search-wrap{position:relative}.attendance-search-wrap:before{content:"⌕";position:absolute;left:14px;top:50%;transform:translateY(-50%);font-size:1.35rem;color:#94a3b8}.attendance-search{font-size:1.05rem;padding-left:46px}.attendance-filter,.attendance-search{height:44px;box-shadow:0 2px 7px #00000012}.attendance-modern-list{border-top:1px solid #e5e7eb}.attendance-modern-row{display:grid;grid-template-columns:44px 1fr auto;gap:14px;align-items:center;padding:18px 32px;border-bottom:1px solid #e5e7eb;background:#fff}.attendance-modern-row:hover{background:#f8fafc}.attendance-modern-row input[type=checkbox]{width:24px;height:24px;accent-color:#1d4ed8}.attendance-person strong{display:block;font-size:1.05rem}.attendance-person span{display:block;color:#64748b;margin-top:2px}.attendance-row-status{font-weight:700;color:#94a3b8}.attendance-row-status.present{color:#16a34a}.attendance-row-status.guest{color:#ea580c}.attendance-modern-footer{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;padding:18px 32px;align-items:end;background:#f8fafc}.attendance-modern-footer input{background:white}.attendance-savebar{padding:18px 32px;display:flex;gap:10px;justify-content:space-between;align-items:center;background:#fff}.attendance-empty{padding:22px 32px;color:#64748b}.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.stat-tile{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:12px}.full{grid-column:1/-1}.bw-hero{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center}.bw-score{font-size:2.2rem;font-weight:800}.bw-steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px}.bw-step{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:10px}.bw-grid{display:grid;gap:14px}.bw-card{border:1px solid #e5e7eb;border-radius:14px;padding:14px;background:#fff}.bw-card-head{display:flex;gap:10px;align-items:flex-start;justify-content:space-between}.bw-card h3{margin:.1rem 0 .35rem}.bw-theme{font-size:.85rem;color:#475569;font-weight:700;text-transform:uppercase;letter-spacing:.03em}.bw-status{display:inline-block;border-radius:999px;padding:5px 9px;font-weight:700;font-size:.85rem;white-space:nowrap}.bw-status.complete{background:#dcfce7;color:#166534}.bw-status.pending{background:#fef3c7;color:#92400e}.bw-status.none{background:#f1f5f9;color:#334155}.bw-form{display:grid;gap:8px;margin-top:12px;background:#f8fafc;border-radius:12px;padding:12px}.bw-comments{margin-top:10px;border-left:4px solid #e2e8f0;padding-left:10px}.bw-muted-line{color:#64748b;font-size:.92rem}.ticket{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fff;margin:10px 0}.ticket-head{display:flex;gap:10px;align-items:center;justify-content:space-between}.ticket.open{border-left:5px solid #2563eb}.ticket.in_progress{border-left:5px solid #f59e0b}.ticket.closed{border-left:5px solid #16a34a}.ticket.cancelled{border-left:5px solid #64748b}.matrix-wrap{overflow:auto;max-width:100%;border:1px solid #e5e7eb;border-radius:12px}.matrix{min-width:980px}.matrix th{position:sticky;top:0;z-index:3}.matrix th:first-child,.matrix td:first-child{position:sticky;left:0;background:#fff;z-index:2;box-shadow:2px 0 0 #e5e7eb}.matrix th:first-child{z-index:4;background:#f1f5f9}.matrix-cell{min-width:220px}.inline-form{display:grid;gap:6px}.inline-form select,.inline-form textarea,.inline-form input{font-size:.9rem;padding:7px}.status-pill{display:inline-block;border-radius:999px;padding:4px 8px;font-size:.82rem;font-weight:700}.status-open{background:#dbeafe;color:#1e40af}.status-in_progress,.status-pending_approval{background:#fef3c7;color:#92400e}.status-complete,.status-closed{background:#dcfce7;color:#166534}.status-not_completed,.status-cancelled{background:#f1f5f9;color:#334155}.asset-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.asset-field{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px}.asset-field span{display:block;color:#64748b;font-size:.85rem}.asset-field strong{display:block;margin-top:3px}.actions-board{display:grid;gap:12px}.recipient-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;max-height:360px;overflow:auto;border:1px solid #e5e7eb;border-radius:12px;padding:10px;background:#f8fafc}.recipient-item{display:flex;gap:10px;align-items:flex-start;background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:9px;margin:0;font-weight:400}.recipient-item input{width:auto;margin-top:4px}.email-app{background:#fff;border:1px solid #dde4ef;border-radius:14px;overflow:hidden;box-shadow:0 1px 4px #0001;margin:16px 0}.email-top{background:#4638cf;color:white;padding:16px 18px;display:flex;align-items:center;gap:12px}.email-title{display:flex;align-items:center;gap:10px;font-size:1.25rem}.email-icon{font-size:1.3rem}.email-top-actions{margin-left:auto}.email-config-btn{background:#ffffff22;color:white;border:1px solid #ffffff55;border-radius:9px;padding:8px 10px;text-decoration:none;font-weight:700}.email-layout{display:grid;grid-template-columns:330px 1fr;min-height:560px}.email-sidebar{border-right:1px solid #dde4ef;background:#f8fafc}.email-recipient-head{display:flex;align-items:center;gap:10px;padding:15px 14px;border-bottom:1px solid #dde4ef;font-size:1.05rem}.email-people{color:#4f46e5}.email-count{background:#e0e7ff;color:#4338ca;border-radius:9px;padding:3px 12px;font-weight:800;box-shadow:0 2px 6px #0001}.email-filter-bar{display:flex;gap:7px;flex-wrap:wrap;padding:12px 14px;border-bottom:1px solid #e7edf6}.email-chip{width:auto;border-radius:7px;padding:8px 10px;background:#eef2ff;color:#4338ca;font-weight:800}.email-chip.active{background:#4f46e5;color:#fff}.email-chip.paid{background:#dcfce7;color:#166534}.email-chip.unpaid{background:#fee2e2;color:#b91c1c}.email-chip.pending{background:#fef3c7;color:#92400e}.email-chip.committee{background:#f3e8ff;color:#7e22ce}.email-chip.none{background:#e2e8f0;color:#64748b}.email-search-wrap{padding:12px 14px}.email-search{background:#fff;padding-left:14px}.email-member-list{max-height:430px;overflow:auto}.email-member-card{display:grid;grid-template-columns:24px 1fr auto;gap:10px;align-items:center;padding:12px 14px;border-top:1px solid #edf2f7;background:#eef2ff;cursor:pointer;margin:0;font-weight:400}.email-member-card:hover{background:#e0e7ff}.email-member-card input{display:none}.email-check-ui{width:18px;height:18px;border-radius:6px;background:#4f46e5;color:#fff;display:grid;place-items:center;font-size:.78rem;font-weight:900}.email-member-card input:not(:checked)+.email-check-ui{background:#fff;color:transparent;border:2px solid #cbd5e1}.email-member-main strong{display:block;color:#1e293b}.email-member-main small,.email-callsign{display:block;color:#94a3b8;font-weight:700;margin-top:2px}.email-badge{border-radius:7px;padding:6px 9px;font-weight:800;font-size:.82rem}.email-badge.paid{background:#dcfce7;color:#166534}.email-badge.unpaid{background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5}.email-badge.pending{background:#fef3c7;color:#92400e}.email-empty{padding:14px}.email-compose{display:flex;flex-direction:column;background:#fff}.email-fields{padding:16px 22px;border-bottom:1px solid #dde4ef}.email-row{display:grid;grid-template-columns:70px 1fr;gap:12px;align-items:center;margin:8px 0}.email-row label{margin:0;text-align:right;color:#64748b}.email-row input{background:#f8fafc}.email-toolbar{display:flex;gap:14px;align-items:center;padding:12px 22px;border-bottom:1px solid #eef2f7}.email-attach-btn{display:inline-flex;align-items:center;gap:8px;width:auto;margin:0;padding:9px 12px;border:1px solid #dbe3ee;border-radius:9px;background:#fff;box-shadow:0 2px 5px #0001;cursor:pointer}.email-attach-btn input{display:none}.email-help{color:#94a3b8;font-weight:700}.email-help code{background:#eef2ff;color:#64748b;border-radius:5px;padding:2px 5px}.email-message{border:0;border-radius:0;min-height:330px;padding:22px;font-size:1rem;resize:vertical}.email-message:focus{outline:2px solid #c7d2fe;outline-offset:-2px}.email-sendbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:auto;padding:14px 22px;border-top:1px solid #eef2f7;background:#fbfdff}@media(max-width:900px){.email-layout{grid-template-columns:1fr}.email-sidebar{border-right:0;border-bottom:1px solid #dde4ef}.email-member-list{max-height:260px}.email-row{grid-template-columns:1fr}.email-row label{text-align:left}.email-sendbar{display:block}.email-sendbar div{margin-top:10px}}.role-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin:8px 0 12px}.role-grid .check{display:flex;align-items:center;gap:8px;margin:0;padding:8px 10px;border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc;font-weight:600;line-height:1.2;cursor:pointer}.role-grid .check:hover{background:#eef2ff;border-color:#c7d2fe}.role-grid .check input[type=checkbox]{width:18px;height:18px;min-width:18px;margin:0;accent-color:#1d4ed8}.role-grid .check span{display:inline-block}.role-grid .check input[disabled]+span{color:#64748b}.role-editor .role-grid{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}footer{text-align:center;color:#64748b;padding:24px}@media(max-width:800px){.two{grid-template-columns:1fr}.event-row{display:block}.calendar{grid-template-columns:1fr}.calendar-head{display:none}table{font-size:.9rem}}@media(max-width:720px){  header{padding:14px 12px}  header div{display:block}  header h1{font-size:1.25rem;margin:.2rem 0}  header span{display:block;font-size:.88rem;margin-top:2px}  .main-nav{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}  .main-nav a,.nav-drop{display:block;width:100%;box-sizing:border-box;text-align:center;padding:11px 10px}  .user-menu{margin-left:0}  .dropdown{padding-bottom:0;margin-bottom:0}  .dropdown::after{display:none}  .dropdown-menu,.dropdown-right{position:static;min-width:0;width:100%;box-sizing:border-box;margin-top:6px;box-shadow:none;border:1px solid #e5e7eb}  .dropdown-menu a{text-align:left}  main{margin:14px auto;padding:0 10px}  .card{border-radius:12px;padding:14px;margin:12px 0}  h1{font-size:1.55rem}  h2{font-size:1.25rem}  .grid,.two,.asset-grid,.stat-grid,.bw-steps{grid-template-columns:1fr}  .toolbar{display:grid;grid-template-columns:1fr;gap:8px}  .toolbar .btn,.toolbar button,.toolbar select{width:100%;box-sizing:border-box;text-align:center}  button,.btn{width:100%;box-sizing:border-box;text-align:center;margin:3px 0}  input,select,textarea{font-size:16px}  table{display:block;width:100%;overflow-x:auto;white-space:nowrap;font-size:.88rem}  th,td{padding:8px}  .event-row{display:block}  .event-actions{white-space:normal;margin-top:10px}  .calendar{display:block}  .calendar-head{display:none}  .calendar-day{min-height:auto;margin-bottom:8px}  .leaderboard-row{grid-template-columns:36px 1fr;align-items:start}  .leaderboard-row > .pill,.leaderboard-row > span:last-child{grid-column:2}  .bw-hero{grid-template-columns:1fr;text-align:left}  .bw-card-head{display:block}  .bw-status{margin-top:8px}  .bw-form button{width:100%}  .matrix-wrap{border-radius:10px}  .matrix{min-width:760px}  .modal{width:calc(100% - 18px);max-height:92vh;overflow:auto}  .modal-head{display:grid;grid-template-columns:1fr auto}  .attendance-modern-head{grid-template-columns:1fr;padding:18px 16px 10px}  .attendance-modern-head h2{font-size:1.45rem}  .attendance-date{font-size:1rem}  .attendance-counts{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}  .attendance-counts strong{font-size:1.15rem}  .attendance-modern-controls{grid-template-columns:1fr;padding:14px 16px;gap:9px}  .attendance-modern-row{grid-template-columns:34px 1fr;padding:14px 16px}  .attendance-row-status{grid-column:2;margin-top:4px}  .attendance-modern-footer{grid-template-columns:1fr;padding:14px 16px}  .attendance-savebar{display:block;padding:14px 16px}  .email-top{display:block}  .email-top-actions{margin-left:0;margin-top:10px}  .email-layout{grid-template-columns:1fr;min-height:0}  .email-sidebar{border-right:0;border-bottom:1px solid #dde4ef}  .email-filter-bar{display:grid;grid-template-columns:1fr 1fr}  .email-chip{width:100%}  .email-member-list{max-height:300px}  .email-member-card{grid-template-columns:24px 1fr;align-items:start}  .email-badge{grid-column:2;width:max-content}  .email-fields,.email-toolbar,.email-sendbar{padding:12px 14px}  .email-row{grid-template-columns:1fr}  .email-row label{text-align:left}  .email-toolbar{display:block}  .email-message{min-height:240px;padding:14px}  .role-grid{grid-template-columns:1fr}  .ticket-head{display:block}  .site-footer{margin-top:18px;padding:14px 10px;font-size:.88rem}}@media(max-width:420px){  .main-nav{grid-template-columns:1fr}  .attendance-counts{grid-template-columns:1fr}  .email-filter-bar{grid-template-columns:1fr}}';
+    echo 'body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#f6f7fb;color:#18202a}header{background:#101827;color:white;padding:18px 24px}header div{display:flex;gap:12px;align-items:end}header span{opacity:.7}.main-nav{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center}.main-nav a,.nav-drop{color:white;background:#24324a;padding:8px 10px;border-radius:8px;text-decoration:none;border:0;font:inherit;cursor:pointer}.dropdown{position:relative;padding-bottom:14px;margin-bottom:-14px}.dropdown::after{content:"";position:absolute;left:0;right:0;top:100%;height:14px}.dropdown-menu{display:none;position:absolute;z-index:999;top:calc(100% - 6px);left:0;min-width:220px;background:white;border-radius:10px;box-shadow:0 10px 25px #0003;padding:8px;margin-top:0}.dropdown:hover .dropdown-menu,.dropdown:focus-within .dropdown-menu,.dropdown.open .dropdown-menu{display:block}.dropdown-menu a{display:block;color:#18202a;background:white;padding:10px;border-radius:8px}.dropdown-menu a:hover{background:#f1f5f9}main{max-width:1180px;margin:24px auto;padding:0 18px}.site-footer{max-width:1180px;margin:28px auto 0;padding:18px;color:#64748b;text-align:center;border-top:1px solid #e5e7eb}.site-footer a{color:#1d4ed8;text-decoration:none}.site-footer a:hover{text-decoration:underline}.footer-main,.footer-links,.footer-version{margin:5px 0}.footer-main{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}.footer-version{font-size:.92rem}.card{background:white;border-radius:14px;padding:18px;margin:16px 0;box-shadow:0 1px 4px #0001}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}label{display:block;margin:10px 0 4px;font-weight:600}input,select,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd3df;border-radius:8px}textarea{min-height:110px}button,.btn{background:#1d4ed8;color:white;border:0;border-radius:8px;padding:10px 14px;text-decoration:none;display:inline-block;cursor:pointer}button.secondary,.btn.secondary{background:#475569}.btn.danger,button.danger{background:#b91c1c}table{width:100%;border-collapse:collapse;background:white}th,td{border-bottom:1px solid #e5e7eb;padding:10px;text-align:left;vertical-align:top}th{background:#f1f5f9}.flash{background:#dcfce7;border:1px solid #86efac;padding:12px;border-radius:10px}.danger-box,.card.danger{background:#fee2e2;border:1px solid #fecaca}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#e0e7ff}.muted{color:#64748b}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.event-list{display:grid;gap:12px}.event-row{display:flex;gap:18px;justify-content:space-between;align-items:flex-start;border:1px solid #e5e7eb;border-radius:12px;padding:14px;background:#fff}.event-actions{white-space:nowrap}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}.calendar-head{font-weight:700;text-align:center;background:#e2e8f0;border-radius:8px;padding:8px}.calendar-day{min-height:110px;background:white;border:1px solid #e5e7eb;border-radius:10px;padding:8px}.calendar-day.muted-day{background:#f8fafc;color:#94a3b8}.calendar-date{font-weight:700;margin-bottom:6px}.calendar-event{display:block;background:#dbeafe;color:#1e3a8a;text-decoration:none;border-radius:8px;padding:5px;margin:4px 0;font-size:.88rem}.leaderboard{counter-reset:rank}.leaderboard-row{display:grid;grid-template-columns:42px 1fr auto;gap:10px;align-items:center;border-bottom:1px solid #e5e7eb;padding:10px 0}.leaderboard-row:before{counter-increment:rank;content:counter(rank);background:#e0e7ff;border-radius:999px;width:30px;height:30px;display:grid;place-items:center;font-weight:700}.progressbar{height:10px;background:#e5e7eb;border-radius:999px;overflow:hidden}.progressbar span{display:block;height:100%;background:#1d4ed8}.small{font-size:.9rem}.status-complete{background:#dcfce7}.status-pending{background:#fef3c7}.status-none{background:#f1f5f9}.user-menu{margin-left:auto}.dropdown-right{right:0;left:auto}.modal{border:0;border-radius:16px;padding:0;max-width:820px;width:calc(100% - 32px);box-shadow:0 24px 80px #0005}.modal::backdrop{background:#0f172acc}.modal .card{margin:0;box-shadow:none}.modal-head{display:flex;align-items:center;gap:12px}.modal-head h2{margin-right:auto}.icon-btn{background:#e2e8f0;color:#0f172a;border-radius:999px;padding:8px 12px}.category-pill{background:#eef2ff;color:#312e81}.attendance-tools{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.attendance-list{display:grid;gap:8px}.attendance-item{display:grid;grid-template-columns:32px 1fr 160px;gap:10px;align-items:center;border:1px solid #e5e7eb;border-radius:10px;padding:10px}.attendance-item input[type=checkbox]{width:auto}.attendance-modern{padding:0;overflow:hidden;border-radius:18px}.attendance-modern-head{display:grid;grid-template-columns:1fr auto;gap:18px;padding:28px 32px 18px;align-items:start}.attendance-modern-head h2{font-size:1.9rem;margin:.1rem 0 .35rem}.attendance-date{font-size:1.25rem;color:#64748b;font-weight:650}.attendance-counts{display:flex;gap:28px;text-align:center;align-items:start}.attendance-counts span{display:block;color:#64748b;font-weight:650}.attendance-counts strong{font-size:1.45rem}.attendance-counts .present{color:#16a34a}.attendance-counts .guest{color:#ea580c}.attendance-counts .absent{color:#dc2626}.attendance-modern-controls{display:grid;grid-template-columns:1fr 220px auto auto;gap:14px;padding:18px 32px 28px;align-items:center}.attendance-search-wrap{position:relative}.attendance-search-wrap:before{content:"⌕";position:absolute;left:14px;top:50%;transform:translateY(-50%);font-size:1.35rem;color:#94a3b8}.attendance-search{font-size:1.05rem;padding-left:46px}.attendance-filter,.attendance-search{height:44px;box-shadow:0 2px 7px #00000012}.attendance-modern-list{border-top:1px solid #e5e7eb}.attendance-modern-row{display:grid;grid-template-columns:44px 1fr auto;gap:14px;align-items:center;padding:18px 32px;border-bottom:1px solid #e5e7eb;background:#fff}.attendance-modern-row:hover{background:#f8fafc}.attendance-modern-row input[type=checkbox]{width:24px;height:24px;accent-color:#1d4ed8}.attendance-person strong{display:block;font-size:1.05rem}.attendance-person span{display:block;color:#64748b;margin-top:2px}.attendance-row-status{font-weight:700;color:#94a3b8}.attendance-row-status.present{color:#16a34a}.attendance-row-status.guest{color:#ea580c}.attendance-modern-footer{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;padding:18px 32px;align-items:end;background:#f8fafc}.attendance-modern-footer input{background:white}.attendance-savebar{padding:18px 32px;display:flex;gap:10px;justify-content:space-between;align-items:center;background:#fff}.attendance-empty{padding:22px 32px;color:#64748b}.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.stat-tile{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:12px}.full{grid-column:1/-1}.bw-hero{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center}.bw-score{font-size:2.2rem;font-weight:800}.bw-steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px}.bw-step{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:10px}.bw-grid{display:grid;gap:14px}.bw-card{border:1px solid #e5e7eb;border-radius:14px;padding:14px;background:#fff}.bw-card-head{display:flex;gap:10px;align-items:flex-start;justify-content:space-between}.bw-card h3{margin:.1rem 0 .35rem}.bw-theme{font-size:.85rem;color:#475569;font-weight:700;text-transform:uppercase;letter-spacing:.03em}.bw-status{display:inline-block;border-radius:999px;padding:5px 9px;font-weight:700;font-size:.85rem;white-space:nowrap}.bw-status.complete{background:#dcfce7;color:#166534}.bw-status.pending{background:#fef3c7;color:#92400e}.bw-status.none{background:#f1f5f9;color:#334155}.bw-form{display:grid;gap:8px;margin-top:12px;background:#f8fafc;border-radius:12px;padding:12px}.bw-comments{margin-top:10px;border-left:4px solid #e2e8f0;padding-left:10px}.bw-muted-line{color:#64748b;font-size:.92rem}.ticket{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fff;margin:10px 0}.ticket-head{display:flex;gap:10px;align-items:center;justify-content:space-between}.ticket.open{border-left:5px solid #2563eb}.ticket.in_progress{border-left:5px solid #f59e0b}.ticket.closed{border-left:5px solid #16a34a}.ticket.cancelled{border-left:5px solid #64748b}.matrix-wrap{overflow:auto;max-width:100%;border:1px solid #e5e7eb;border-radius:12px}.matrix{min-width:980px}.matrix th{position:sticky;top:0;z-index:3}.matrix th:first-child,.matrix td:first-child{position:sticky;left:0;background:#fff;z-index:2;box-shadow:2px 0 0 #e5e7eb}.matrix th:first-child{z-index:4;background:#f1f5f9}.matrix-cell{min-width:220px}.inline-form{display:grid;gap:6px}.inline-form select,.inline-form textarea,.inline-form input{font-size:.9rem;padding:7px}.status-pill{display:inline-block;border-radius:999px;padding:4px 8px;font-size:.82rem;font-weight:700}.status-open{background:#dbeafe;color:#1e40af}.status-in_progress,.status-pending_approval{background:#fef3c7;color:#92400e}.status-complete,.status-closed{background:#dcfce7;color:#166534}.status-not_completed,.status-cancelled{background:#f1f5f9;color:#334155}.asset-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.asset-field{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px}.asset-field span{display:block;color:#64748b;font-size:.85rem}.asset-field strong{display:block;margin-top:3px}.actions-board{display:grid;gap:12px}.recipient-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;max-height:360px;overflow:auto;border:1px solid #e5e7eb;border-radius:12px;padding:10px;background:#f8fafc}.recipient-item{display:flex;gap:10px;align-items:flex-start;background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:9px;margin:0;font-weight:400}.recipient-item input{width:auto;margin-top:4px}.email-app{background:#fff;border:1px solid #dde4ef;border-radius:14px;overflow:hidden;box-shadow:0 1px 4px #0001;margin:16px 0}.email-top{background:#4638cf;color:white;padding:16px 18px;display:flex;align-items:center;gap:12px}.email-title{display:flex;align-items:center;gap:10px;font-size:1.25rem}.email-icon{font-size:1.3rem}.email-top-actions{margin-left:auto}.email-config-btn{background:#ffffff22;color:white;border:1px solid #ffffff55;border-radius:9px;padding:8px 10px;text-decoration:none;font-weight:700}.email-layout{display:grid;grid-template-columns:330px 1fr;min-height:560px}.email-sidebar{border-right:1px solid #dde4ef;background:#f8fafc}.email-recipient-head{display:flex;align-items:center;gap:10px;padding:15px 14px;border-bottom:1px solid #dde4ef;font-size:1.05rem}.email-people{color:#4f46e5}.email-count{background:#e0e7ff;color:#4338ca;border-radius:9px;padding:3px 12px;font-weight:800;box-shadow:0 2px 6px #0001}.email-filter-bar{display:flex;gap:7px;flex-wrap:wrap;padding:12px 14px;border-bottom:1px solid #e7edf6}.email-chip{width:auto;border-radius:7px;padding:8px 10px;background:#eef2ff;color:#4338ca;font-weight:800}.email-chip.active{background:#4f46e5;color:#fff}.email-chip.paid{background:#dcfce7;color:#166534}.email-chip.unpaid{background:#fee2e2;color:#b91c1c}.email-chip.pending{background:#fef3c7;color:#92400e}.email-chip.committee{background:#f3e8ff;color:#7e22ce}.email-chip.none{background:#e2e8f0;color:#64748b}.email-search-wrap{padding:12px 14px}.email-search{background:#fff;padding-left:14px}.email-member-list{max-height:430px;overflow:auto}.email-member-card{display:grid;grid-template-columns:24px 1fr auto;gap:10px;align-items:center;padding:12px 14px;border-top:1px solid #edf2f7;background:#eef2ff;cursor:pointer;margin:0;font-weight:400}.email-member-card:hover{background:#e0e7ff}.email-member-card input{display:none}.email-check-ui{width:18px;height:18px;border-radius:6px;background:#4f46e5;color:#fff;display:grid;place-items:center;font-size:.78rem;font-weight:900}.email-member-card input:not(:checked)+.email-check-ui{background:#fff;color:transparent;border:2px solid #cbd5e1}.email-member-main strong{display:block;color:#1e293b}.email-member-main small,.email-callsign{display:block;color:#94a3b8;font-weight:700;margin-top:2px}.email-badge{border-radius:7px;padding:6px 9px;font-weight:800;font-size:.82rem}.email-badge.paid{background:#dcfce7;color:#166534}.email-badge.unpaid{background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5}.email-badge.pending{background:#fef3c7;color:#92400e}.email-empty{padding:14px}.email-compose{display:flex;flex-direction:column;background:#fff}.email-fields{padding:16px 22px;border-bottom:1px solid #dde4ef}.email-row{display:grid;grid-template-columns:70px 1fr;gap:12px;align-items:center;margin:8px 0}.email-row label{margin:0;text-align:right;color:#64748b}.email-row input{background:#f8fafc}.email-toolbar{display:flex;gap:14px;align-items:center;padding:12px 22px;border-bottom:1px solid #eef2f7}.email-attach-btn{display:inline-flex;align-items:center;gap:8px;width:auto;margin:0;padding:9px 12px;border:1px solid #dbe3ee;border-radius:9px;background:#fff;box-shadow:0 2px 5px #0001;cursor:pointer}.email-attach-btn input{display:none}.email-help{color:#94a3b8;font-weight:700}.email-help code{background:#eef2ff;color:#64748b;border-radius:5px;padding:2px 5px}.email-message{border:0;border-radius:0;min-height:330px;padding:22px;font-size:1rem;resize:vertical}.email-message:focus{outline:2px solid #c7d2fe;outline-offset:-2px}.email-sendbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:auto;padding:14px 22px;border-top:1px solid #eef2f7;background:#fbfdff}@media(max-width:900px){.email-layout{grid-template-columns:1fr}.email-sidebar{border-right:0;border-bottom:1px solid #dde4ef}.email-member-list{max-height:260px}.email-row{grid-template-columns:1fr}.email-row label{text-align:left}.email-sendbar{display:block}.email-sendbar div{margin-top:10px}}.role-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin:8px 0 12px}.role-grid .check{display:flex;align-items:center;gap:8px;margin:0;padding:8px 10px;border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc;font-weight:600;line-height:1.2;cursor:pointer}.role-grid .check:hover{background:#eef2ff;border-color:#c7d2fe}.role-grid .check input[type=checkbox]{width:18px;height:18px;min-width:18px;margin:0;accent-color:#1d4ed8}.role-grid .check span{display:inline-block}.role-grid .check input[disabled]+span{color:#64748b}.role-editor .role-grid{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}.audit-details{margin:4px 0}.audit-details summary{cursor:pointer;color:#1d4ed8;font-weight:700}.audit-change-table{margin-top:8px;font-size:.86rem}.audit-change-table th,.audit-change-table td{padding:6px;border:1px solid #e5e7eb;white-space:normal;max-width:260px}.audit-meta{white-space:pre-wrap;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:8px;max-width:420px;overflow:auto;font-size:.82rem}footer{text-align:center;color:#64748b;padding:24px}@media(max-width:800px){.two{grid-template-columns:1fr}.event-row{display:block}.calendar{grid-template-columns:1fr}.calendar-head{display:none}table{font-size:.9rem}}@media(max-width:720px){  header{padding:14px 12px}  header div{display:block}  header h1{font-size:1.25rem;margin:.2rem 0}  header span{display:block;font-size:.88rem;margin-top:2px}  .main-nav{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}  .main-nav a,.nav-drop{display:block;width:100%;box-sizing:border-box;text-align:center;padding:11px 10px}  .user-menu{margin-left:0}  .dropdown{padding-bottom:0;margin-bottom:0}  .dropdown::after{display:none}  .dropdown-menu,.dropdown-right{position:static;min-width:0;width:100%;box-sizing:border-box;margin-top:6px;box-shadow:none;border:1px solid #e5e7eb}  .dropdown-menu a{text-align:left}  main{margin:14px auto;padding:0 10px}  .card{border-radius:12px;padding:14px;margin:12px 0}  h1{font-size:1.55rem}  h2{font-size:1.25rem}  .grid,.two,.asset-grid,.stat-grid,.bw-steps{grid-template-columns:1fr}  .toolbar{display:grid;grid-template-columns:1fr;gap:8px}  .toolbar .btn,.toolbar button,.toolbar select{width:100%;box-sizing:border-box;text-align:center}  button,.btn{width:100%;box-sizing:border-box;text-align:center;margin:3px 0}  input,select,textarea{font-size:16px}  table{display:block;width:100%;overflow-x:auto;white-space:nowrap;font-size:.88rem}  th,td{padding:8px}  .event-row{display:block}  .event-actions{white-space:normal;margin-top:10px}  .calendar{display:block}  .calendar-head{display:none}  .calendar-day{min-height:auto;margin-bottom:8px}  .leaderboard-row{grid-template-columns:36px 1fr;align-items:start}  .leaderboard-row > .pill,.leaderboard-row > span:last-child{grid-column:2}  .bw-hero{grid-template-columns:1fr;text-align:left}  .bw-card-head{display:block}  .bw-status{margin-top:8px}  .bw-form button{width:100%}  .matrix-wrap{border-radius:10px}  .matrix{min-width:760px}  .modal{width:calc(100% - 18px);max-height:92vh;overflow:auto}  .modal-head{display:grid;grid-template-columns:1fr auto}  .attendance-modern-head{grid-template-columns:1fr;padding:18px 16px 10px}  .attendance-modern-head h2{font-size:1.45rem}  .attendance-date{font-size:1rem}  .attendance-counts{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}  .attendance-counts strong{font-size:1.15rem}  .attendance-modern-controls{grid-template-columns:1fr;padding:14px 16px;gap:9px}  .attendance-modern-row{grid-template-columns:34px 1fr;padding:14px 16px}  .attendance-row-status{grid-column:2;margin-top:4px}  .attendance-modern-footer{grid-template-columns:1fr;padding:14px 16px}  .attendance-savebar{display:block;padding:14px 16px}  .email-top{display:block}  .email-top-actions{margin-left:0;margin-top:10px}  .email-layout{grid-template-columns:1fr;min-height:0}  .email-sidebar{border-right:0;border-bottom:1px solid #dde4ef}  .email-filter-bar{display:grid;grid-template-columns:1fr 1fr}  .email-chip{width:100%}  .email-member-list{max-height:300px}  .email-member-card{grid-template-columns:24px 1fr;align-items:start}  .email-badge{grid-column:2;width:max-content}  .email-fields,.email-toolbar,.email-sendbar{padding:12px 14px}  .email-row{grid-template-columns:1fr}  .email-row label{text-align:left}  .email-toolbar{display:block}  .email-message{min-height:240px;padding:14px}  .role-grid{grid-template-columns:1fr}  .ticket-head{display:block}  .site-footer{margin-top:18px;padding:14px 10px;font-size:.88rem}}@media(max-width:420px){  .main-nav{grid-template-columns:1fr}  .attendance-counts{grid-template-columns:1fr}  .email-filter-bar{grid-template-columns:1fr}}';
     exit;
 }
 if (route() === 'email_open') {
@@ -1421,6 +1677,14 @@ if (route() === 'profile') {
     if ($_SERVER['REQUEST_METHOD']==='POST') {
         require_csrf();
         $emergencySummary = trim(($_POST['emergency_contact_name'] ?? '') . ' | ' . ($_POST['emergency_contact_relationship'] ?? '') . ' | ' . ($_POST['emergency_contact_phone'] ?? ''));
+        $oldDp = first('SELECT * FROM member_directory_preferences WHERE member_id=?',[$m['id']]) ?: [];
+        $oldAudit = [
+            'first_name'=>$m['first_name'] ?? '', 'last_name'=>$m['last_name'] ?? '', 'callsign'=>$m['callsign'] ?? '', 'licence_level'=>$m['licence_level'] ?? '', 'email'=>$m['email'] ?? '',
+            'phone'=>decrypt_value($m['phone_encrypted'] ?? '') ?: '', 'address'=>decrypt_value($m['address_encrypted'] ?? '') ?: '',
+            'emergency_contact_name'=>decrypt_value($m['emergency_contact_name_encrypted'] ?? '') ?: '', 'emergency_contact_relationship'=>decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '') ?: '', 'emergency_contact_phone'=>decrypt_value($m['emergency_contact_phone_encrypted'] ?? '') ?: '',
+            'show_in_directory'=>!empty($oldDp['show_callsign']) ? 'Yes' : 'No',
+            'email_comms'=>get_member_consent((int)$m['id'],'email_comms') ? 'Yes' : 'No', 'text_comms'=>get_member_consent((int)$m['id'],'text_comms') ? 'Yes' : 'No', 'whatsapp_community'=>get_member_consent((int)$m['id'],'whatsapp_community') ? 'Yes' : 'No'
+        ];
         exec_sql('UPDATE members SET first_name=?, last_name=?, callsign=?, licence_level=?, email=?, phone_encrypted=?, address_encrypted=?, emergency_contact_encrypted=?, emergency_contact_name_encrypted=?, emergency_contact_relationship_encrypted=?, emergency_contact_phone_encrypted=?, data_last_confirmed_at=datetime("now"), updated_at=datetime("now") WHERE id=?', [trim($_POST['first_name']),trim($_POST['last_name']),trim($_POST['callsign']),trim($_POST['licence_level']),trim($_POST['email']),encrypt_value(trim($_POST['phone'] ?? '')),encrypt_value(trim($_POST['address'] ?? '')),encrypt_value($emergencySummary),encrypt_value(trim($_POST['emergency_contact_name'] ?? '')),encrypt_value(trim($_POST['emergency_contact_relationship'] ?? '')),encrypt_value(trim($_POST['emergency_contact_phone'] ?? '')),$m['id']]);
         exec_sql('UPDATE users SET email=?, updated_at=datetime("now") WHERE id=?',[trim($_POST['email']),$u['id']]);
         exec_sql('INSERT OR IGNORE INTO member_directory_preferences (member_id, created_at, updated_at) VALUES (?, datetime("now"), datetime("now"))',[$m['id']]);
@@ -1430,7 +1694,14 @@ if (route() === 'profile') {
         $emailConsent = isset($_POST['consent_email_comms']) ? 1 : 0;
         exec_sql('UPDATE member_email_preferences SET receive_admin_emails=?, receive_subs_emails=?, receive_event_emails=?, receive_newsletter_emails=?, receive_brickworks_emails=?, updated_at=datetime("now") WHERE member_id=?',[$emailConsent,$emailConsent,$emailConsent,$emailConsent,$emailConsent,$m['id']]);
         save_consent_post((int)$m['id'], (int)$u['id']);
-        audit('profile.update','member',(int)$m['id'],'success',null,['fields_changed'=>['profile','directory_preferences','consents']]); flash('Profile updated.'); redirect('profile');
+        $newAudit = [
+            'first_name'=>trim($_POST['first_name'] ?? ''), 'last_name'=>trim($_POST['last_name'] ?? ''), 'callsign'=>trim($_POST['callsign'] ?? ''), 'licence_level'=>trim($_POST['licence_level'] ?? ''), 'email'=>trim($_POST['email'] ?? ''),
+            'phone'=>trim($_POST['phone'] ?? ''), 'address'=>trim($_POST['address'] ?? ''),
+            'emergency_contact_name'=>trim($_POST['emergency_contact_name'] ?? ''), 'emergency_contact_relationship'=>trim($_POST['emergency_contact_relationship'] ?? ''), 'emergency_contact_phone'=>trim($_POST['emergency_contact_phone'] ?? ''),
+            'show_in_directory'=>isset($_POST['show_in_directory']) ? 'Yes' : 'No',
+            'email_comms'=>isset($_POST['consent_email_comms']) ? 'Yes' : 'No', 'text_comms'=>isset($_POST['consent_text_comms']) ? 'Yes' : 'No', 'whatsapp_community'=>isset($_POST['consent_whatsapp_community']) ? 'Yes' : 'No'
+        ];
+        audit('profile.update','member',(int)$m['id'],'success',null,['field_changes'=>audit_field_changes($oldAudit,$newAudit)]); flash('Profile updated.'); redirect('profile');
     }
     audit('profile.view','member',(int)$m['id']);
     $dp = first('SELECT * FROM member_directory_preferences WHERE member_id=?',[$m['id']]) ?: [];
@@ -1451,31 +1722,6 @@ if (route() === 'directory') {
     echo '</table></div>'; page_footer(); exit;
 }
 
-if (route() === 'member_add') {
-    require_permission('edit_membership_db');
-    audit('member.add.view');
-    page_header('Add member');
-    if ($_SERVER['REQUEST_METHOD']==='POST') {
-        require_csrf();
-        $membershipNumber = can_edit_membership_number() ? trim($_POST['membership_number'] ?? '') : null;
-        $joinedBeforeSystem = isset($_POST['joined_before_system']) ? 1 : 0;
-        $dateJoined = $joinedBeforeSystem ? '' : trim($_POST['date_joined'] ?? '');
-        $emergencySummary = trim(($_POST['emergency_contact_name'] ?? '') . ' | ' . ($_POST['emergency_contact_relationship'] ?? '') . ' | ' . ($_POST['emergency_contact_phone'] ?? ''));
-        exec_sql('INSERT INTO members (membership_number,first_name,last_name,callsign,licence_level,email,phone_encrypted,address_encrypted,emergency_contact_encrypted,emergency_contact_name_encrypted,emergency_contact_relationship_encrypted,emergency_contact_phone_encrypted,date_joined,joined_before_system,renewal_date,membership_status,membership_type,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime("now"), datetime("now"))', [$membershipNumber ?: null,trim($_POST['first_name']),trim($_POST['last_name']),trim($_POST['callsign']),trim($_POST['licence_level']),trim($_POST['email']),encrypt_value(trim($_POST['phone'])),encrypt_value(trim($_POST['address'])),encrypt_value($emergencySummary),encrypt_value(trim($_POST['emergency_contact_name'] ?? '')),encrypt_value(trim($_POST['emergency_contact_relationship'] ?? '')),encrypt_value(trim($_POST['emergency_contact_phone'] ?? '')),$dateJoined,$joinedBeforeSystem,trim($_POST['renewal_date']),trim($_POST['membership_status']),trim($_POST['membership_type'])]);
-        $mid=(int)db()->lastInsertId();
-        exec_sql('INSERT INTO member_directory_preferences (member_id, created_at, updated_at) VALUES (?,datetime("now"),datetime("now"))',[$mid]);
-        exec_sql('INSERT INTO member_email_preferences (member_id, created_at, updated_at) VALUES (?,datetime("now"),datetime("now"))',[$mid]);
-        save_consent_post($mid, (int)$u['id']);
-        audit('member.create','member',$mid, 'success', null, ['new_member'=>['name'=>trim($_POST['first_name'].' '.$_POST['last_name']),'callsign'=>trim($_POST['callsign']),'email'=>trim($_POST['email']),'status'=>trim($_POST['membership_status'])]]);
-        flash('Member added.');
-        redirect('member_view&id='.$mid);
-    }
-    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Add member</h1><a class="btn secondary" href="?route=members">Back to members</a></div><p class="muted">Create the member record here. They can be linked to a user account later from the Users page.</p><form method="post">'.csrf_field().'<div class="two">';
-    if (can_edit_membership_number()) echo '<div><label>Membership number</label><input name="membership_number"></div>';
-    echo '<div><label>Callsign</label><input name="callsign"></div><div><label>First name</label><input name="first_name" required></div><div><label>Surname</label><input name="last_name" required></div><div><label>Email</label><input name="email" type="email" required></div><div><label>Licence level</label><input name="licence_level"></div><div><label>Phone</label><input name="phone"></div><div class="full"><label>Address</label><textarea name="address"></textarea></div><div class="full"><h3>Emergency contact</h3></div><div><label>Emergency contact name</label><input name="emergency_contact_name"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone"></div><div><label>Membership type</label><input name="membership_type"></div><div><label>Date joined</label><input name="date_joined" type="date"></div><div><label>Renewal date</label><input name="renewal_date" type="date"></div><div><label>Membership status</label><select name="membership_status"><option>active</option><option>pending</option><option>expired</option><option>former</option><option>suspended</option><option>honorary</option></select></div></div><label><input type="checkbox" name="joined_before_system"> Joined before system / date not on record</label><h3>Consents</h3>'.render_consent_checkboxes(0).'<p class="muted">Consents can also be updated later from the member record.</p><button>Add member</button></form></div>';
-    page_footer(); exit;
-}
-
 if (route() === 'members') {
     require_permission('view_membership_db'); audit('member_database.view'); page_header('Membership Database');
     if ($_SERVER['REQUEST_METHOD']==='POST') {
@@ -1486,16 +1732,57 @@ if (route() === 'members') {
             flash($msg);
             redirect('members');
         }
+        $membershipNumber = can_edit_membership_number() ? trim($_POST['membership_number'] ?? '') : null;
+        $joinedBeforeSystem = isset($_POST['joined_before_system']) ? 1 : 0;
+        $dateJoined = $joinedBeforeSystem ? '' : trim($_POST['date_joined'] ?? '');
+        $emergencySummary = trim(($_POST['emergency_contact_name'] ?? '') . ' | ' . ($_POST['emergency_contact_relationship'] ?? '') . ' | ' . ($_POST['emergency_contact_phone'] ?? ''));
+        exec_sql('INSERT INTO members (membership_number,first_name,last_name,callsign,licence_level,email,phone_encrypted,address_encrypted,emergency_contact_encrypted,emergency_contact_name_encrypted,emergency_contact_relationship_encrypted,emergency_contact_phone_encrypted,date_joined,joined_before_system,renewal_date,membership_status,membership_type,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime("now"), datetime("now"))', [$membershipNumber ?: null,trim($_POST['first_name']),trim($_POST['last_name']),trim($_POST['callsign']),trim($_POST['licence_level']),trim($_POST['email']),encrypt_value(trim($_POST['phone'])),encrypt_value(trim($_POST['address'])),encrypt_value($emergencySummary),encrypt_value(trim($_POST['emergency_contact_name'] ?? '')),encrypt_value(trim($_POST['emergency_contact_relationship'] ?? '')),encrypt_value(trim($_POST['emergency_contact_phone'] ?? '')),$dateJoined,$joinedBeforeSystem,trim($_POST['renewal_date']),trim($_POST['membership_status']),trim($_POST['membership_type'])]);
+        $mid=(int)db()->lastInsertId(); exec_sql('INSERT INTO member_directory_preferences (member_id, created_at, updated_at) VALUES (?,datetime("now"),datetime("now"))',[$mid]); exec_sql('INSERT INTO member_email_preferences (member_id, created_at, updated_at) VALUES (?,datetime("now"),datetime("now"))',[$mid]); save_consent_post($mid, (int)$u['id']); audit('member.create','member',$mid); flash('Member added.'); redirect('members');
     }
     $rows = all('SELECT * FROM members ORDER BY last_name, first_name');
-    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Membership database</h1><a class="btn" href="?route=member_export">Export all members spreadsheet</a>'; if (has_permission('edit_membership_db')) echo '<a class="btn secondary" href="?route=member_add">Add member</a>'; echo '</div><table><tr><th>No.</th><th>Name</th><th>Callsign</th><th>Status</th><th>Joined</th><th>Renewal</th><th>Attendance</th><th>Action</th></tr>';
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Membership database</h1><a class="btn" href="?route=member_export">Export all members spreadsheet</a>'; if (has_permission('edit_membership_db')) echo '<a class="btn secondary" href="?route=member_import">Import members</a>'; echo '</div><table><tr><th>No.</th><th>Name</th><th>Callsign</th><th>Status</th><th>Joined</th><th>Renewal</th><th>Attendance</th><th>Action</th></tr>';
     foreach($rows as $m){
         $st=attendance_stats((int)$m['id']);
         echo '<tr><td>'.e($m['membership_number']).'</td><td>'.e($m['first_name'].' '.$m['last_name']).'</td><td>'.e($m['callsign']).'</td><td>'.e($m['membership_status']).'</td><td>'.e(member_joined_display($m)).'</td><td>'.e($m['renewal_date']).'</td><td>'.e($st['signup_percent']===null?'N/A':$st['signup_percent'].'%').'</td><td><div class="toolbar"><a class="btn secondary" href="?route=member_view&id='.e($m['id']).'">Open</a>';
         if (has_permission('edit_membership_db')) echo '<form method="post" onsubmit="return confirm(&quot;Delete this member and all linked records? This cannot be undone.&quot;)">'.csrf_field().'<input type="hidden" name="delete_member" value="1"><input type="hidden" name="member_id" value="'.e($m['id']).'"><button class="danger">Delete</button></form>';
         echo '</div></td></tr>';
     }
-    echo '</table></div>';
+    echo '</table></div><div class="card"><h2>Add member</h2><form method="post">'.csrf_field().'<div class="two">';
+    if (can_edit_membership_number()) echo '<div><label>Membership number</label><input name="membership_number"></div>';
+    echo '<div><label>Callsign</label><input name="callsign"></div><div><label>First name</label><input name="first_name" required></div><div><label>Surname</label><input name="last_name" required></div><div><label>Email</label><input name="email" type="email" required></div><div><label>Licence level</label><input name="licence_level"></div><div><label>Phone</label><input name="phone"></div><div class="full"><label>Address</label><textarea name="address"></textarea></div><div class="full"><h3>Emergency contact</h3></div><div><label>Emergency contact name</label><input name="emergency_contact_name"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone"></div><div><label>Membership type</label><input name="membership_type"></div><div><label>Date joined</label><input name="date_joined" type="date"></div><div><label>Renewal date</label><input name="renewal_date" type="date"></div><div><label>Membership status</label><select name="membership_status"><option>active</option><option>pending</option><option>expired</option><option>former</option><option>suspended</option><option>honorary</option></select></div></div><label><input type="checkbox" name="joined_before_system"> Joined before system / date not on record</label><h3>Consents</h3>'.render_consent_checkboxes(0).'<p class="muted">Consents can also be set after the member has been created.</p><button>Add member</button></form></div>';
+    page_footer(); exit;
+}
+
+
+if (route() === 'member_import') {
+    require_permission('edit_membership_db');
+    page_header('Import members');
+    $summary = null;
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        require_csrf();
+        if (empty($_FILES['member_file']['tmp_name']) || !is_uploaded_file($_FILES['member_file']['tmp_name'])) {
+            $summary = ['created'=>0,'updated'=>0,'skipped'=>0,'payments'=>0,'errors'=>['No file was uploaded.']];
+        } else {
+            try {
+                $rows = import_spreadsheet_rows($_FILES['member_file']['tmp_name'], $_FILES['member_file']['name'] ?? 'members.xlsx');
+                $summary = import_members_from_rows($rows, !empty($_POST['update_existing']), !empty($_POST['import_payments']), (int)$u['id']);
+                audit('member.import', null, null, empty($summary['errors']) ? 'success' : 'partial', null, ['created'=>$summary['created'],'updated'=>$summary['updated'],'skipped'=>$summary['skipped'],'payments'=>$summary['payments'],'errors'=>$summary['errors']]);
+                flash('Import complete: '.$summary['created'].' created, '.$summary['updated'].' updated, '.$summary['skipped'].' skipped.');
+            } catch (Throwable $e) {
+                $summary = ['created'=>0,'updated'=>0,'skipped'=>0,'payments'=>0,'errors'=>[$e->getMessage()]];
+                audit('member.import', null, null, 'failed', $e->getMessage());
+            }
+        }
+    }
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Import members</h1><a class="btn secondary" href="?route=members">Back to members</a></div><p>Upload a <strong>.xlsx</strong> or <strong>.csv</strong> spreadsheet. The importer supports the current system export format and the CADARS member spreadsheet format.</p>';
+    echo '<div class="grid"><div><h3>Supported CADARS import headers</h3><p class="muted">Member Number, Full Name, Email, Phone, Callsign, License Class, Society Role, Payment Status, Payment Date, Membership Start, Active, Emergency Contact, Emergency Phone.</p></div><div><h3>Supported export headers</h3><p class="muted">Membership number, First name, Surname, Full name, Callsign, Licence level, Email, Phone, Address, Date joined, Renewal date, Membership status, Membership type, emergency contact fields and consent fields.</p></div></div>';
+    echo '<form method="post" enctype="multipart/form-data">'.csrf_field().'<div class="two"><div><label>Spreadsheet file</label><input type="file" name="member_file" accept=".xlsx,.csv,text/csv" required></div><div><label>Import options</label><label><input type="checkbox" name="update_existing" checked> Update existing members matched by membership number or email</label><label><input type="checkbox" name="import_payments" checked> Import payment status/date into subs history</label></div></div><p><button>Import members</button></p></form>';
+    echo '<p class="muted">For .xlsx imports the server needs the PHP zip extension. If import fails with a ZipArchive message, run <code>apt install php-zip -y && systemctl restart php8.1-fpm</code>.</p></div>';
+    if ($summary) {
+        echo '<div class="card"><h2>Import result</h2><div class="stat-grid"><div class="stat"><strong>'.e($summary['created']).'</strong><span>Created</span></div><div class="stat"><strong>'.e($summary['updated']).'</strong><span>Updated</span></div><div class="stat"><strong>'.e($summary['skipped']).'</strong><span>Skipped</span></div><div class="stat"><strong>'.e($summary['payments']).'</strong><span>Payment rows</span></div></div>';
+        if (!empty($summary['errors'])) { echo '<h3>Messages</h3><ul>'; foreach ($summary['errors'] as $err) echo '<li>'.e($err).'</li>'; echo '</ul>'; }
+        echo '</div>';
+    }
     page_footer(); exit;
 }
 
@@ -1605,9 +1892,23 @@ if (route() === 'member_view') {
         $joinedBeforeSystem = isset($_POST['joined_before_system']) ? 1 : 0;
         $dateJoined = $joinedBeforeSystem ? '' : trim($_POST['date_joined'] ?? '');
         $emergencySummary = trim(($_POST['emergency_contact_name'] ?? '') . ' | ' . ($_POST['emergency_contact_relationship'] ?? '') . ' | ' . ($_POST['emergency_contact_phone'] ?? ''));
+        $oldAudit = [
+            'membership_number'=>$m['membership_number'] ?? '', 'first_name'=>$m['first_name'] ?? '', 'last_name'=>$m['last_name'] ?? '', 'callsign'=>$m['callsign'] ?? '', 'licence_level'=>$m['licence_level'] ?? '', 'email'=>$m['email'] ?? '',
+            'phone'=>decrypt_value($m['phone_encrypted'] ?? '') ?: '', 'address'=>decrypt_value($m['address_encrypted'] ?? '') ?: '',
+            'emergency_contact_name'=>decrypt_value($m['emergency_contact_name_encrypted'] ?? '') ?: '', 'emergency_contact_relationship'=>decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '') ?: '', 'emergency_contact_phone'=>decrypt_value($m['emergency_contact_phone_encrypted'] ?? '') ?: '',
+            'date_joined'=>$m['date_joined'] ?? '', 'joined_before_system'=>!empty($m['joined_before_system']) ? 'Yes' : 'No', 'renewal_date'=>$m['renewal_date'] ?? '', 'membership_status'=>$m['membership_status'] ?? '', 'membership_type'=>$m['membership_type'] ?? '', 'notes'=>decrypt_value($m['notes_encrypted'] ?? '') ?: '',
+            'email_comms'=>get_member_consent($id,'email_comms') ? 'Yes' : 'No', 'text_comms'=>get_member_consent($id,'text_comms') ? 'Yes' : 'No', 'whatsapp_community'=>get_member_consent($id,'whatsapp_community') ? 'Yes' : 'No'
+        ];
         exec_sql('UPDATE members SET membership_number=?, first_name=?, last_name=?, callsign=?, licence_level=?, email=?, phone_encrypted=?, address_encrypted=?, emergency_contact_encrypted=?, emergency_contact_name_encrypted=?, emergency_contact_relationship_encrypted=?, emergency_contact_phone_encrypted=?, date_joined=?, joined_before_system=?, renewal_date=?, membership_status=?, membership_type=?, notes_encrypted=?, updated_at=datetime("now") WHERE id=?',[$membershipNumber ?: null,trim($_POST['first_name']),trim($_POST['last_name']),trim($_POST['callsign']),trim($_POST['licence_level']),trim($_POST['email']),encrypt_value(trim($_POST['phone'])),encrypt_value(trim($_POST['address'])),encrypt_value($emergencySummary),encrypt_value(trim($_POST['emergency_contact_name'] ?? '')),encrypt_value(trim($_POST['emergency_contact_relationship'] ?? '')),encrypt_value(trim($_POST['emergency_contact_phone'] ?? '')),$dateJoined,$joinedBeforeSystem,trim($_POST['renewal_date']),trim($_POST['membership_status']),trim($_POST['membership_type']),encrypt_value(trim($_POST['notes']??'')),$id]);
         save_consent_post($id, (int)$u['id']);
-        audit('member.update','member',$id,'success',null,['membership_number_changed'=>can_edit_membership_number()]); flash('Member updated.'); redirect('member_view&id='.$id);
+        $newAudit = [
+            'membership_number'=>$membershipNumber ?: '', 'first_name'=>trim($_POST['first_name'] ?? ''), 'last_name'=>trim($_POST['last_name'] ?? ''), 'callsign'=>trim($_POST['callsign'] ?? ''), 'licence_level'=>trim($_POST['licence_level'] ?? ''), 'email'=>trim($_POST['email'] ?? ''),
+            'phone'=>trim($_POST['phone'] ?? ''), 'address'=>trim($_POST['address'] ?? ''),
+            'emergency_contact_name'=>trim($_POST['emergency_contact_name'] ?? ''), 'emergency_contact_relationship'=>trim($_POST['emergency_contact_relationship'] ?? ''), 'emergency_contact_phone'=>trim($_POST['emergency_contact_phone'] ?? ''),
+            'date_joined'=>$dateJoined, 'joined_before_system'=>$joinedBeforeSystem ? 'Yes' : 'No', 'renewal_date'=>trim($_POST['renewal_date'] ?? ''), 'membership_status'=>trim($_POST['membership_status'] ?? ''), 'membership_type'=>trim($_POST['membership_type'] ?? ''), 'notes'=>trim($_POST['notes'] ?? ''),
+            'email_comms'=>isset($_POST['consent_email_comms']) ? 'Yes' : 'No', 'text_comms'=>isset($_POST['consent_text_comms']) ? 'Yes' : 'No', 'whatsapp_community'=>isset($_POST['consent_whatsapp_community']) ? 'Yes' : 'No'
+        ];
+        audit('member.update','member',$id,'success',null,['membership_number_changed'=>can_edit_membership_number(),'field_changes'=>audit_field_changes($oldAudit,$newAudit)]); flash('Member updated.'); redirect('member_view&id='.$id);
     }
     page_header('Member record'); $stats=attendance_stats($id);
     echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">'.e($m['first_name'].' '.$m['last_name']).'</h1><a class="btn secondary" href="?route=member_export">Export all members spreadsheet</a>';
@@ -1662,8 +1963,9 @@ if (route() === 'users') {
             $targetUserId = (int)$_POST['user_id'];
             $selectedRoles = $_POST['roles'] ?? [];
             if (!is_array($selectedRoles)) $selectedRoles = [];
+            $oldRoles = user_roles($targetUserId);
             $result = set_user_roles($targetUserId, array_map('strval', $selectedRoles), (int)$u['id'], trim($_POST['role_change_reason'] ?? 'Admin updated roles'));
-            audit('user.roles_updated','user',$targetUserId,'success',null,['added'=>$result['added'],'removed'=>$result['removed'],'final'=>$result['final']]);
+            audit('user.roles_updated','user',$targetUserId,'success',null,['added'=>$result['added'],'removed'=>$result['removed'],'final'=>$result['final'],'field_changes'=>['roles'=>['label'=>'Roles','old'=>implode(', ', $oldRoles),'new'=>implode(', ', $result['final'])]]]);
             flash('User roles updated.'); redirect('users');
         }
         if (isset($_POST['create_user'])) {
@@ -1774,8 +2076,11 @@ if (route() === 'equipment_view') {
         }
         if (isset($_POST['update_ticket'])) {
             $tid=(int)$_POST['ticket_id']; $status=$_POST['status'] ?? 'open';
+            $oldTicket = first('SELECT * FROM equipment_maintenance_tickets WHERE id=? AND equipment_id=?',[$tid,$id]) ?: [];
+            $oldAudit = ['status'=>$oldTicket['status'] ?? '', 'priority'=>$oldTicket['priority'] ?? '', 'due_date'=>$oldTicket['due_date'] ?? '', 'description'=>decrypt_value($oldTicket['description_encrypted'] ?? '') ?: '', 'action_taken'=>decrypt_value($oldTicket['action_taken_encrypted'] ?? '') ?: '', 'cost'=>$oldTicket['cost'] ?? '', 'assigned_user_id'=>$oldTicket['assigned_user_id'] ?? ''];
+            $newAudit = ['status'=>$status, 'priority'=>trim($_POST['priority'] ?? 'normal'), 'due_date'=>trim($_POST['due_date'] ?? ''), 'description'=>trim($_POST['description'] ?? ''), 'action_taken'=>trim($_POST['action_taken'] ?? ''), 'cost'=>($_POST['cost'] !== '' ? (float)$_POST['cost'] : null), 'assigned_user_id'=>!empty($_POST['assigned_user_id'])?(int)$_POST['assigned_user_id']:null];
             exec_sql('UPDATE equipment_maintenance_tickets SET status=?, priority=?, due_date=?, description_encrypted=?, action_taken_encrypted=?, cost=?, assigned_user_id=?, closed_at=CASE WHEN ?="closed" THEN COALESCE(closed_at, datetime("now")) ELSE NULL END, updated_at=datetime("now") WHERE id=? AND equipment_id=?',[$status,trim($_POST['priority'] ?? 'normal'),trim($_POST['due_date'] ?? ''),encrypt_value(trim($_POST['description'] ?? '')),encrypt_value(trim($_POST['action_taken'] ?? '')),($_POST['cost'] !== '' ? (float)$_POST['cost'] : null),!empty($_POST['assigned_user_id'])?(int)$_POST['assigned_user_id']:null,$status,$tid,$id]);
-            audit('equipment.ticket_update','equipment_maintenance_ticket',$tid); flash('Maintenance ticket updated.'); redirect('equipment_view&id='.$id);
+            audit('equipment.ticket_update','equipment_maintenance_ticket',$tid,'success',null,['equipment_id'=>$id,'field_changes'=>audit_field_changes($oldAudit,$newAudit)]); flash('Maintenance ticket updated.'); redirect('equipment_view&id='.$id);
         }
     }
     page_header('Asset details');
@@ -1830,12 +2135,12 @@ if (route() === 'committee_actions') {
                 if ((string)$oldVal !== (string)$newVal) $changes[$field]=['from'=>$oldVal,'to'=>$newVal];
             }
             $oldDesc=decrypt_value($old['description_encrypted'] ?? '') ?: '';
-            if ($oldDesc !== $newVals['description']) $changes['description']=['from'=>'[previous description]','to'=>'[updated description]'];
+            if ($oldDesc !== $newVals['description']) $changes['description']=['label'=>'Description','old'=>$oldDesc,'new'=>$newVals['description']];
             exec_sql('UPDATE committee_actions SET title=?, status=?, priority=?, action_required=?, description_encrypted=?, due_date=?, assigned_user_id=NULL, assigned_member_id=?, completed_at=CASE WHEN ?="closed" THEN COALESCE(completed_at, datetime("now")) ELSE NULL END, updated_at=datetime("now") WHERE id=?',[
                 $newVals['title'],$newVals['status'],$newVals['priority'],$newVals['action_required'],encrypt_value($newVals['description']),$newVals['due_date'],$newVals['assigned_member_id'],$status,$aid
             ]);
             record_action_history($aid, 'field_change', trim($_POST['update_note'] ?? ''), $changes);
-            audit('committee_action.update','committee_action',$aid,'success',null,['changes'=>array_keys($changes)]); flash('Committee action updated.'); redirect('committee_actions');
+            audit('committee_action.update','committee_action',$aid,'success',null,['field_changes'=>$changes]); flash('Committee action updated.'); redirect('committee_actions');
         }
     }
     echo '<div class="card"><h1>Committee actions</h1><p class="muted">Track committee tasks/actions in a simple ticket-style list. Actions are assigned to members, and each ticket keeps an update/history log.</p></div>';
@@ -1955,10 +2260,17 @@ if (route() === 'event_view') {
         if (isset($_POST['add_guest_attendance'])) { require_permission('track_attendance'); $guestName=trim($_POST['guest_name'] ?? ''); if($guestName!==''){ exec_sql('INSERT INTO event_guests (event_id,name,comment_encrypted,attended,added_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,datetime("now"),datetime("now"))',[$id,$guestName,encrypt_value(trim($_POST['guest_comment'] ?? '')),0,$u['id']]); audit('attendance.guest_added','event',$id); flash('Guest / visitor added.'); } redirect('event_view&id='.$id); }
         if (isset($_POST['mark_attendance'])) { require_permission('track_attendance');
             $checkedMembers=$_POST['member_attended'] ?? [];
-            $activeMembers=all('SELECT m.id, ea.id attendance_id FROM members m LEFT JOIN event_attendance ea ON ea.member_id=m.id AND ea.event_id=? WHERE m.membership_status IN ("active","honorary","life_member")',[$id]);
+            $oldMemberRows=all('SELECT ea.member_id,ea.attended,ea.status,m.first_name,m.last_name,m.callsign FROM event_attendance ea JOIN members m ON m.id=ea.member_id WHERE ea.event_id=?',[$id]);
+            $oldMemberState=[]; foreach($oldMemberRows as $om){ $oldMemberState[(int)$om['member_id']]=$om; }
+            $memberChanges=[]; $guestChanges=[];
+            $activeMembers=all('SELECT m.id,m.first_name,m.last_name,m.callsign, ea.id attendance_id FROM members m LEFT JOIN event_attendance ea ON ea.member_id=m.id AND ea.event_id=? WHERE m.membership_status IN ("active","honorary","life_member")',[$id]);
             foreach($activeMembers as $row){
                 $memberId=(int)$row['id'];
                 $isAttended=isset($checkedMembers[$memberId]) ? 1 : 0;
+                $oldPresent = !empty($oldMemberState[$memberId]) && (int)($oldMemberState[$memberId]['attended'] ?? 0) === 1;
+                if ($oldPresent !== (bool)$isAttended) {
+                    $memberChanges['member_'.$memberId] = ['label'=>trim(($row['first_name'] ?? '').' '.($row['last_name'] ?? '')).(($row['callsign'] ?? '') ? ' ('.$row['callsign'].')' : ''),'old'=>$oldPresent ? 'Present' : 'Absent','new'=>$isAttended ? 'Present' : 'Absent'];
+                }
                 if ($isAttended) {
                     exec_sql('INSERT OR IGNORE INTO event_attendance (event_id,member_id,status,attended,signed_up_at,marked_at,marked_by_user_id,created_at,updated_at) VALUES (?, ?, "attended", 1, COALESCE((SELECT signed_up_at FROM event_attendance WHERE event_id=? AND member_id=?), datetime("now")), datetime("now"), ?, datetime("now"), datetime("now"))',[$id,$memberId,$id,$memberId,$u['id']]);
                     exec_sql('UPDATE event_attendance SET attended=1, status="attended", marked_at=datetime("now"), marked_by_user_id=?, updated_at=datetime("now") WHERE event_id=? AND member_id=?',[$u['id'],$id,$memberId]);
@@ -1966,8 +2278,8 @@ if (route() === 'event_view') {
                     exec_sql('UPDATE event_attendance SET attended=0, status="did_not_attend", marked_at=datetime("now"), marked_by_user_id=?, updated_at=datetime("now") WHERE event_id=? AND member_id=?',[$u['id'],$id,$memberId]);
                 }
             }
-            $guestRows=all('SELECT id FROM event_guests WHERE event_id=?',[$id]); $checkedGuests=$_POST['guest_attended'] ?? []; foreach($guestRows as $row){ $guestId=(int)$row['id']; $isAttended=isset($checkedGuests[$guestId]) ? 1 : 0; $comment=trim($_POST['guest_comment_existing'][$guestId] ?? ''); exec_sql('UPDATE event_guests SET attended=?, comment_encrypted=?, updated_at=datetime("now") WHERE event_id=? AND id=?',[$isAttended,encrypt_value($comment),$id,$guestId]); }
-            audit('attendance.update','event',$id); flash('Attendance updated.'); redirect('event_view&id='.$id); }
+            $guestRows=all('SELECT id,name,attended,comment_encrypted FROM event_guests WHERE event_id=?',[$id]); $checkedGuests=$_POST['guest_attended'] ?? []; foreach($guestRows as $row){ $guestId=(int)$row['id']; $isAttended=isset($checkedGuests[$guestId]) ? 1 : 0; $comment=trim($_POST['guest_comment_existing'][$guestId] ?? ''); $oldPresent=(int)($row['attended'] ?? 0)===1; $oldComment=decrypt_value($row['comment_encrypted'] ?? '') ?: ''; if($oldPresent !== (bool)$isAttended || $oldComment !== $comment){ $guestChanges['guest_'.$guestId]=['label'=>'Guest: '.($row['name'] ?? $guestId),'old'=>($oldPresent?'Present':'Absent').($oldComment!==''?' / '.$oldComment:''),'new'=>($isAttended?'Present':'Absent').($comment!==''?' / '.$comment:'')]; } exec_sql('UPDATE event_guests SET attended=?, comment_encrypted=?, updated_at=datetime("now") WHERE event_id=? AND id=?',[$isAttended,encrypt_value($comment),$id,$guestId]); }
+            audit('attendance.update','event',$id,'success',null,['field_changes'=>array_merge($memberChanges,$guestChanges),'member_changes'=>count($memberChanges),'guest_changes'=>count($guestChanges)]); flash('Attendance updated.'); redirect('event_view&id='.$id); }
     }
     page_header($ev['title']);
     echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">'.e($ev['title']).'</h1>';
@@ -2017,9 +2329,11 @@ if (route() === 'event_edit') {
     $id=(int)($_GET['id']??0); $ev=first('SELECT * FROM events WHERE id=?',[$id]); if(!$ev) redirect('events');
     if ($_SERVER['REQUEST_METHOD']==='POST') { require_csrf();
         $category = in_array($_POST['event_type'] ?? '', event_categories(), true) ? $_POST['event_type'] : 'Other';
+        $oldAudit = ['title'=>$ev['title'] ?? '', 'event_type'=>$ev['event_type'] ?? '', 'description'=>$ev['description'] ?? '', 'location'=>$ev['location'] ?? '', 'start_at'=>$ev['start_at'] ?? '', 'end_at'=>$ev['end_at'] ?? '', 'max_attendees'=>$ev['max_attendees'] ?? ''];
+        $newAudit = ['title'=>trim($_POST['title'] ?? ''), 'event_type'=>$category, 'description'=>trim($_POST['description'] ?? ''), 'location'=>trim($_POST['location'] ?? ''), 'start_at'=>trim($_POST['start_at'] ?? ''), 'end_at'=>trim($_POST['end_at'] ?? ''), 'max_attendees'=>(int)($_POST['max_attendees']?:0)];
         exec_sql('UPDATE events SET title=?, event_type=?, description=?, location=?, start_at=?, end_at=?, max_attendees=?, updated_at=datetime("now") WHERE id=?',[trim($_POST['title']),$category,trim($_POST['description']),trim($_POST['location']),trim($_POST['start_at']),trim($_POST['end_at']),(int)($_POST['max_attendees']?:0),$id]);
         if (!empty($_FILES['attachment']['name']) && $_FILES['attachment']['error']===UPLOAD_ERR_OK) { $mime=mime_content_type($_FILES['attachment']['tmp_name']) ?: 'application/octet-stream'; $stored=bin2hex(random_bytes(18)).'-'.preg_replace('/[^A-Za-z0-9._-]/','_',$_FILES['attachment']['name']); $dest=PRIVATE_PATH.'/event-attachments/'.$stored; if(!is_dir(dirname($dest))) mkdir(dirname($dest),0750,true); move_uploaded_file($_FILES['attachment']['tmp_name'],$dest); exec_sql('INSERT INTO event_attachments (event_id,original_filename,stored_filename,mime_type,file_size,uploaded_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?,datetime("now"),datetime("now"))',[$id,$_FILES['attachment']['name'],$stored,$mime,(int)$_FILES['attachment']['size'],$u['id']]); audit('event.attachment_uploaded','event',$id); }
-        audit('event.update','event',$id); flash('Event updated.'); redirect('event_view&id='.$id);
+        audit('event.update','event',$id,'success',null,['field_changes'=>audit_field_changes($oldAudit,$newAudit)]); flash('Event updated.'); redirect('event_view&id='.$id);
     }
     page_header('Edit event');
     echo '<div class="card"><h1>Edit event</h1><form method="post" enctype="multipart/form-data">'.csrf_field().'<div class="two"><div><label>Title</label><input name="title" value="'.e($ev['title']).'" required></div><div><label>Category</label><select name="event_type">'.event_category_options($ev['event_type']).'</select></div><div><label>Location</label><input name="location" value="'.e($ev['location']).'"></div><div><label>Start</label><input name="start_at" type="datetime-local" value="'.e(str_replace(' ','T',substr($ev['start_at'],0,16))).'" required></div><div><label>End</label><input name="end_at" type="datetime-local" value="'.e($ev['end_at']?str_replace(' ','T',substr($ev['end_at'],0,16)):'').'"></div><div><label>Max attendees</label><input name="max_attendees" type="number" value="'.e($ev['max_attendees']).'"></div></div><label>Description</label><textarea name="description">'.e($ev['description']).'</textarea><label>Add attachment</label><input type="file" name="attachment"><p><button>Save changes</button> <a class="btn secondary" href="?route=event_view&id='.e($id).'">Cancel</a></p></form></div>';
@@ -2168,8 +2482,11 @@ if (route() === 'brickworks_manage') {
         $status=$_POST['status'] ?? 'not_completed';
         if (!in_array($status, ['not_completed','pending_approval','complete'], true)) $status='not_completed';
         $completedAt = $status === 'complete' ? (trim($_POST['completed_at'] ?? '') ?: date('Y-m-d')) : null;
+        $oldProgress = first('SELECT * FROM brickworks_progress WHERE id=?',[$progressId]) ?: [];
+        $oldAudit = ['status'=>$oldProgress['status'] ?? '', 'reviewer_comment'=>decrypt_value($oldProgress['reviewer_comment_encrypted'] ?? '') ?: '', 'completed_at'=>$oldProgress['completed_at'] ?? ''];
+        $newAudit = ['status'=>$status, 'reviewer_comment'=>trim($_POST['reviewer_comment'] ?? ''), 'completed_at'=>$completedAt ?: ''];
         exec_sql('UPDATE brickworks_progress SET status=?, reviewer_comment_encrypted=?, completed_at=?, reviewed_by_user_id=?, reviewed_at=datetime("now"), updated_at=datetime("now") WHERE id=?',[$status,encrypt_value(trim($_POST['reviewer_comment'] ?? '')),$completedAt,$u['id'],$progressId]);
-        audit('brickworks.status.update','brickworks_progress',$progressId,'success',null,['status'=>$status]); flash('Brickworks progress updated.'); redirect('brickworks_manage');
+        audit('brickworks.status.update','brickworks_progress',$progressId,'success',null,['status'=>$status,'field_changes'=>audit_field_changes($oldAudit,$newAudit)]); flash('Brickworks progress updated.'); redirect('brickworks_manage');
     }
     $progressRows=all('SELECT bp.*,b.member_id,bc.title FROM brickworks_progress bp JOIN brickworks_participants b ON b.id=bp.participant_id JOIN brickworks_criteria bc ON bc.id=bp.criterion_id ORDER BY b.member_id,bc.sort_order');
     $progress=[]; foreach($progressRows as $pr){ $progress[(int)$pr['participant_id']][(int)$pr['criterion_id']]=$pr; }
@@ -2197,7 +2514,7 @@ if (route() === 'brickworks_manage') {
 
 if (route() === 'brickworks_review') {
     require_permission('review_brickworks_evidence'); page_header('Brickworks Review'); audit('brickworks.review.view');
-    if ($_SERVER['REQUEST_METHOD']==='POST') { require_csrf(); $pid=(int)$_POST['progress_id']; $status=$_POST['decision']==='approve'?'complete':'pending_approval'; exec_sql('UPDATE brickworks_progress SET status=?, reviewer_comment_encrypted=?, completed_at=CASE WHEN ?="complete" THEN date("now") ELSE completed_at END, reviewed_by_user_id=?, reviewed_at=datetime("now"), updated_at=datetime("now") WHERE id=?',[$status,encrypt_value($_POST['reviewer_comment']??''),$status,$u['id'],$pid]); audit('brickworks.criteria.approve','brickworks_progress',$pid,'success',null,['decision'=>$_POST['decision']]); flash('Review saved.'); redirect('brickworks_review'); }
+    if ($_SERVER['REQUEST_METHOD']==='POST') { require_csrf(); $pid=(int)$_POST['progress_id']; $status=$_POST['decision']==='approve'?'complete':'pending_approval'; $oldProgress=first('SELECT * FROM brickworks_progress WHERE id=?',[$pid]) ?: []; $oldAudit=['status'=>$oldProgress['status'] ?? '', 'reviewer_comment'=>decrypt_value($oldProgress['reviewer_comment_encrypted'] ?? '') ?: '', 'completed_at'=>$oldProgress['completed_at'] ?? '']; $newAudit=['status'=>$status, 'reviewer_comment'=>$_POST['reviewer_comment'] ?? '', 'completed_at'=>$status==='complete'?date('Y-m-d'):($oldProgress['completed_at'] ?? '')]; exec_sql('UPDATE brickworks_progress SET status=?, reviewer_comment_encrypted=?, completed_at=CASE WHEN ?="complete" THEN date("now") ELSE completed_at END, reviewed_by_user_id=?, reviewed_at=datetime("now"), updated_at=datetime("now") WHERE id=?',[$status,encrypt_value($_POST['reviewer_comment']??''),$status,$u['id'],$pid]); audit('brickworks.criteria.approve','brickworks_progress',$pid,'success',null,['decision'=>$_POST['decision'],'field_changes'=>audit_field_changes($oldAudit,$newAudit)]); flash('Review saved.'); redirect('brickworks_review'); }
     $rows=all('SELECT bp.*,bc.title,m.first_name,m.last_name,m.callsign FROM brickworks_progress bp JOIN brickworks_participants b ON b.id=bp.participant_id JOIN members m ON m.id=b.member_id JOIN brickworks_criteria bc ON bc.id=bp.criterion_id WHERE bp.status="pending_approval" ORDER BY bp.submitted_at');
     echo '<div class="card"><h1>Pending Brickworks evidence</h1><table><tr><th>Member</th><th>Criteria</th><th>Comment</th><th>Decision</th></tr>'; foreach($rows as $r) echo '<tr><td>'.e($r['first_name'].' '.$r['last_name'].' '.$r['callsign']).'</td><td>'.e($r['title']).'</td><td>'.e(decrypt_value($r['member_comment_encrypted'])).'</td><td><form method="post">'.csrf_field().'<input type="hidden" name="progress_id" value="'.e($r['id']).'"><textarea name="reviewer_comment" placeholder="Reviewer comment"></textarea><select name="decision"><option value="approve">Approve</option><option value="more">Request more evidence</option></select><button>Save review</button></form></td></tr>'; echo '</table></div>'; page_footer(); exit;
 }
@@ -2388,38 +2705,8 @@ if (route() === 'email_config') {
 
 if (route() === 'audit') {
     require_permission('view_audit_logs'); audit('audit.view'); page_header('Audit Logs');
-    $q = trim($_GET['q'] ?? '');
-    $result = trim($_GET['result'] ?? '');
-    $action = trim($_GET['action'] ?? '');
-    $where = []; $args = [];
-    if ($q !== '') { $where[] = '(a.action LIKE ? OR a.entity_type LIKE ? OR a.reason LIKE ? OR a.ip_address LIKE ? OR u.email LIKE ? OR a.metadata LIKE ?)'; for($i=0;$i<6;$i++) $args[] = '%' . $q . '%'; }
-    if ($result !== '') { $where[] = 'a.result=?'; $args[] = $result; }
-    if ($action !== '') { $where[] = 'a.action LIKE ?'; $args[] = '%' . $action . '%'; }
-    $sqlWhere = $where ? ('WHERE ' . implode(' AND ', $where)) : '';
-    $rows=all('SELECT a.*,u.email FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_user_id '.$sqlWhere.' ORDER BY a.created_at DESC LIMIT 200', $args);
-    $stats = ['success'=>0,'failed'=>0,'denied'=>0,'other'=>0];
-    foreach($rows as $sr){ $key=$sr['result'] ?: 'other'; if(isset($stats[$key])) $stats[$key]++; else $stats['other']++; }
-    echo '<style>.audit-hero{display:grid;grid-template-columns:1fr auto;gap:16px;align-items:center}.audit-filters{display:grid;grid-template-columns:1fr 180px 220px auto;gap:10px;align-items:end}.audit-totals{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-top:14px}.audit-total{background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:12px}.audit-total span{display:block;color:#64748b;font-weight:700}.audit-total strong{font-size:1.45rem}.audit-list{display:grid;gap:12px}.audit-item{border:1px solid #e5e7eb;border-radius:16px;background:#fff;padding:14px;box-shadow:0 1px 4px #00000008}.audit-item-head{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:start}.audit-action{font-size:1.05rem;font-weight:800}.audit-time{color:#64748b;font-size:.92rem;margin-top:3px}.audit-pill{display:inline-block;border-radius:999px;padding:5px 10px;font-weight:800;font-size:.82rem}.audit-pill.success{background:#dcfce7;color:#166534}.audit-pill.failed{background:#fee2e2;color:#991b1b}.audit-pill.denied{background:#fef3c7;color:#92400e}.audit-pill.other{background:#e2e8f0;color:#334155}.audit-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-top:12px}.audit-meta div,.audit-kv{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:8px;color:#334155}.audit-kv{display:inline-block;margin:8px 6px 0 0}.audit-changes{margin-top:12px}.audit-change-table{margin-top:8px}.audit-change-table code{white-space:pre-wrap;word-break:break-word}.audit-details{margin-top:10px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:9px}.audit-details summary{cursor:pointer;font-weight:700}.audit-details pre{white-space:pre-wrap;word-break:break-word;max-height:320px;overflow:auto}.audit-empty{text-align:center;padding:28px;color:#64748b}@media(max-width:720px){.audit-hero,.audit-filters,.audit-item-head{grid-template-columns:1fr}.audit-filters button{width:100%}}</style>';
-    echo '<div class="card"><div class="audit-hero"><div><h1>Audit logs</h1><p class="muted">Review views, edits, exports, failed access attempts and admin changes. Expand entries to inspect old/new values and IP/header details.</p></div><a class="btn secondary" href="?route=audit">Clear filters</a></div>';
-    echo '<form class="audit-filters" method="get"><input type="hidden" name="route" value="audit"><div><label>Search</label><input name="q" value="'.e($q).'" placeholder="user, action, IP, field or entity"></div><div><label>Result</label><select name="result"><option value="">All</option>'; foreach(['success','failed','denied'] as $opt) echo '<option value="'.e($opt).'" '.($result===$opt?'selected':'').'>'.e(ucfirst($opt)).'</option>'; echo '</select></div><div><label>Action contains</label><input name="action" value="'.e($action).'" placeholder="member.update"></div><div><button>Filter</button></div></form>';
-    echo '<div class="audit-totals"><div class="audit-total"><span>Showing</span><strong>'.count($rows).'</strong></div><div class="audit-total"><span>Success</span><strong>'.e($stats['success']).'</strong></div><div class="audit-total"><span>Failed</span><strong>'.e($stats['failed']).'</strong></div><div class="audit-total"><span>Denied</span><strong>'.e($stats['denied']).'</strong></div></div></div>';
-    echo '<div class="audit-list">';
-    if (!$rows) echo '<div class="card audit-empty">No audit entries match those filters.</div>';
-    foreach($rows as $r) {
-        $meta = json_decode($r['metadata'] ?? '', true); if (!is_array($meta)) $meta = [];
-        $ipDetails = $meta['ip_details'] ?? [];
-        $pill = in_array($r['result'], ['success','failed','denied'], true) ? $r['result'] : 'other';
-        echo '<div class="audit-item"><div class="audit-item-head"><div><div class="audit-action">'.e($r['action']).'</div><div class="audit-time">'.e($r['created_at']).'</div></div><span class="audit-pill '.e($pill).'">'.e(strtoupper($r['result'] ?: 'other')).'</span></div>';
-        echo '<div class="audit-meta"><div><strong>User</strong><br>'.e($r['email'] ?: 'System / unknown').'</div><div><strong>Entity</strong><br>'.e(($r['entity_type'] ?: 'none') . ($r['entity_id'] ? ' #' . $r['entity_id'] : '')).'</div><div><strong>IP</strong><br>'.e($r['ip_address'] ?: 'not recorded').'</div><div><strong>Reason</strong><br>'.e($r['reason'] ?: '—').'</div></div>';
-        $summary = audit_meta_summary_html($meta); if ($summary) echo '<div>'.$summary.'</div>';
-        echo audit_change_html($meta);
-        $metaNoIp = $meta; unset($metaNoIp['ip_details']);
-        echo audit_json_details_html($metaNoIp, 'More data');
-        if (is_array($ipDetails) && $ipDetails) echo audit_json_details_html($ipDetails, 'IP/header details');
-        echo '</div>';
-    }
-    echo '</div>';
-    page_footer(); exit;
+    $rows=all('SELECT a.*,u.email FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_user_id ORDER BY a.created_at DESC LIMIT 250');
+    echo '<div class="card"><h1>Audit logs</h1><p class="muted">Change logs show old and new values where the system captured them. Treat this page as sensitive member data.</p><table><tr><th>Time</th><th>User</th><th>Action</th><th>Entity</th><th>Result</th><th>Reason</th><th>IP</th><th>Details</th></tr>'; foreach($rows as $r) echo '<tr><td>'.e($r['created_at']).'</td><td>'.e($r['email']).'</td><td>'.e($r['action']).'</td><td>'.e($r['entity_type'].' #'.$r['entity_id']).'</td><td>'.e($r['result']).'</td><td>'.e($r['reason']).'</td><td>'.e($r['ip_address']).'</td><td>'.audit_metadata_html($r['metadata']).'</td></tr>'; echo '</table></div>'; page_footer(); exit;
 }
 
 

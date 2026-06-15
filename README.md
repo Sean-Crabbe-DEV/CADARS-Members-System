@@ -250,3 +250,14 @@ The next step should be replacing the basic email sender with a real SMTP/MIME m
 ## Audit logging detail
 
 Audit logs now capture expanded metadata for data changes, including old and new values where available. This is applied to member/profile edits, role changes, event edits, attendance register updates, committee action updates, equipment maintenance tickets, and Brickworks review/status changes. Audit log details are visible from the Audit logs page.
+
+## Member spreadsheet imports
+
+The Membership database now includes an Import members page. It supports CSV and XLSX uploads in either the system export format or the CADARS spreadsheet format with headers such as Member Number, Full Name, Email, Phone, Callsign, License Class, Society Role, Payment Status, Payment Date, Membership Start, Active, Emergency Contact and Emergency Phone.
+
+XLSX import requires the PHP zip extension:
+
+```bash
+apt install php-zip -y
+systemctl restart php8.1-fpm
+```
