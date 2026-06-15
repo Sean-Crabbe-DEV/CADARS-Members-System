@@ -1973,6 +1973,47 @@ if (route() === 'member_view') {
     page_footer(); exit;
 }
 
+
+if (route() === 'user_invite') {
+    require_permission('manage_users');
+    page_header('Invite new user');
+    audit('user_invite.view');
+
+    $canRoles = has_permission('manage_roles');
+    $allRoles = all('SELECT name, display_name, description FROM roles ORDER BY CASE name WHEN "member" THEN 1 WHEN "committee" THEN 2 WHEN "chair" THEN 3 WHEN "vice_chair" THEN 4 WHEN "secretary" THEN 5 WHEN "member_db" THEN 6 WHEN "brickworks_reviewer" THEN 7 WHEN "equipment_manager" THEN 8 WHEN "event_manager" THEN 9 WHEN "treasurer" THEN 10 WHEN "admin" THEN 99 ELSE 50 END, display_name');
+    $members = all('SELECT id,first_name,last_name,callsign,email FROM members ORDER BY last_name,first_name');
+
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Invite new user</h1><a class="btn secondary" href="?route=users">Back to users</a></div><p class="muted">Creates the account and emails a secure setup link. The user sets their own password on first login.</p></div>';
+    echo '<div class="card"><form method="post" action="?route=users">'.csrf_field().'<input type="hidden" name="invite_user" value="1"><div class="two"><div><label>Link to member</label><select name="member_id"><option value="">None</option>';
+    foreach($members as $m) echo '<option value="'.e($m['id']).'">'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'').' / '.$m['email']).'</option>';
+    echo '</select></div><div><label>Email address</label><input type="email" name="email" required placeholder="user@example.com"></div></div>';
+    if ($canRoles) {
+        echo '<h2>Initial roles</h2><p class="muted small">The Member role is always included. Add any extra roles needed.</p><div class="role-grid">';
+        foreach($allRoles as $role){
+            $checked = $role['name']==='member' ? 'checked disabled' : '';
+            if($role['name']==='member') echo '<input type="hidden" name="roles[]" value="member">';
+            echo '<label class="check"><input type="checkbox" name="roles[]" value="'.e($role['name']).'" '.$checked.'><span><strong>'.e($role['display_name']).'</strong><small>'.e($role['description'] ?: $role['name']).'</small></span></label>';
+        }
+        echo '</div>';
+    }
+    echo '<button>Send invite</button></form></div>';
+    page_footer(); exit;
+}
+
+if (route() === 'user_create') {
+    require_permission('manage_users');
+    page_header('Create user');
+    audit('user_create.view');
+
+    $members = all('SELECT id,first_name,last_name,callsign,email FROM members ORDER BY last_name,first_name');
+
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Create user manually</h1><a class="btn secondary" href="?route=users">Back to users</a></div><p class="muted">Fallback option only. Prefer sending an invite where possible. Manual users are forced to change their temporary password after login.</p></div>';
+    echo '<div class="card"><form method="post" action="?route=users">'.csrf_field().'<input type="hidden" name="create_user" value="1"><div class="two"><div><label>Link to member</label><select name="member_id"><option value="">None</option>';
+    foreach($members as $m) echo '<option value="'.e($m['id']).'">'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'').' / '.$m['email']).'</option>';
+    echo '</select></div><div><label>Email address</label><input type="email" name="email" required placeholder="user@example.com"></div><div><label>Temporary password</label><input name="password" required minlength="10" placeholder="Minimum 10 characters"></div></div><button>Create user</button></form></div>';
+    page_footer(); exit;
+}
+
 if (route() === 'users') {
     require_permission('manage_users'); page_header('Users'); audit('users.view');
     if ($_SERVER['REQUEST_METHOD']==='POST') { require_csrf();
@@ -2058,19 +2099,8 @@ if (route() === 'users') {
 
     echo '<div class="card users-hero"><div><h1>Users</h1><p class="muted">Create accounts, send invites, reset passwords and manage user roles. Invite/reset links let users set their own password securely.</p></div><div class="users-stats"><div><strong>'.e(count($users)).'</strong><span>Total users</span></div><div><strong>'.e($activeCount).'</strong><span>Active</span></div><div><strong>'.e($adminCount).'</strong><span>Admins</span></div><div><strong>'.e($setupRequired).'</strong><span>Setup required</span></div></div></div>';
 
-    echo '<div class="users-layout">';
-    echo '<aside class="users-side">';
-    echo '<div class="card"><h2>Invite new user</h2><p class="muted small">Best option. Creates the account and emails a secure setup link.</p><form method="post">'.csrf_field().'<input type="hidden" name="invite_user" value="1"><label>Link to member</label><select name="member_id"><option value="">None</option>';
-    foreach($members as $m) echo '<option value="'.e($m['id']).'">'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'').' / '.$m['email']).'</option>';
-    echo '</select><label>Email</label><input type="email" name="email" required>';
-    if ($canRoles) { echo '<label>Initial roles</label><div class="role-grid compact">'; foreach($allRoles as $role){ $checked = $role['name']==='member' ? 'checked disabled' : ''; if($role['name']==='member') echo '<input type="hidden" name="roles[]" value="member">'; echo '<label class="check"><input type="checkbox" name="roles[]" value="'.e($role['name']).'" '.$checked.'><span>'.e($role['display_name']).'</span></label>'; } echo '</div>'; }
-    echo '<button>Send invite</button></form></div>';
-
-    echo '<div class="card"><h2>Create manually</h2><p class="muted small">Fallback only. The user must change this temporary password after login.</p><form method="post">'.csrf_field().'<input type="hidden" name="create_user" value="1"><label>Link to member</label><select name="member_id"><option value="">None</option>';
-    foreach($members as $m) echo '<option value="'.e($m['id']).'">'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'').' / '.$m['email']).'</option>';
-    echo '</select><label>Email</label><input type="email" name="email" required><label>Temporary password</label><input name="password" required minlength="10"><button class="secondary">Create user</button></form></div>';
-    echo '</aside>';
-
+    echo '<div class="card"><div class="toolbar"><a class="btn" href="?route=user_invite">Invite new user</a><a class="btn secondary" href="?route=user_create">Create manual user</a></div></div>';
+    echo '<div class="users-layout" style="grid-template-columns:1fr">';
     echo '<section class="users-main"><div class="card users-list-card"><div class="toolbar"><h2 style="margin-right:auto">User accounts</h2><span class="pill">'.e(count($users)).' users</span></div><div class="users-admin-list">';
     foreach($users as $usr){
         $currentRoles = user_roles((int)$usr['id']);

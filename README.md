@@ -42,3 +42,7 @@ Added officer roles:
 - Secretary
 
 The Users admin page has been redesigned into a more spacious card layout with clearer role chips, role management panels, invite/reset actions and user summary stats.
+
+## User admin layout
+
+Invite new user and Create manual user have been moved to their own pages. The Users page now has top action buttons for those workflows, keeping the user admin list cleaner and less cramped.
