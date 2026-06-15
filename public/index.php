@@ -113,6 +113,46 @@ function wallet_member_payload(array $member): array {
         'verify_url' => wallet_member_verify_url($member),
     ];
 }
+function wallet_private_dir(): string {
+    $dir = PRIVATE_PATH . '/wallet';
+    if (!is_dir($dir)) mkdir($dir, 0750, true);
+    return $dir;
+}
+
+function wallet_uploaded_filename(string $field): ?string {
+    $cfg = app_config();
+    return $cfg[$field] ?? null;
+}
+
+function wallet_upload_file(string $input, string $configKey, array &$updates): ?string {
+    if (empty($_FILES[$input]) || ($_FILES[$input]['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) return null;
+    if ($_FILES[$input]['error'] !== UPLOAD_ERR_OK) throw new RuntimeException('Upload failed for ' . $input);
+    $original = (string)($_FILES[$input]['name'] ?? 'upload.bin');
+    $safeOriginal = preg_replace('/[^A-Za-z0-9._-]+/', '_', $original);
+    $stored = $configKey . '-' . bin2hex(random_bytes(12)) . '-' . $safeOriginal;
+    $dest = wallet_private_dir() . '/' . $stored;
+    if (!move_uploaded_file($_FILES[$input]['tmp_name'], $dest)) throw new RuntimeException('Could not save uploaded file for ' . $input);
+    @chmod($dest, 0640);
+    $updates[$configKey] = $stored;
+    $updates[$configKey . '_original'] = $original;
+    return $stored;
+}
+
+function wallet_file_status(string $configKey): string {
+    $cfg = app_config();
+    $file = $cfg[$configKey] ?? '';
+    if (!$file) return 'Not uploaded';
+    $path = wallet_private_dir() . '/' . basename($file);
+    return is_file($path) ? 'Uploaded: ' . ($cfg[$configKey . '_original'] ?? basename($file)) : 'Configured but file missing';
+}
+
+function wallet_mask_secret(?string $value): string {
+    $value = trim((string)$value);
+    if ($value === '') return '';
+    if (strlen($value) <= 8) return str_repeat('•', strlen($value));
+    return substr($value, 0, 4) . str_repeat('•', max(4, strlen($value)-8)) . substr($value, -4);
+}
+
 
 function send_configured_email(array $cfg, array $to, array $bcc, string $subject, string $html, string $fromName, string $fromAddress, string $replyTo, array $attachments=[]): array {
     $method = $cfg['email_method'] ?? 'php_mail';
@@ -1026,6 +1066,7 @@ function page_header(string $title): void {
             echo '<a href="?route=audit">Audit logs</a>';
             echo '<a href="?route=email_config">Email settings</a>';
             echo '<a href="?route=wallet_cards">Wallet cards</a>';
+            echo '<a href="?route=wallet_settings">Wallet settings</a>';
             echo '</div></div>';
         }
         echo '<div class="dropdown user-menu"><button type="button" class="nav-drop">' . e($displayName) . ' ▾</button><div class="dropdown-menu dropdown-right"><a href="?route=profile">My Profile</a><a href="?route=logout">Logout</a></div></div>';
@@ -1814,7 +1855,8 @@ if (route() === 'assets.css') {
 @media(max-width:720px){.asset-hero,.action-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.asset-hero h1,.action-hero h1{font-size:1.55rem}.asset-hero-stats,.action-mini-stats{display:grid;grid-template-columns:1fr;width:100%}.asset-hero-stats div{min-width:0}.asset-card-grid{grid-template-columns:1fr;padding:12px}.asset-card-meta{grid-template-columns:1fr;gap:3px}.asset-card-meta strong{margin-bottom:8px}.asset-card-top{display:grid;grid-template-columns:1fr;gap:8px}.action-list-card .actions-board{padding:12px}.action-ticket{padding:13px}.ticket-head{display:grid!important;grid-template-columns:1fr;gap:8px}.action-ticket-body{padding:10px}.maintenance-list-card .ticket{margin:12px}.action-hero-icon{display:none}.asset-form-card .two,.action-form-card .two{grid-template-columns:1fr!important}}.action-header-side{display:grid;gap:10px;justify-items:end}.action-header-side .btn{width:max-content}@media(max-width:720px){.action-header-side{justify-items:stretch}.action-header-side .btn{width:100%;box-sizing:border-box}.asset-list-card>.dash-card-head{display:grid;grid-template-columns:1fr;gap:10px}.asset-list-card>.dash-card-head .btn{width:100%;box-sizing:border-box}}.member-hero{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;background:linear-gradient(135deg,#101827,#263858);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:0 12px 30px #0f172a22}.member-hero h1{margin:.15rem 0;font-size:2rem}.member-hero p{margin:0;color:#dbeafe}.member-hero-stats{display:flex;gap:10px;flex-wrap:wrap}.member-hero-stats div{background:#ffffff18;border:1px solid #ffffff40;border-radius:14px;padding:12px 16px;min-width:105px}.member-hero-stats strong{display:block;font-size:1.35rem}.member-hero-stats span{display:block;color:#dbeafe;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}.member-filter-card{padding:0;overflow:hidden}.member-list-card{padding:0;overflow:hidden}.member-list-card>.dash-card-head{padding:18px;border-bottom:1px solid #e5e7eb;margin:0}.member-header-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.member-card-grid{display:grid;gap:12px;padding:16px}.member-card-modern{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:start;border:1px solid #e5e7eb;border-radius:16px;background:#fff;padding:16px;transition:.15s ease}.member-card-modern:hover{box-shadow:0 10px 25px #0f172a14;transform:translateY(-1px);background:#f8fafc}.member-card-main{display:grid;grid-template-columns:54px 1fr;gap:14px;min-width:0}.member-avatar{width:54px;height:54px;border-radius:999px;background:#e0e7ff;color:#3730a3;display:grid;place-items:center;font-weight:900}.member-card-top{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.member-card-top h3{margin:0}.member-card-meta{display:grid;grid-template-columns:90px 1fr;gap:5px 10px;margin-top:10px}.member-card-meta span{color:#64748b;font-size:.86rem}.member-card-meta strong{font-size:.92rem}.member-card-actions{display:grid;gap:8px;justify-items:end}.member-attendance{display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center;margin-top:12px}.member-attendance span{display:block;color:#64748b;font-size:.86rem}.member-attendance strong{display:block}.member-form-card{border-top:4px solid #2563eb}.member-detail-hero .member-hero-stats div{min-width:140px}.member-detail-card{margin-top:0}.status-active,.status-honorary,.status-life_member{background:#dcfce7;color:#166534}.status-pending{background:#fef3c7;color:#92400e}.status-expired,.status-suspended{background:#fee2e2;color:#991b1b}.status-former{background:#f1f5f9;color:#334155}
 @media(max-width:720px){.member-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.member-hero h1{font-size:1.55rem}.member-hero-stats{display:grid;grid-template-columns:1fr;width:100%}.member-hero-stats div{min-width:0}.member-list-card>.dash-card-head{display:grid;grid-template-columns:1fr;gap:10px}.member-header-actions{display:grid;grid-template-columns:1fr;width:100%}.member-header-actions .btn{width:100%;box-sizing:border-box}.member-card-grid{padding:12px}.member-card-modern{grid-template-columns:1fr;padding:13px}.member-card-main{grid-template-columns:44px 1fr;gap:11px}.member-avatar{width:44px;height:44px}.member-card-actions{display:grid;grid-template-columns:1fr;justify-items:stretch}.member-card-actions .btn,.member-card-actions button{width:100%;box-sizing:border-box}.member-card-meta{grid-template-columns:1fr;gap:3px}.member-card-meta strong{margin-bottom:7px}.member-attendance{grid-template-columns:1fr}.member-form-card .two{grid-template-columns:1fr!important}}.member-attendance small{display:block;color:#64748b;margin-top:2px;font-size:.78rem}.email-member-card.disabled{opacity:.65;background:#f8fafc}.email-member-card.disabled .email-check-ui{background:#e5e7eb;color:#94a3b8}.email-member-card.disabled input{cursor:not-allowed}.email-member-card.disabled *{cursor:not-allowed}.wallet-hero{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;background:linear-gradient(135deg,#27396c,#16213e);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:0 12px 30px #0f172a22}.wallet-hero h1{margin:.15rem 0;font-size:2rem}.wallet-hero p{margin:0;color:#dbeafe}.wallet-hero-icon{width:76px;height:76px;border-radius:999px;background:#ffffff18;border:1px solid #ffffff40;display:grid;place-items:center;font-size:2rem;font-weight:900}.wallet-admin-grid{grid-template-columns:minmax(280px,420px) 1fr}.wallet-control-card,.wallet-preview-card{margin-top:0}.wallet-actions{display:grid;gap:8px}.wallet-pass-preview{width:min(100%,420px);min-height:560px;background:#2f407a;color:#fff;border-radius:18px;padding:26px;box-shadow:0 18px 35px #0f172a33;display:flex;flex-direction:column;gap:28px}.wallet-pass-top{display:flex;justify-content:space-between;gap:18px;align-items:center;font-size:1.25rem}.wallet-pass-field span,.wallet-pass-grid span{display:block;font-size:.78rem;font-weight:900;letter-spacing:.08em;color:#e5e7eb}.wallet-pass-field strong{display:block;font-size:2rem;font-weight:400;margin-top:4px}.wallet-pass-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.wallet-pass-grid strong{display:block;font-size:1.2rem;font-weight:400;margin-top:4px}.wallet-qr-box{margin:auto auto 0;align-self:center;background:#fff;border-radius:8px;padding:12px;color:#111827;text-align:center}.wallet-qr-box img{display:block;width:170px;height:170px}.wallet-qr-box small{display:block;margin-top:4px}.wallet-print-wrap{display:grid;place-items:center}.wallet-print-card{width:420px}.wallet-verify-card{display:grid;grid-template-columns:1fr auto;gap:16px;align-items:center;background:linear-gradient(135deg,#166534,#15803d);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px}.wallet-verify-card h1{margin:.2rem 0}.wallet-verify-card p{margin:0;color:#dcfce7}.wallet-status{background:#ffffff20;border:1px solid #ffffff40;border-radius:999px;padding:10px 14px;font-weight:900}
 @media(max-width:720px){.wallet-hero,.wallet-verify-card{grid-template-columns:1fr;padding:18px;border-radius:14px}.wallet-hero-icon{display:none}.wallet-admin-grid{grid-template-columns:1fr}.wallet-pass-preview{min-height:520px;padding:20px}.wallet-pass-field strong{font-size:1.55rem}.wallet-pass-grid{grid-template-columns:1fr}.wallet-qr-box img{width:150px;height:150px}}
-@media print{header,footer,.wallet-control-card,.wallet-preview-card h2,.wallet-print-wrap+*,main>.card:not(:has(.wallet-print-card)){display:none!important}body{background:#fff}.wallet-print-card{box-shadow:none}}';
+@media print{header,footer,.wallet-control-card,.wallet-preview-card h2,.wallet-print-wrap+*,main>.card:not(:has(.wallet-print-card)){display:none!important}body{background:#fff}.wallet-print-card{box-shadow:none}}.wallet-settings-grid{grid-template-columns:1fr}.wallet-settings-card{margin-top:0}.wallet-settings-card h2{margin-top:0}.wallet-upload-list{display:grid;gap:14px;margin-top:14px}.wallet-upload-list>div{border:1px solid #e5e7eb;background:#f8fafc;border-radius:12px;padding:12px}.wallet-upload-list small{display:block;color:#64748b;margin-top:6px}.wallet-settings-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.wallet-readiness{display:grid;gap:8px}.wallet-readiness span{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px}
+@media(max-width:720px){.wallet-settings-actions{display:grid}.wallet-settings-actions .btn,.wallet-settings-actions button{width:100%;box-sizing:border-box}}';
     exit;
 }
 if (route() === 'email_open') {
@@ -2452,6 +2494,78 @@ if (route() === 'wallet_card_print') {
     page_footer(); exit;
 }
 
+
+if (route() === 'wallet_settings') {
+    require_permission('manage_users');
+    page_header('Wallet settings');
+    audit('wallet_settings.view');
+    $cfg = app_config();
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        require_csrf();
+        $updates = [
+            'wallet_card_title' => trim($_POST['wallet_card_title'] ?? 'Membership'),
+            'wallet_card_colour' => trim($_POST['wallet_card_colour'] ?? '#2f407a'),
+            'apple_pass_type_id' => trim($_POST['apple_pass_type_id'] ?? ''),
+            'apple_team_id' => trim($_POST['apple_team_id'] ?? ''),
+            'apple_organization_name' => trim($_POST['apple_organization_name'] ?? ''),
+            'apple_pass_description' => trim($_POST['apple_pass_description'] ?? ''),
+            'apple_pass_serial_prefix' => trim($_POST['apple_pass_serial_prefix'] ?? 'member-'),
+            'apple_cert_password' => trim($_POST['apple_cert_password'] ?? ($cfg['apple_cert_password'] ?? '')),
+            'google_wallet_issuer_id' => trim($_POST['google_wallet_issuer_id'] ?? ''),
+            'google_wallet_class_id' => trim($_POST['google_wallet_class_id'] ?? ''),
+            'google_wallet_program_name' => trim($_POST['google_wallet_program_name'] ?? ''),
+        ];
+
+        foreach (['apple_signing_cert','apple_private_key','apple_wwdr_cert','google_service_account_json'] as $key) {
+            if (!empty($_POST['delete_'.$key])) {
+                $oldFile = $cfg[$key] ?? '';
+                if ($oldFile && is_file(wallet_private_dir().'/'.basename($oldFile))) @unlink(wallet_private_dir().'/'.basename($oldFile));
+                $updates[$key] = '';
+                $updates[$key.'_original'] = '';
+            }
+        }
+
+        try {
+            wallet_upload_file('apple_signing_cert_file', 'apple_signing_cert', $updates);
+            wallet_upload_file('apple_private_key_file', 'apple_private_key', $updates);
+            wallet_upload_file('apple_wwdr_cert_file', 'apple_wwdr_cert', $updates);
+            wallet_upload_file('google_service_account_json_file', 'google_service_account_json', $updates);
+        } catch (Throwable $e) {
+            flash('Wallet settings upload failed: '.$e->getMessage());
+            redirect('wallet_settings');
+        }
+
+        save_app_config($updates);
+        audit('wallet_settings.update','config',null,'success',null,['updated_keys'=>array_keys($updates)]);
+        flash('Wallet settings saved.');
+        redirect('wallet_settings');
+    }
+
+    $cfg = app_config();
+    echo '<section class="wallet-hero"><div><span class="eyebrow">Admin settings</span><h1>Wallet settings</h1><p>Upload Apple pass certificates and Google/Android Wallet API details for membership cards.</p></div><div class="wallet-hero-icon">⚙</div></section>';
+
+    echo '<form method="post" enctype="multipart/form-data">'.csrf_field().'<div class="grid wallet-settings-grid">';
+
+    echo '<div class="card wallet-settings-card"><h2>Card appearance</h2><div class="two"><div><label>Card title</label><input name="wallet_card_title" value="'.e($cfg['wallet_card_title'] ?? 'Membership').'"></div><div><label>Card colour</label><input name="wallet_card_colour" value="'.e($cfg['wallet_card_colour'] ?? '#2f407a').'" placeholder="#2f407a"></div></div><p class="muted">These settings are used by the card preview and can also be used by future Apple/Google pass generation.</p></div>';
+
+    echo '<div class="card wallet-settings-card"><h2>Apple Wallet / .pkpass</h2><div class="two"><div><label>Apple Pass Type ID</label><input name="apple_pass_type_id" value="'.e($cfg['apple_pass_type_id'] ?? '').'" placeholder="pass.uk.org.example.membership"></div><div><label>Apple Team ID</label><input name="apple_team_id" value="'.e($cfg['apple_team_id'] ?? '').'" placeholder="ABCDE12345"></div><div><label>Organisation name</label><input name="apple_organization_name" value="'.e($cfg['apple_organization_name'] ?? '').'"></div><div><label>Pass description</label><input name="apple_pass_description" value="'.e($cfg['apple_pass_description'] ?? '').'" placeholder="Club membership card"></div><div><label>Serial prefix</label><input name="apple_pass_serial_prefix" value="'.e($cfg['apple_pass_serial_prefix'] ?? 'member-').'"></div><div><label>Certificate/private key password</label><input type="password" name="apple_cert_password" value="'.e($cfg['apple_cert_password'] ?? '').'" autocomplete="new-password"></div></div>';
+
+    echo '<div class="wallet-upload-list">';
+    echo '<div><label>Apple signing certificate / pass certificate</label><input type="file" name="apple_signing_cert_file" accept=".pem,.cer,.crt,.p12"><small>'.e(wallet_file_status('apple_signing_cert')).'</small><label class="check"><input type="checkbox" name="delete_apple_signing_cert" value="1"> Delete existing file</label></div>';
+    echo '<div><label>Apple private key</label><input type="file" name="apple_private_key_file" accept=".pem,.key,.p12"><small>'.e(wallet_file_status('apple_private_key')).'</small><label class="check"><input type="checkbox" name="delete_apple_private_key" value="1"> Delete existing file</label></div>';
+    echo '<div><label>Apple WWDR certificate</label><input type="file" name="apple_wwdr_cert_file" accept=".pem,.cer,.crt"><small>'.e(wallet_file_status('apple_wwdr_cert')).'</small><label class="check"><input type="checkbox" name="delete_apple_wwdr_cert" value="1"> Delete existing file</label></div>';
+    echo '</div><p class="muted">Apple pass installation requires a valid Apple Developer Pass Type ID, signing certificate, private key, and WWDR certificate. Uploaded files are stored outside the public web folder.</p></div>';
+
+    echo '<div class="card wallet-settings-card"><h2>Google / Android Wallet</h2><div class="two"><div><label>Google Wallet issuer ID</label><input name="google_wallet_issuer_id" value="'.e($cfg['google_wallet_issuer_id'] ?? '').'" placeholder="3388000000022xxxxx"></div><div><label>Google Wallet class ID</label><input name="google_wallet_class_id" value="'.e($cfg['google_wallet_class_id'] ?? '').'" placeholder="issuer.membership_class"></div><div class="full"><label>Programme name</label><input name="google_wallet_program_name" value="'.e($cfg['google_wallet_program_name'] ?? '').'" placeholder="Club Membership"></div></div><div class="wallet-upload-list"><div><label>Google service account JSON</label><input type="file" name="google_service_account_json_file" accept=".json,application/json"><small>'.e(wallet_file_status('google_service_account_json')).'</small><label class="check"><input type="checkbox" name="delete_google_service_account_json" value="1"> Delete existing file</label></div></div><p class="muted">Google/Android Wallet generation requires a Google Wallet issuer account and service account JSON with suitable permissions. Uploaded API JSON is stored privately.</p></div>';
+
+    echo '</div><div class="card wallet-settings-actions"><button>Save wallet settings</button><a class="btn secondary" href="?route=wallet_cards">Back to Wallet cards</a></div></form>';
+
+    echo '<div class="card"><h2>Current readiness</h2><div class="wallet-readiness"><span>Apple Pass Type ID: <strong>'.e(($cfg['apple_pass_type_id'] ?? '') !== '' ? 'Set' : 'Missing').'</strong></span><span>Apple signing cert: <strong>'.e(wallet_file_status('apple_signing_cert')).'</strong></span><span>Apple private key: <strong>'.e(wallet_file_status('apple_private_key')).'</strong></span><span>Apple WWDR cert: <strong>'.e(wallet_file_status('apple_wwdr_cert')).'</strong></span><span>Google issuer ID: <strong>'.e(($cfg['google_wallet_issuer_id'] ?? '') !== '' ? 'Set' : 'Missing').'</strong></span><span>Google API JSON: <strong>'.e(wallet_file_status('google_service_account_json')).'</strong></span></div></div>';
+
+    page_footer(); exit;
+}
+
 if (route() === 'wallet_cards') {
     require_permission('manage_users');
     page_header('Wallet cards');
@@ -2474,7 +2588,7 @@ if (route() === 'wallet_cards') {
 
     echo '<h2>Export options</h2>';
     if ($selected) {
-        echo '<div class="wallet-actions"><a class="btn" href="?route=wallet_card_print&id='.e($selected['id']).'" target="_blank">Print / save card</a><a class="btn secondary" href="?route=wallet_card_json&id='.e($selected['id']).'">Download pass data JSON</a><button class="secondary" type="button" disabled>Apple .pkpass needs certificate</button><button class="secondary" type="button" disabled>Google Wallet needs issuer API</button></div>';
+        echo '<div class="wallet-actions"><a class="btn" href="?route=wallet_card_print&id='.e($selected['id']).'" target="_blank">Print / save card</a><a class="btn secondary" href="?route=wallet_card_json&id='.e($selected['id']).'">Download pass data JSON</a><a class="btn secondary" href="?route=wallet_settings">Wallet settings</a><button class="secondary" type="button" disabled>Apple .pkpass needs certificate</button><button class="secondary" type="button" disabled>Google Wallet needs issuer API</button></div>';
     }
     echo '<p class="muted">Apple Wallet cards require an Apple Developer Pass Type ID and signing certificate before a real .pkpass can be installed. Google/Android Wallet requires Google Wallet issuer/API credentials. This page prepares the member card data and QR verification style ready for those integrations.</p></div>';
 
