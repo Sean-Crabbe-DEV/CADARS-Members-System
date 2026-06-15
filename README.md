@@ -32,3 +32,13 @@ Dashboard order adjusted so Notifications appear in the top dashboard grid and N
 ## Login and password recovery
 
 The login page has been restyled with a responsive centred sign-in card. Users can now use **Forgot password?** to request a self-service password reset link. Reset links use the existing secure token system and expire after 48 hours.
+
+## User admin and officer roles
+
+Added officer roles:
+
+- Chair
+- Vice Chair
+- Secretary
+
+The Users admin page has been redesigned into a more spacious card layout with clearer role chips, role management panels, invite/reset actions and user summary stats.
