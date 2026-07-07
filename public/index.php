@@ -154,16 +154,212 @@ function wallet_mask_secret(?string $value): string {
 }
 
 
+function email_safe_header(string $value): string {
+    return str_replace(["\r","\n"], '', $value);
+}
+
+function email_encoded_header(string $value): string {
+    $value = email_safe_header($value);
+    if (function_exists('mb_encode_mimeheader')) return mb_encode_mimeheader($value, 'UTF-8', 'B', "\r\n");
+    return $value;
+}
+
+function email_format_from(string $name, string $address): string {
+    $name = trim(email_safe_header($name));
+    $address = trim(email_safe_header($address));
+    return $name !== '' ? email_encoded_header($name) . ' <' . $address . '>' : $address;
+}
+
+function build_email_mime(array $to, array $bcc, string $subject, string $html, string $fromName, string $fromAddress, string $replyTo, array $attachments=[], bool $includeBccHeader=false, bool $includeSubject=false): array {
+    $to = normalise_email_list($to);
+    $bcc = normalise_email_list($bcc);
+    $replyTo = normalise_email_list($replyTo);
+    $subject = email_safe_header($subject);
+
+    $headers = [];
+    $headers[] = 'Date: ' . date(DATE_RFC2822);
+    $headers[] = 'From: ' . email_format_from($fromName, $fromAddress);
+    $headers[] = 'To: ' . ($to ? implode(', ', $to) : 'Undisclosed recipients:;');
+    if ($replyTo) $headers[] = 'Reply-To: ' . implode(', ', $replyTo);
+    if ($includeBccHeader && $bcc) $headers[] = 'Bcc: ' . implode(', ', $bcc);
+    if ($includeSubject) $headers[] = 'Subject: ' . email_encoded_header($subject);
+    $headers[] = 'MIME-Version: 1.0';
+
+    if ($attachments) {
+        $boundary = '=_CADARS_' . bin2hex(random_bytes(16));
+        $headers[] = 'Content-Type: multipart/mixed; boundary="' . $boundary . '"';
+
+        $body = "--{$boundary}\r\n";
+        $body .= "Content-Type: text/html; charset=UTF-8\r\n";
+        $body .= "Content-Transfer-Encoding: 8bit\r\n\r\n";
+        $body .= $html . "\r\n";
+
+        foreach ($attachments as $attachment) {
+            $filename = preg_replace('/[\r\n"]+/', '', (string)($attachment['filename'] ?? 'attachment'));
+            $mime = email_safe_header((string)($attachment['mime_type'] ?? 'application/octet-stream'));
+            $body .= "--{$boundary}\r\n";
+            $body .= 'Content-Type: ' . $mime . '; name="' . $filename . '"' . "\r\n";
+            $body .= "Content-Transfer-Encoding: base64\r\n";
+            $body .= 'Content-Disposition: attachment; filename="' . $filename . '"' . "\r\n\r\n";
+            $body .= chunk_split(base64_encode((string)($attachment['content'] ?? ''))) . "\r\n";
+        }
+        $body .= "--{$boundary}--\r\n";
+    } else {
+        $headers[] = 'Content-Type: text/html; charset=UTF-8';
+        $headers[] = 'Content-Transfer-Encoding: 8bit';
+        $body = $html;
+    }
+
+    return ['headers' => implode("\r\n", $headers), 'body' => $body];
+}
+
+function smtp_read_response($socket, array &$trace): array {
+    $lines = [];
+    while (!feof($socket)) {
+        $line = fgets($socket, 2048);
+        if ($line === false) break;
+        $line = rtrim($line, "\r\n");
+        $lines[] = $line;
+        $trace[] = 'S: ' . $line;
+        if (preg_match('/^\d{3} /', $line)) break;
+    }
+    $last = $lines ? end($lines) : '';
+    $code = preg_match('/^(\d{3})/', (string)$last, $m) ? (int)$m[1] : 0;
+    return ['code' => $code, 'lines' => $lines, 'text' => implode(' | ', $lines)];
+}
+
+function smtp_write_all($socket, string $data): bool {
+    $length = strlen($data);
+    $written = 0;
+    while ($written < $length) {
+        $result = fwrite($socket, substr($data, $written));
+        if ($result === false || $result === 0) return false;
+        $written += $result;
+    }
+    return true;
+}
+
+function smtp_command($socket, string $command, array $expectedCodes, array &$trace, ?string $displayCommand=null): array {
+    $trace[] = 'C: ' . ($displayCommand ?? $command);
+    if (!smtp_write_all($socket, $command . "\r\n")) {
+        return ['ok' => false, 'code' => 0, 'text' => 'Could not write command to SMTP server.'];
+    }
+    $response = smtp_read_response($socket, $trace);
+    $response['ok'] = in_array((int)$response['code'], $expectedCodes, true);
+    return $response;
+}
+
+function smtp_trace_summary(array $trace): string {
+    // Last part of the protocol trace is enough to troubleshoot, and never logs passwords.
+    return implode(' | ', array_slice($trace, -14));
+}
+
+function send_smtp_email(array $cfg, array $to, array $bcc, string $subject, string $html, string $fromName, string $fromAddress, string $replyTo, array $attachments=[]): array {
+    $host = trim(email_safe_header((string)($cfg['smtp_host'] ?? '')));
+    $port = (int)($cfg['smtp_port'] ?? 587);
+    $security = strtolower(trim((string)($cfg['smtp_security'] ?? 'tls')));
+    $username = trim((string)($cfg['smtp_username'] ?? ''));
+    $password = (string)($cfg['smtp_password'] ?? '');
+
+    if ($host === '' || !preg_match('/^[A-Za-z0-9.-]+$/', $host)) {
+        return ['ok' => false, 'error' => 'SMTP host is missing or invalid.'];
+    }
+    if ($port < 1 || $port > 65535) return ['ok' => false, 'error' => 'SMTP port must be between 1 and 65535.'];
+    if (!in_array($security, ['tls','ssl','none'], true)) return ['ok' => false, 'error' => 'SMTP security must be TLS, SSL or None.'];
+
+    $recipients = normalise_email_list(array_merge($to, $bcc));
+    if (!$recipients) return ['ok' => false, 'error' => 'No valid SMTP recipients supplied.'];
+    if (!filter_var($fromAddress, FILTER_VALIDATE_EMAIL)) return ['ok' => false, 'error' => 'From email address is invalid.'];
+
+    $trace = [];
+    $context = stream_context_create([
+        'ssl' => [
+            'verify_peer' => true,
+            'verify_peer_name' => true,
+            'allow_self_signed' => false,
+            'peer_name' => $host,
+        ]
+    ]);
+    $endpoint = ($security === 'ssl' ? 'ssl://' : 'tcp://') . $host . ':' . $port;
+    $errno = 0; $errstr = '';
+    $socket = @stream_socket_client($endpoint, $errno, $errstr, 20, STREAM_CLIENT_CONNECT, $context);
+    if (!$socket) {
+        return ['ok' => false, 'error' => 'SMTP connection failed: ' . ($errstr ?: ('error ' . $errno))];
+    }
+    stream_set_timeout($socket, 25);
+
+    $fail = function(string $message) use ($socket, &$trace): array {
+        @fwrite($socket, "QUIT\r\n");
+        @fclose($socket);
+        return ['ok' => false, 'error' => $message, 'diagnostic' => smtp_trace_summary($trace)];
+    };
+
+    $greeting = smtp_read_response($socket, $trace);
+    if ($greeting['code'] !== 220) return $fail('SMTP server did not accept the connection: ' . $greeting['text']);
+
+    $heloName = preg_replace('/[^A-Za-z0-9.-]/', '', gethostname() ?: 'localhost');
+    if ($heloName === '') $heloName = 'localhost';
+    $ehlo = smtp_command($socket, 'EHLO ' . $heloName, [250], $trace);
+    if (!$ehlo['ok']) return $fail('SMTP EHLO failed: ' . $ehlo['text']);
+
+    if ($security === 'tls') {
+        $startTls = smtp_command($socket, 'STARTTLS', [220], $trace);
+        if (!$startTls['ok']) return $fail('SMTP STARTTLS failed. Confirm TLS/port settings: ' . $startTls['text']);
+        $crypto = @stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLS_CLIENT);
+        if ($crypto !== true) return $fail('SMTP TLS encryption could not be enabled. Check the host certificate and SMTP security setting.');
+        $ehlo = smtp_command($socket, 'EHLO ' . $heloName, [250], $trace);
+        if (!$ehlo['ok']) return $fail('SMTP EHLO after STARTTLS failed: ' . $ehlo['text']);
+    }
+
+    if ($username !== '') {
+        $login = smtp_command($socket, 'AUTH LOGIN', [334], $trace);
+        if (!$login['ok']) {
+            $plain = base64_encode("\0" . $username . "\0" . $password);
+            $plainAuth = smtp_command($socket, 'AUTH PLAIN ' . $plain, [235], $trace, 'AUTH PLAIN <credentials hidden>');
+            if (!$plainAuth['ok']) return $fail('SMTP authentication failed: ' . $plainAuth['text']);
+        } else {
+            $userResponse = smtp_command($socket, base64_encode($username), [334], $trace, '<username credentials hidden>');
+            if (!$userResponse['ok']) return $fail('SMTP username was rejected: ' . $userResponse['text']);
+            $passResponse = smtp_command($socket, base64_encode($password), [235], $trace, '<password credentials hidden>');
+            if (!$passResponse['ok']) return $fail('SMTP password was rejected: ' . $passResponse['text']);
+        }
+    }
+
+    $mailFrom = smtp_command($socket, 'MAIL FROM:<' . $fromAddress . '>', [250], $trace);
+    if (!$mailFrom['ok']) return $fail('SMTP rejected the From address: ' . $mailFrom['text']);
+
+    foreach ($recipients as $recipient) {
+        $rcpt = smtp_command($socket, 'RCPT TO:<' . $recipient . '>', [250,251], $trace);
+        if (!$rcpt['ok']) return $fail('SMTP rejected recipient ' . $recipient . ': ' . $rcpt['text']);
+    }
+
+    $data = smtp_command($socket, 'DATA', [354], $trace);
+    if (!$data['ok']) return $fail('SMTP DATA command failed: ' . $data['text']);
+
+    $mime = build_email_mime($to, [], $subject, $html, $fromName, $fromAddress, $replyTo, $attachments, false, true);
+    $message = str_replace(["\r\n","\r"], "\n", $mime['headers'] . "\n\n" . $mime['body']);
+    $message = str_replace("\n", "\r\n", $message);
+    $message = preg_replace('/(?m)^\./', '..', $message);
+    $trace[] = 'C: <email message data>';
+    if (!smtp_write_all($socket, $message . "\r\n.\r\n")) {
+        return $fail('Could not send the SMTP message data.');
+    }
+    $sent = smtp_read_response($socket, $trace);
+    if (!in_array((int)$sent['code'], [250], true)) return $fail('SMTP server did not accept the message: ' . $sent['text']);
+
+    smtp_command($socket, 'QUIT', [221], $trace);
+    @fclose($socket);
+    return ['ok' => true, 'error' => null, 'diagnostic' => smtp_trace_summary($trace)];
+}
+
 function send_configured_email(array $cfg, array $to, array $bcc, string $subject, string $html, string $fromName, string $fromAddress, string $replyTo, array $attachments=[]): array {
-    $method = $cfg['email_method'] ?? 'php_mail';
-    $to = array_values(array_filter(array_map('trim', $to)));
-    $bcc = array_values(array_filter(array_map('trim', $bcc)));
-    $subject = str_replace(["\r","\n"], '', $subject);
-    $fromName = str_replace(["\r","\n"], '', $fromName);
-    $fromAddress = str_replace(["\r","\n"], '', $fromAddress);
-    $replyTo = str_replace(["\r","\n"], '', $replyTo);
-    $replyToAddresses = normalise_email_list($replyTo);
-    $replyTo = implode(', ', $replyToAddresses);
+    $method = strtolower(trim((string)($cfg['email_method'] ?? 'php_mail')));
+    $to = normalise_email_list($to);
+    $bcc = normalise_email_list($bcc);
+    $subject = email_safe_header($subject);
+    $fromName = email_safe_header($fromName);
+    $fromAddress = email_safe_header($fromAddress);
+    $replyTo = implode(', ', normalise_email_list($replyTo));
 
     if (!$to) return ['ok' => false, 'error' => 'No To recipient supplied.'];
 
@@ -172,12 +368,17 @@ function send_configured_email(array $cfg, array $to, array $bcc, string $subjec
         $path = $a['path'] ?? $a['file_path'] ?? '';
         if (!$path && !empty($a['stored_filename'])) $path = PRIVATE_PATH . '/email-attachments/' . $a['stored_filename'];
         if (!$path || !is_file($path)) continue;
+        $content = @file_get_contents($path);
+        if ($content === false) continue;
         $preparedAttachments[] = [
             'filename' => preg_replace('/[\r\n"]+/', '', (string)($a['filename'] ?? $a['original_filename'] ?? basename($path))),
             'mime_type' => (string)($a['mime_type'] ?? mime_content_type($path) ?: 'application/octet-stream'),
-            'path' => $path,
-            'content' => file_get_contents($path),
+            'content' => $content,
         ];
+    }
+
+    if ($method === 'smtp') {
+        return send_smtp_email($cfg, $to, $bcc, $subject, $html, $fromName, $fromAddress, $replyTo, $preparedAttachments);
     }
 
     if ($method === 'resend') {
@@ -191,6 +392,7 @@ function send_configured_email(array $cfg, array $to, array $bcc, string $subjec
             'html' => $html,
         ];
         if ($bcc) $payload['bcc'] = $bcc;
+        $replyToAddresses = normalise_email_list($replyTo);
         if ($replyToAddresses) $payload['reply_to'] = count($replyToAddresses) === 1 ? $replyToAddresses[0] : $replyToAddresses;
         if ($preparedAttachments) {
             $payload['attachments'] = [];
@@ -204,39 +406,27 @@ function send_configured_email(array $cfg, array $to, array $bcc, string $subjec
         }
 
         $json = json_encode($payload);
-        $headers = [
-            'Authorization: Bearer ' . $apiKey,
-            'Content-Type: application/json',
-        ];
+        $headers = ['Authorization: Bearer ' . $apiKey, 'Content-Type: application/json'];
 
         if (function_exists('curl_init')) {
             $ch = curl_init('https://api.resend.com/emails');
             curl_setopt_array($ch, [
-                CURLOPT_POST => true,
-                CURLOPT_POSTFIELDS => $json,
-                CURLOPT_HTTPHEADER => $headers,
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_TIMEOUT => 30,
+                CURLOPT_POST => true, CURLOPT_POSTFIELDS => $json, CURLOPT_HTTPHEADER => $headers,
+                CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 30,
             ]);
             $response = curl_exec($ch);
             $error = curl_error($ch);
             $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
             curl_close($ch);
-
             if ($response === false) return ['ok' => false, 'error' => $error ?: 'Resend cURL request failed.'];
             if ($status >= 200 && $status < 300) return ['ok' => true, 'error' => null, 'provider_response' => $response];
             return ['ok' => false, 'error' => 'Resend API error HTTP ' . $status . ': ' . substr((string)$response, 0, 500)];
         }
 
-        $context = stream_context_create([
-            'http' => [
-                'method' => 'POST',
-                'header' => implode("\r\n", $headers) . "\r\n",
-                'content' => $json,
-                'timeout' => 30,
-                'ignore_errors' => true,
-            ]
-        ]);
+        $context = stream_context_create(['http' => [
+            'method' => 'POST', 'header' => implode("\r\n", $headers) . "\r\n", 'content' => $json,
+            'timeout' => 30, 'ignore_errors' => true,
+        ]]);
         $response = @file_get_contents('https://api.resend.com/emails', false, $context);
         $status = 0;
         if (!empty($http_response_header)) {
@@ -248,38 +438,8 @@ function send_configured_email(array $cfg, array $to, array $bcc, string $subjec
         return ['ok' => false, 'error' => 'Resend API request failed' . ($status ? ' HTTP ' . $status : '') . ': ' . substr((string)$response, 0, 500)];
     }
 
-    if ($preparedAttachments) {
-        $boundary = '=_CADARS_' . bin2hex(random_bytes(16));
-        $headers = "MIME-Version: 1.0\r\n";
-        $headers .= 'From: ' . $fromName . ' <' . $fromAddress . ">\r\n";
-        $headers .= 'Reply-To: ' . $replyTo . "\r\n";
-        if ($bcc) $headers .= 'Bcc: ' . implode(', ', $bcc) . "\r\n";
-        $headers .= 'Content-Type: multipart/mixed; boundary="' . $boundary . '"' . "\r\n";
-
-        $message = "--{$boundary}\r\n";
-        $message .= "Content-Type: text/html; charset=UTF-8\r\n";
-        $message .= "Content-Transfer-Encoding: 8bit\r\n\r\n";
-        $message .= $html . "\r\n";
-
-        foreach ($preparedAttachments as $a) {
-            $message .= "--{$boundary}\r\n";
-            $message .= 'Content-Type: ' . $a['mime_type'] . '; name="' . $a['filename'] . '"' . "\r\n";
-            $message .= "Content-Transfer-Encoding: base64\r\n";
-            $message .= 'Content-Disposition: attachment; filename="' . $a['filename'] . '"' . "\r\n\r\n";
-            $message .= chunk_split(base64_encode((string)$a['content'])) . "\r\n";
-        }
-        $message .= "--{$boundary}--\r\n";
-
-        $ok = @mail(implode(', ', $to), $subject, $message, $headers);
-        return ['ok' => (bool)$ok, 'error' => $ok ? null : 'mail() failed or is not configured.'];
-    }
-
-    $headers = "MIME-Version: 1.0\r\nContent-type: text/html; charset=UTF-8\r\n";
-    $headers .= 'From: ' . $fromName . ' <' . $fromAddress . ">\r\n";
-    $headers .= 'Reply-To: ' . $replyTo . "\r\n";
-    if ($bcc) $headers .= 'Bcc: ' . implode(', ', $bcc) . "\r\n";
-
-    $ok = @mail(implode(', ', $to), $subject, $html, $headers);
+    $mime = build_email_mime($to, $bcc, $subject, $html, $fromName, $fromAddress, $replyTo, $preparedAttachments, true, false);
+    $ok = @mail(implode(', ', $to), $subject, $mime['body'], $mime['headers']);
     return ['ok' => (bool)$ok, 'error' => $ok ? null : 'mail() failed or is not configured.'];
 }
 
@@ -1856,7 +2016,7 @@ if (route() === 'assets.css') {
 @media(max-width:720px){.member-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.member-hero h1{font-size:1.55rem}.member-hero-stats{display:grid;grid-template-columns:1fr;width:100%}.member-hero-stats div{min-width:0}.member-list-card>.dash-card-head{display:grid;grid-template-columns:1fr;gap:10px}.member-header-actions{display:grid;grid-template-columns:1fr;width:100%}.member-header-actions .btn{width:100%;box-sizing:border-box}.member-card-grid{padding:12px}.member-card-modern{grid-template-columns:1fr;padding:13px}.member-card-main{grid-template-columns:44px 1fr;gap:11px}.member-avatar{width:44px;height:44px}.member-card-actions{display:grid;grid-template-columns:1fr;justify-items:stretch}.member-card-actions .btn,.member-card-actions button{width:100%;box-sizing:border-box}.member-card-meta{grid-template-columns:1fr;gap:3px}.member-card-meta strong{margin-bottom:7px}.member-attendance{grid-template-columns:1fr}.member-form-card .two{grid-template-columns:1fr!important}}.member-attendance small{display:block;color:#64748b;margin-top:2px;font-size:.78rem}.email-member-card.disabled{opacity:.65;background:#f8fafc}.email-member-card.disabled .email-check-ui{background:#e5e7eb;color:#94a3b8}.email-member-card.disabled input{cursor:not-allowed}.email-member-card.disabled *{cursor:not-allowed}.wallet-hero{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;background:linear-gradient(135deg,#27396c,#16213e);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:0 12px 30px #0f172a22}.wallet-hero h1{margin:.15rem 0;font-size:2rem}.wallet-hero p{margin:0;color:#dbeafe}.wallet-hero-icon{width:76px;height:76px;border-radius:999px;background:#ffffff18;border:1px solid #ffffff40;display:grid;place-items:center;font-size:2rem;font-weight:900}.wallet-admin-grid{grid-template-columns:minmax(280px,420px) 1fr}.wallet-control-card,.wallet-preview-card{margin-top:0}.wallet-actions{display:grid;gap:8px}.wallet-pass-preview{width:min(100%,420px);min-height:560px;background:#2f407a;color:#fff;border-radius:18px;padding:26px;box-shadow:0 18px 35px #0f172a33;display:flex;flex-direction:column;gap:28px}.wallet-pass-top{display:flex;justify-content:space-between;gap:18px;align-items:center;font-size:1.25rem}.wallet-pass-field span,.wallet-pass-grid span{display:block;font-size:.78rem;font-weight:900;letter-spacing:.08em;color:#e5e7eb}.wallet-pass-field strong{display:block;font-size:2rem;font-weight:400;margin-top:4px}.wallet-pass-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.wallet-pass-grid strong{display:block;font-size:1.2rem;font-weight:400;margin-top:4px}.wallet-qr-box{margin:auto auto 0;align-self:center;background:#fff;border-radius:8px;padding:12px;color:#111827;text-align:center}.wallet-qr-box img{display:block;width:170px;height:170px}.wallet-qr-box small{display:block;margin-top:4px}.wallet-print-wrap{display:grid;place-items:center}.wallet-print-card{width:420px}.wallet-verify-card{display:grid;grid-template-columns:1fr auto;gap:16px;align-items:center;background:linear-gradient(135deg,#166534,#15803d);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px}.wallet-verify-card h1{margin:.2rem 0}.wallet-verify-card p{margin:0;color:#dcfce7}.wallet-status{background:#ffffff20;border:1px solid #ffffff40;border-radius:999px;padding:10px 14px;font-weight:900}
 @media(max-width:720px){.wallet-hero,.wallet-verify-card{grid-template-columns:1fr;padding:18px;border-radius:14px}.wallet-hero-icon{display:none}.wallet-admin-grid{grid-template-columns:1fr}.wallet-pass-preview{min-height:520px;padding:20px}.wallet-pass-field strong{font-size:1.55rem}.wallet-pass-grid{grid-template-columns:1fr}.wallet-qr-box img{width:150px;height:150px}}
 @media print{header,footer,.wallet-control-card,.wallet-preview-card h2,.wallet-print-wrap+*,main>.card:not(:has(.wallet-print-card)){display:none!important}body{background:#fff}.wallet-print-card{box-shadow:none}}.wallet-settings-grid{grid-template-columns:1fr}.wallet-settings-card{margin-top:0}.wallet-settings-card h2{margin-top:0}.wallet-upload-list{display:grid;gap:14px;margin-top:14px}.wallet-upload-list>div{border:1px solid #e5e7eb;background:#f8fafc;border-radius:12px;padding:12px}.wallet-upload-list small{display:block;color:#64748b;margin-top:6px}.wallet-settings-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.wallet-readiness{display:grid;gap:8px}.wallet-readiness span{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px}
-@media(max-width:720px){.wallet-settings-actions{display:grid}.wallet-settings-actions .btn,.wallet-settings-actions button{width:100%;box-sizing:border-box}}';
+@media(max-width:720px){.wallet-settings-actions{display:grid}.wallet-settings-actions .btn,.wallet-settings-actions button{width:100%;box-sizing:border-box}}.email-config-card .email-test-panel{margin-top:20px;padding:18px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:14px}.email-config-card .email-test-panel h2{margin-top:0}.email-config-card .email-test-panel .toolbar{margin-top:12px}';
     exit;
 }
 if (route() === 'email_open') {
@@ -3542,10 +3702,17 @@ HTML;
 
 if (route() === 'email_config') {
     if (!is_admin_user()) require_permission('system_admin');
-    page_header('Email system config'); audit('email.config.view');
+    page_header('Email system config');
+    audit('email.config.view');
     $cfg = app_config();
-    if ($_SERVER['REQUEST_METHOD']==='POST') { require_csrf();
-        save_app_config([
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        require_csrf();
+
+        // Blank secret fields deliberately retain their existing saved values.
+        $postedSmtpPassword = trim((string)($_POST['smtp_password'] ?? ''));
+        $postedResendKey = trim((string)($_POST['resend_api_key'] ?? ''));
+        $updates = [
             'email_from_name' => trim($_POST['email_from_name'] ?? ''),
             'email_from_address' => trim($_POST['email_from_address'] ?? ''),
             'email_reply_to' => trim($_POST['email_reply_to'] ?? ''),
@@ -3554,13 +3721,55 @@ if (route() === 'email_config') {
             'smtp_port' => trim($_POST['smtp_port'] ?? '587'),
             'smtp_security' => trim($_POST['smtp_security'] ?? 'tls'),
             'smtp_username' => trim($_POST['smtp_username'] ?? ''),
-            'smtp_password' => trim($_POST['smtp_password'] ?? ''),
-            'resend_api_key' => trim($_POST['resend_api_key'] ?? ''),
+            'smtp_password' => $postedSmtpPassword !== '' ? $postedSmtpPassword : ($cfg['smtp_password'] ?? ''),
+            'resend_api_key' => $postedResendKey !== '' ? $postedResendKey : ($cfg['resend_api_key'] ?? ''),
             'email_open_tracking_enabled' => isset($_POST['email_open_tracking_enabled']) ? '1' : '0',
-        ]);
-        audit('email.config.update'); flash('Email configuration saved.'); redirect('email_config');
+        ];
+        save_app_config($updates);
+        $cfg = app_config();
+
+        if (isset($_POST['send_test_email'])) {
+            $testRecipient = trim((string)($_POST['test_recipient'] ?? ''));
+            if ($testRecipient === '') $testRecipient = trim((string)($u['email'] ?? ''));
+            if (!filter_var($testRecipient, FILTER_VALIDATE_EMAIL)) {
+                audit('email.config.test','email_config',null,'failed','Invalid test recipient');
+                flash('Test email was not sent: enter a valid test recipient address.');
+                redirect('email_config');
+            }
+
+            $fromAddress = trim($cfg['email_from_address'] ?: ('noreply@' . ($_SERVER['HTTP_HOST'] ?? 'localhost')));
+            $fromName = trim($cfg['email_from_name'] ?: ($cfg['society_name'] ?? 'Membership System'));
+            $replyTo = email_reply_to_for_sender($u, $cfg, $fromAddress);
+            $subject = 'Email configuration test - ' . ($cfg['society_name'] ?? 'Membership System');
+            $html = '<h2>Email configuration test</h2><p>This is a test email sent by the membership system.</p><p><strong>Method:</strong> ' . e($cfg['email_method'] ?? 'php_mail') . '<br><strong>Time:</strong> ' . e(date('d/m/Y H:i:s')) . '</p><p>If you received this, the configured email transport accepted the message.</p>';
+
+            $result = send_configured_email($cfg, [$testRecipient], [], $subject, $html, $fromName, $fromAddress, $replyTo);
+            $auditMeta = [
+                'method' => $cfg['email_method'] ?? 'php_mail',
+                'recipient' => $testRecipient,
+                'smtp_host' => $cfg['smtp_host'] ?? '',
+                'smtp_port' => $cfg['smtp_port'] ?? '',
+                'smtp_security' => $cfg['smtp_security'] ?? '',
+                'diagnostic' => $result['diagnostic'] ?? null,
+            ];
+            audit('email.config.test','email_config',null,!empty($result['ok']) ? 'success' : 'failed',$result['error'] ?? null,$auditMeta);
+
+            if (!empty($result['ok'])) {
+                flash('Test email accepted by the configured ' . strtoupper((string)($cfg['email_method'] ?? 'php_mail')) . ' transport and sent to ' . $testRecipient . '.');
+            } else {
+                flash('Test email failed: ' . ($result['error'] ?? 'Unknown error') . (!empty($result['diagnostic']) ? ' | SMTP diagnostic: ' . $result['diagnostic'] : ''));
+            }
+            redirect('email_config');
+        }
+
+        audit('email.config.update');
+        flash('Email configuration saved.');
+        redirect('email_config');
     }
-    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Email system config</h1><a class="btn secondary" href="?route=emails">Back to emails</a></div><p class="muted">Choose how the system sends email. PHP mail uses the server mail setup. Resend API sends via Resend using the API key below. SMTP fields are stored for future SMTP wiring.</p><form method="post">'.csrf_field().'<div class="two"><div><label>From name</label><input name="email_from_name" value="'.e($cfg['email_from_name']).'"></div><div><label>From email address</label><input type="email" name="email_from_address" value="'.e($cfg['email_from_address']).'" placeholder="noreply@example.org"></div><div><label>Reply-to email</label><input type="email" name="email_reply_to" value="'.e($cfg['email_reply_to']).'"></div><div><label>Mail method</label><select name="email_method"><option value="php_mail" '.($cfg['email_method']==='php_mail'?'selected':'').'>PHP mail()</option><option value="resend" '.($cfg['email_method']==='resend'?'selected':'').'>Resend API</option><option value="smtp" '.($cfg['email_method']==='smtp'?'selected':'').'>SMTP settings stored</option></select></div><div class="full"><label>Resend API key</label><input type="password" name="resend_api_key" value="'.e($cfg['resend_api_key'] ?? '').'" placeholder="re_..."><p class="muted small">Used only when Mail method is set to Resend API. The From email must be allowed/verified in your Resend account.</p></div><div class="full"><label><input type="checkbox" name="email_open_tracking_enabled" value="1" '.(($cfg['email_open_tracking_enabled'] ?? '1')==='1'?'checked':'').'> Enable open/read tracking pixels</label><p class="muted small">This records when a recipient loads the tiny tracking image. It is not guaranteed proof the email was read because some mail apps block or pre-load images.</p></div><div><label>SMTP host</label><input name="smtp_host" value="'.e($cfg['smtp_host']).'"></div><div><label>SMTP port</label><input name="smtp_port" value="'.e($cfg['smtp_port']).'"></div><div><label>SMTP security</label><select name="smtp_security"><option value="tls" '.($cfg['smtp_security']==='tls'?'selected':'').'>TLS</option><option value="ssl" '.($cfg['smtp_security']==='ssl'?'selected':'').'>SSL</option><option value="none" '.($cfg['smtp_security']==='none'?'selected':'').'>None</option></select></div><div><label>SMTP username</label><input name="smtp_username" value="'.e($cfg['smtp_username']).'"></div><div><label>SMTP password</label><input type="password" name="smtp_password" value="'.e($cfg['smtp_password']).'"></div></div><p><button>Save email config</button></p></form></div>';
+
+    $smtpPasswordSet = !empty($cfg['smtp_password']);
+    $resendKeySet = !empty($cfg['resend_api_key']);
+    echo '<div class="card email-config-card"><div class="toolbar"><h1 style="margin-right:auto">Email system config</h1><a class="btn secondary" href="?route=emails">Back to emails</a></div><p class="muted">Choose how the system sends email. SMTP is now fully supported, including TLS/STARTTLS, SSL, SMTP authentication and email attachments. Use the test section to save the current settings and send a test message.</p><form method="post">'.csrf_field().'<div class="two"><div><label>From name</label><input name="email_from_name" value="'.e($cfg['email_from_name']).'"></div><div><label>From email address</label><input type="email" name="email_from_address" value="'.e($cfg['email_from_address']).'" placeholder="noreply@example.org"></div><div><label>Reply-to email fallback</label><input type="email" name="email_reply_to" value="'.e($cfg['email_reply_to']).'"></div><div><label>Mail method</label><select name="email_method"><option value="php_mail" '.($cfg['email_method']==='php_mail'?'selected':'').'>PHP mail()</option><option value="resend" '.($cfg['email_method']==='resend'?'selected':'').'>Resend API</option><option value="smtp" '.($cfg['email_method']==='smtp'?'selected':'').'>SMTP</option></select></div><div class="full"><label>Resend API key</label><input type="password" name="resend_api_key" value="" placeholder="'.($resendKeySet ? 'Saved — leave blank to keep current key' : 're_...').'"><p class="muted small">Used only when Mail method is set to Resend API. The From email must be allowed/verified in your Resend account.</p></div><div class="full"><label><input type="checkbox" name="email_open_tracking_enabled" value="1" '.(($cfg['email_open_tracking_enabled'] ?? '1')==='1'?'checked':'').'> Enable open/read tracking pixels</label><p class="muted small">This records when a recipient loads the tiny tracking image. It is not guaranteed proof the email was read because some mail apps block or pre-load images.</p></div><div><label>SMTP host</label><input name="smtp_host" value="'.e($cfg['smtp_host']).'" placeholder="smtp.example.org"></div><div><label>SMTP port</label><input name="smtp_port" value="'.e($cfg['smtp_port']).'" placeholder="587"></div><div><label>SMTP security</label><select name="smtp_security"><option value="tls" '.($cfg['smtp_security']==='tls'?'selected':'').'>TLS / STARTTLS (usually port 587)</option><option value="ssl" '.($cfg['smtp_security']==='ssl'?'selected':'').'>SSL / SMTPS (usually port 465)</option><option value="none" '.($cfg['smtp_security']==='none'?'selected':'').'>None (only for trusted local SMTP)</option></select></div><div><label>SMTP username</label><input name="smtp_username" value="'.e($cfg['smtp_username']).'"></div><div><label>SMTP password</label><input type="password" name="smtp_password" value="" placeholder="'.($smtpPasswordSet ? 'Saved — leave blank to keep current password' : 'SMTP password or app password').'"></div></div><div class="email-test-panel"><h2>Send a test email</h2><p class="muted">Saves the settings above first, then sends using the selected method. For SMTP failures, the flash message and audit log include a safe protocol diagnostic without exposing credentials.</p><label>Test recipient email</label><input type="email" name="test_recipient" value="'.e($u['email'] ?? '').'" placeholder="you@example.org"><div class="toolbar"><button class="secondary" name="send_test_email" value="1">Send test email</button><button>Save email config</button></div></div></form></div>';
     page_footer(); exit;
 }
 
