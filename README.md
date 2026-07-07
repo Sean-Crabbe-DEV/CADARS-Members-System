@@ -40,3 +40,11 @@ The Users admin page now allows admins to change which member record is linked t
 ## Wallet settings page
 
 Added Admin > Wallet settings. Admins can upload Apple Wallet pass certificate files, private key, WWDR certificate, certificate password, and Google/Android Wallet issuer/API details including service account JSON. Uploaded credential files are stored under the private storage folder rather than the public web folder.
+
+## SMTP sending and test email
+
+- Implemented SMTP sending with STARTTLS/TLS, SSL/SMTPS, or trusted unencrypted SMTP.
+- Supports SMTP AUTH LOGIN with AUTH PLAIN fallback.
+- SMTP sends support HTML email, BCC envelope recipients, Reply-To, and attachments.
+- Email settings now have a Send test email button which saves the current configuration and sends a test using the selected transport.
+- SMTP/Resend secret fields no longer display saved secrets; leaving them blank retains the existing value.
