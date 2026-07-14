@@ -114,6 +114,59 @@ function wallet_member_payload(array $member): array {
         'verify_url' => wallet_member_verify_url($member),
     ];
 }
+function membership_card_joined_text(array $member): string {
+    if (!empty($member['joined_before_system'])) return 'Before system records';
+    $date = trim((string)($member['date_joined'] ?? ''));
+    if ($date === '') return 'Not recorded';
+    $ts = strtotime($date);
+    return $ts ? date('d/m/Y', $ts) : $date;
+}
+
+function membership_card_logo_html(): string {
+    $cfg = app_config();
+    $logo = trim((string)($cfg['club_logo'] ?? ''));
+    if ($logo !== '' && is_file(wallet_private_dir() . '/' . basename($logo))) {
+        return '<img class="physical-card-logo-img" src="?route=club_logo" alt="' . e($cfg['society_name'] ?? 'Club logo') . '">';
+    }
+
+    $name = trim((string)($cfg['society_name'] ?? 'CADARS'));
+    $initials = '';
+    foreach (preg_split('/\s+/', $name) ?: [] as $word) {
+        if ($word !== '') $initials .= strtoupper(substr($word, 0, 1));
+    }
+    if ($initials === '') $initials = 'CADARS';
+    if (strlen($initials) < 3) $initials = strtoupper(substr($name, 0, 8));
+
+    return '<span class="physical-card-logo-fallback">' . e($initials) . '</span>';
+}
+
+function render_physical_membership_card(array $member, bool $printLink=false): string {
+    $cfg = app_config();
+    $club = trim((string)($cfg['society_name'] ?? 'Radio Club'));
+    $title = trim((string)($cfg['wallet_card_title'] ?? 'Membership'));
+    $colour = trim((string)($cfg['wallet_card_colour'] ?? '#2f407a'));
+    if (!preg_match('/^#[0-9A-Fa-f]{6}$/', $colour)) $colour = '#2f407a';
+
+    $name = trim((string)($member['first_name'] ?? '') . ' ' . (string)($member['last_name'] ?? ''));
+    $number = trim((string)($member['membership_number'] ?? ''));
+    $joined = membership_card_joined_text($member);
+    $verify = wallet_member_verify_url($member);
+    $qr = wallet_qr_img($verify, 300);
+
+    $html = '<article class="physical-membership-card" style="--member-card-colour:' . e($colour) . '">';
+    $html .= '<div class="physical-card-header"><div class="physical-card-brand">' . membership_card_logo_html() . '<div><strong>' . e($club) . '</strong><small>' . e($title) . ' card</small></div></div><span class="physical-card-label">MEMBERSHIP</span></div>';
+    $html .= '<div class="physical-card-body"><div class="physical-card-details">';
+    $html .= '<div class="physical-card-field physical-card-name"><span>MEMBER NAME</span><strong>' . e($name ?: 'Unnamed member') . '</strong></div>';
+    $html .= '<div class="physical-card-fields-row"><div class="physical-card-field"><span>MEMBERSHIP NUMBER</span><strong>' . e($number ?: 'Not set') . '</strong></div><div class="physical-card-field"><span>JOIN DATE</span><strong>' . e($joined) . '</strong></div></div>';
+    $html .= '</div><div class="physical-card-qr"><img src="' . e($qr) . '" alt="Membership verification QR code"><small>' . e($number ?: '') . '</small></div></div>';
+    $html .= '</article>';
+
+    if ($printLink) {
+        $html .= '<div class="physical-card-actions no-print"><a class="btn secondary" href="?route=membership_card&id=' . e($member['id']) . '" target="_blank">Open / print card</a></div>';
+    }
+    return $html;
+}
+
 function wallet_private_dir(): string {
     $dir = PRIVATE_PATH . '/wallet';
     if (!is_dir($dir)) mkdir($dir, 0750, true);
@@ -1305,7 +1358,7 @@ function page_header(string $title): void {
         echo '<a href="?route=dashboard">Dashboard</a><a href="?route=events">Programme</a><a href="?route=directory">Directory</a><a href="?route=brickworks">Brickworks</a>';
         if (can_view_committee_menu()) {
             echo '<div class="dropdown"><button type="button" class="nav-drop" aria-haspopup="true">Committee ▾</button><div class="dropdown-menu">';
-            if (has_permission('view_membership_db')) echo '<a href="?route=members">Members</a>';
+            if (has_permission('view_membership_db')) echo '<a href="?route=members">Members</a><a href="?route=membership_cards">Membership cards</a>';
             if (has_permission('track_attendance')) echo '<a href="?route=attendance">Attendance</a><a href="?route=attendance_stats">Attendance stats</a>';
             if (door_tax_manager()) echo '<a href="?route=door_tax">Door tax</a>';
             if (has_permission('send_member_emails')) echo '<a href="?route=emails">Emails</a>';
@@ -1319,6 +1372,7 @@ function page_header(string $title): void {
             echo '<a href="?route=audit">Audit logs</a>';
             echo '<a href="?route=email_config">Email settings</a>';
             echo '<a href="?route=wallet_cards">Wallet cards</a>';
+            echo '<a href="?route=membership_cards">Membership cards</a>';
             echo '<a href="?route=wallet_settings">Wallet settings</a>';
             echo '</div></div>';
         }
@@ -2108,9 +2162,11 @@ if (route() === 'assets.css') {
 @media(max-width:720px){.asset-hero,.action-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.asset-hero h1,.action-hero h1{font-size:1.55rem}.asset-hero-stats,.action-mini-stats{display:grid;grid-template-columns:1fr;width:100%}.asset-hero-stats div{min-width:0}.asset-card-grid{grid-template-columns:1fr;padding:12px}.asset-card-meta{grid-template-columns:1fr;gap:3px}.asset-card-meta strong{margin-bottom:8px}.asset-card-top{display:grid;grid-template-columns:1fr;gap:8px}.action-list-card .actions-board{padding:12px}.action-ticket{padding:13px}.ticket-head{display:grid!important;grid-template-columns:1fr;gap:8px}.action-ticket-body{padding:10px}.maintenance-list-card .ticket{margin:12px}.action-hero-icon{display:none}.asset-form-card .two,.action-form-card .two{grid-template-columns:1fr!important}}.action-header-side{display:grid;gap:10px;justify-items:end}.action-header-side .btn{width:max-content}@media(max-width:720px){.action-header-side{justify-items:stretch}.action-header-side .btn{width:100%;box-sizing:border-box}.asset-list-card>.dash-card-head{display:grid;grid-template-columns:1fr;gap:10px}.asset-list-card>.dash-card-head .btn{width:100%;box-sizing:border-box}}.member-hero{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;background:linear-gradient(135deg,#101827,#263858);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:0 12px 30px #0f172a22}.member-hero h1{margin:.15rem 0;font-size:2rem}.member-hero p{margin:0;color:#dbeafe}.member-hero-stats{display:flex;gap:10px;flex-wrap:wrap}.member-hero-stats div{background:#ffffff18;border:1px solid #ffffff40;border-radius:14px;padding:12px 16px;min-width:105px}.member-hero-stats strong{display:block;font-size:1.35rem}.member-hero-stats span{display:block;color:#dbeafe;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}.member-filter-card{padding:0;overflow:hidden}.member-list-card{padding:0;overflow:hidden}.member-list-card>.dash-card-head{padding:18px;border-bottom:1px solid #e5e7eb;margin:0}.member-header-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.member-card-grid{display:grid;gap:12px;padding:16px}.member-card-modern{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:start;border:1px solid #e5e7eb;border-radius:16px;background:#fff;padding:16px;transition:.15s ease}.member-card-modern:hover{box-shadow:0 10px 25px #0f172a14;transform:translateY(-1px);background:#f8fafc}.member-card-main{display:grid;grid-template-columns:54px 1fr;gap:14px;min-width:0}.member-avatar{width:54px;height:54px;border-radius:999px;background:#e0e7ff;color:#3730a3;display:grid;place-items:center;font-weight:900}.member-card-top{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.member-card-top h3{margin:0}.member-card-meta{display:grid;grid-template-columns:90px 1fr;gap:5px 10px;margin-top:10px}.member-card-meta span{color:#64748b;font-size:.86rem}.member-card-meta strong{font-size:.92rem}.member-card-actions{display:grid;gap:8px;justify-items:end}.member-attendance{display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center;margin-top:12px}.member-attendance span{display:block;color:#64748b;font-size:.86rem}.member-attendance strong{display:block}.member-form-card{border-top:4px solid #2563eb}.member-detail-hero .member-hero-stats div{min-width:140px}.member-detail-card{margin-top:0}.status-active,.status-honorary,.status-life_member{background:#dcfce7;color:#166534}.status-pending{background:#fef3c7;color:#92400e}.status-expired,.status-suspended{background:#fee2e2;color:#991b1b}.status-former{background:#f1f5f9;color:#334155}
 @media(max-width:720px){.member-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.member-hero h1{font-size:1.55rem}.member-hero-stats{display:grid;grid-template-columns:1fr;width:100%}.member-hero-stats div{min-width:0}.member-list-card>.dash-card-head{display:grid;grid-template-columns:1fr;gap:10px}.member-header-actions{display:grid;grid-template-columns:1fr;width:100%}.member-header-actions .btn{width:100%;box-sizing:border-box}.member-card-grid{padding:12px}.member-card-modern{grid-template-columns:1fr;padding:13px}.member-card-main{grid-template-columns:44px 1fr;gap:11px}.member-avatar{width:44px;height:44px}.member-card-actions{display:grid;grid-template-columns:1fr;justify-items:stretch}.member-card-actions .btn,.member-card-actions button{width:100%;box-sizing:border-box}.member-card-meta{grid-template-columns:1fr;gap:3px}.member-card-meta strong{margin-bottom:7px}.member-attendance{grid-template-columns:1fr}.member-form-card .two{grid-template-columns:1fr!important}}.member-attendance small{display:block;color:#64748b;margin-top:2px;font-size:.78rem}.email-member-card.disabled{opacity:.65;background:#f8fafc}.email-member-card.disabled .email-check-ui{background:#e5e7eb;color:#94a3b8}.email-member-card.disabled input{cursor:not-allowed}.email-member-card.disabled *{cursor:not-allowed}.wallet-hero{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;background:linear-gradient(135deg,#27396c,#16213e);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:0 12px 30px #0f172a22}.wallet-hero h1{margin:.15rem 0;font-size:2rem}.wallet-hero p{margin:0;color:#dbeafe}.wallet-hero-icon{width:76px;height:76px;border-radius:999px;background:#ffffff18;border:1px solid #ffffff40;display:grid;place-items:center;font-size:2rem;font-weight:900}.wallet-admin-grid{grid-template-columns:minmax(280px,420px) 1fr}.wallet-control-card,.wallet-preview-card{margin-top:0}.wallet-actions{display:grid;gap:8px}.wallet-pass-preview{width:min(100%,420px);min-height:560px;background:#2f407a;color:#fff;border-radius:18px;padding:26px;box-shadow:0 18px 35px #0f172a33;display:flex;flex-direction:column;gap:28px}.wallet-pass-top{display:flex;justify-content:space-between;gap:18px;align-items:center;font-size:1.25rem}.wallet-pass-field span,.wallet-pass-grid span{display:block;font-size:.78rem;font-weight:900;letter-spacing:.08em;color:#e5e7eb}.wallet-pass-field strong{display:block;font-size:2rem;font-weight:400;margin-top:4px}.wallet-pass-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.wallet-pass-grid strong{display:block;font-size:1.2rem;font-weight:400;margin-top:4px}.wallet-qr-box{margin:auto auto 0;align-self:center;background:#fff;border-radius:8px;padding:12px;color:#111827;text-align:center}.wallet-qr-box img{display:block;width:170px;height:170px}.wallet-qr-box small{display:block;margin-top:4px}.wallet-print-wrap{display:grid;place-items:center}.wallet-print-card{width:420px}.wallet-verify-card{display:grid;grid-template-columns:1fr auto;gap:16px;align-items:center;background:linear-gradient(135deg,#166534,#15803d);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px}.wallet-verify-card h1{margin:.2rem 0}.wallet-verify-card p{margin:0;color:#dcfce7}.wallet-status{background:#ffffff20;border:1px solid #ffffff40;border-radius:999px;padding:10px 14px;font-weight:900}
 @media(max-width:720px){.wallet-hero,.wallet-verify-card{grid-template-columns:1fr;padding:18px;border-radius:14px}.wallet-hero-icon{display:none}.wallet-admin-grid{grid-template-columns:1fr}.wallet-pass-preview{min-height:520px;padding:20px}.wallet-pass-field strong{font-size:1.55rem}.wallet-pass-grid{grid-template-columns:1fr}.wallet-qr-box img{width:150px;height:150px}}
-@media print{header,footer,.wallet-control-card,.wallet-preview-card h2,.wallet-print-wrap+*,main>.card:not(:has(.wallet-print-card)){display:none!important}body{background:#fff}.wallet-print-card{box-shadow:none}}.wallet-settings-grid{grid-template-columns:1fr}.wallet-settings-card{margin-top:0}.wallet-settings-card h2{margin-top:0}.wallet-upload-list{display:grid;gap:14px;margin-top:14px}.wallet-upload-list>div{border:1px solid #e5e7eb;background:#f8fafc;border-radius:12px;padding:12px}.wallet-upload-list small{display:block;color:#64748b;margin-top:6px}.wallet-settings-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.wallet-readiness{display:grid;gap:8px}.wallet-readiness span{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px}
+@media print{header,footer,.wallet-control-card,.wallet-preview-card h2,.wallet-print-wrap+*,main>.card:not(:has(.wallet-print-card)):not(.membership-cards-shell){display:none!important}body{background:#fff}.wallet-print-card{box-shadow:none}}.wallet-settings-grid{grid-template-columns:1fr}.wallet-settings-card{margin-top:0}.wallet-settings-card h2{margin-top:0}.wallet-upload-list{display:grid;gap:14px;margin-top:14px}.wallet-upload-list>div{border:1px solid #e5e7eb;background:#f8fafc;border-radius:12px;padding:12px}.wallet-upload-list small{display:block;color:#64748b;margin-top:6px}.wallet-settings-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.wallet-readiness{display:grid;gap:8px}.wallet-readiness span{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px}
 @media(max-width:720px){.wallet-settings-actions{display:grid}.wallet-settings-actions .btn,.wallet-settings-actions button{width:100%;box-sizing:border-box}}.email-config-card .email-test-panel{margin-top:20px;padding:18px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:14px}.email-config-card .email-test-panel h2{margin-top:0}.email-config-card .email-test-panel .toolbar{margin-top:12px}.door-tax-hero{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;background:linear-gradient(135deg,#14532d,#166534);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:0 12px 30px #0f172a22}.door-tax-hero h1{margin:.15rem 0;font-size:2rem}.door-tax-hero p{margin:0;color:#dcfce7}.door-tax-hero-stats{display:flex;gap:10px;flex-wrap:wrap}.door-tax-hero-stats div{background:#ffffff18;border:1px solid #ffffff40;border-radius:14px;padding:12px 16px;min-width:115px}.door-tax-hero-stats strong{display:block;font-size:1.35rem}.door-tax-hero-stats span{display:block;color:#dcfce7;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}.door-tax-grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.door-tax-table-card{overflow:auto}.door-tax-balance-card{border-top:4px solid #16a34a}.door-tax-balance-card h2{margin-top:0}
-@media(max-width:720px){.door-tax-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.door-tax-hero h1{font-size:1.55rem}.door-tax-hero-stats{display:grid;grid-template-columns:1fr;width:100%}.door-tax-grid{grid-template-columns:1fr}}';
+@media(max-width:720px){.door-tax-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.door-tax-hero h1{font-size:1.55rem}.door-tax-hero-stats{display:grid;grid-template-columns:1fr;width:100%}.door-tax-grid{grid-template-columns:1fr}}.membership-cards-shell{padding:0;overflow:visible}.membership-card-toolbar{padding:18px;border-bottom:1px solid #e5e7eb}.membership-card-filter{display:grid;grid-template-columns:minmax(220px,1fr) 220px auto;gap:12px;align-items:end}.membership-card-filter-actions{display:flex;gap:8px;flex-wrap:wrap}.physical-card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:22px;padding:22px}.physical-card-item{display:grid;justify-items:center;gap:10px;break-inside:avoid;page-break-inside:avoid}.physical-card-actions{display:flex;justify-content:center}.physical-membership-card{width:85.6mm;height:53.98mm;box-sizing:border-box;border-radius:3.2mm;background:linear-gradient(140deg,var(--member-card-colour),#172554);color:#fff;padding:4.5mm;box-shadow:0 5mm 10mm #0f172a35;display:grid;grid-template-rows:auto 1fr;overflow:hidden;position:relative;font-family:Arial,Helvetica,sans-serif}.physical-membership-card:after{content:"";position:absolute;width:45mm;height:45mm;border-radius:50%;right:-20mm;top:-22mm;background:#ffffff0d}.physical-card-header{display:flex;justify-content:space-between;align-items:flex-start;gap:3mm;position:relative;z-index:1}.physical-card-brand{display:flex;gap:2.5mm;align-items:center;min-width:0}.physical-card-logo-img{width:14mm;height:9mm;object-fit:contain;object-position:left center;filter:drop-shadow(0 1px 1px #0003)}.physical-card-logo-fallback{min-width:14mm;height:9mm;display:grid;place-items:center;border:0.35mm solid #ffffffaa;border-radius:1.2mm;font-size:3mm;font-weight:900;letter-spacing:.2mm}.physical-card-brand div{display:grid;gap:.4mm;min-width:0}.physical-card-brand strong{font-size:3.3mm;line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:42mm}.physical-card-brand small{font-size:2.1mm;color:#dbeafe}.physical-card-label{font-size:2.2mm;letter-spacing:.35mm;font-weight:900;color:#dbeafe}.physical-card-body{display:grid;grid-template-columns:1fr 24mm;gap:4mm;align-items:end;position:relative;z-index:1}.physical-card-details{display:grid;gap:4mm;align-self:stretch;padding-top:5mm}.physical-card-field span{display:block;font-size:2mm;font-weight:900;letter-spacing:.25mm;color:#dbeafe;margin-bottom:.8mm}.physical-card-field strong{display:block;font-size:3.4mm;font-weight:500;line-height:1.1}.physical-card-name strong{font-size:5.3mm;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:48mm}.physical-card-fields-row{display:grid;grid-template-columns:1fr 1fr;gap:4mm}.physical-card-qr{background:#fff;border-radius:1.5mm;padding:1.5mm;color:#111827;text-align:center;align-self:end}.physical-card-qr img{display:block;width:20mm;height:20mm}.physical-card-qr small{display:block;font-size:2.1mm;line-height:1;margin-top:.7mm}.single-card-stage{display:grid;place-items:center;padding:30px;min-height:65vh}.membership-profile-card{border-top:4px solid #2f407a}
+@media(max-width:720px){.membership-card-filter{grid-template-columns:1fr}.membership-card-filter-actions{display:grid}.membership-card-filter-actions .btn,.membership-card-filter-actions button{width:100%;box-sizing:border-box}.physical-card-grid{grid-template-columns:1fr;padding:12px;overflow-x:auto}.physical-membership-card{transform-origin:top center;max-width:none}.single-card-stage{padding:14px;overflow-x:auto;justify-content:start}.membership-profile-card .toolbar{display:grid;gap:10px}.membership-profile-card .btn{width:100%;box-sizing:border-box}}
+@media print{@page{size:A4 portrait;margin:8mm}.no-print,header,footer{display:none!important}main{padding:0!important;margin:0!important;max-width:none!important}.membership-cards-shell{border:0!important;box-shadow:none!important;margin:0!important;padding:0!important}.physical-card-grid{display:grid!important;grid-template-columns:85.6mm 85.6mm!important;gap:7mm 8mm!important;padding:0!important;justify-content:center!important}.physical-card-item{display:block!important;width:85.6mm!important;height:53.98mm!important}.physical-membership-card{width:85.6mm!important;height:53.98mm!important;box-shadow:none!important;break-inside:avoid!important;page-break-inside:avoid!important;-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}.single-membership-card-shell{display:block!important}.single-card-stage{display:block!important;padding:0!important;min-height:0!important}.single-card-stage .physical-membership-card{margin:0 auto!important}}';
     exit;
 }
 if (route() === 'email_open') {
@@ -2345,6 +2401,7 @@ if (route() === 'profile') {
     page_header('My Profile');
     $doorTaxBalance = door_tax_member_balance((int)$m['id']);
     echo '<div class="card door-tax-balance-card"><h2>Door tax balance</h2><p><strong>'.e(door_tax_money($doorTaxBalance)).'</strong> balance • '.e(door_tax_meetings_remaining($doorTaxBalance)).' meetings covered at '.e(door_tax_money(door_tax_charge_amount())).' per meeting.</p><p class="muted">Payments and corrections are managed by the Chair, Vice Chair, Secretary or Treasurer.</p></div>';
+    echo '<div class="card membership-profile-card"><div class="toolbar"><div><h2>Membership card</h2><p class="muted">View your printable credit-card-sized membership card and QR verification code.</p></div><a class="btn" href="?route=membership_card&id='.e($m['id']).'" target="_blank">View my card</a></div></div>';
     echo '<div class="card"><h1>My Profile</h1><p><strong>Membership number:</strong> '.e($m['membership_number'] ?: 'Not set').'<br><strong>Date joined:</strong> '.e(member_joined_display($m)).'</p><form method="post">'.csrf_field().'<div class="two"><div><label>First name</label><input name="first_name" value="'.e($m['first_name']).'"></div><div><label>Surname</label><input name="last_name" value="'.e($m['last_name']).'"></div><div><label>Callsign</label><input name="callsign" value="'.e($m['callsign']).'"></div><div><label>Licence level</label><input name="licence_level" value="'.e($m['licence_level']).'"></div><div><label>Email</label><input type="email" name="email" value="'.e($m['email']).'"></div><div><label>Phone</label><input name="phone" value="'.e(decrypt_value($m['phone_encrypted'])).'"></div><div class="full"><label>Address</label><textarea name="address">'.e(decrypt_value($m['address_encrypted'])).'</textarea></div><div class="full"><h2>Emergency contact</h2></div><div><label>Emergency contact name</label><input name="emergency_contact_name" value="'.e(decrypt_value($m['emergency_contact_name_encrypted'] ?? '')).'"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship" value="'.e(decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '')).'"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone" value="'.e(decrypt_value($m['emergency_contact_phone_encrypted'] ?? '')).'"></div></div>';
     echo '<h2>Internal directory</h2><p class="muted">If enabled, the internal directory will show only your name and callsign to logged-in members.</p><label><input type="checkbox" name="show_in_directory" '.(!empty($dp['show_callsign'])?'checked':'').'> Show my name and callsign in the internal directory</label>';
     echo '<h2>Consents</h2><p class="muted">These control how the society may contact you.</p>'.render_consent_checkboxes((int)$m['id']).'<p><button>Save profile</button></p></form></div>';
@@ -2473,7 +2530,7 @@ if (route() === 'members') {
     foreach(['active','pending','expired','former','suspended','honorary','life_member'] as $stOpt) echo '<option value="'.e($stOpt).'" '.($statusFilter===$stOpt?'selected':'').'>'.e($stOpt).'</option>';
     echo '</select></div><div class="programme-filter-actions"><button>Apply</button><a class="btn secondary" href="?route=members">Clear</a></div></form></section>';
 
-    echo '<section class="card member-list-card"><div class="dash-card-head"><div><h2>Member list</h2><p class="muted">Open a member to edit details, consents, payments and role history.</p></div><div class="member-header-actions"><a class="btn" href="?route=member_export">Export all members spreadsheet</a>';
+    echo '<section class="card member-list-card"><div class="dash-card-head"><div><h2>Member list</h2><p class="muted">Open a member to edit details, consents, payments and role history.</p></div><div class="member-header-actions"><a class="btn secondary" href="?route=membership_cards">Membership cards</a><a class="btn" href="?route=member_export">Export all members spreadsheet</a>';
     if (has_permission('edit_membership_db')) echo '<a class="btn secondary" href="?route=member_import">Import members</a><a class="btn" href="?route=member_create">Add member</a>';
     echo '</div></div>';
 
@@ -2490,7 +2547,7 @@ if (route() === 'members') {
             $initials=strtoupper(substr(trim($m['first_name'] ?? ''),0,1).substr(trim($m['last_name'] ?? ''),0,1));
             if($initials==='') $initials=strtoupper(substr($m['callsign'] ?: '?',0,2));
             $statusClass=preg_replace('/[^a-z0-9_]+/','_',strtolower($m['membership_status'] ?: 'unknown'));
-            echo '<article class="member-card-modern"><div class="member-card-main"><div class="member-avatar">'.e($initials).'</div><div><div class="member-card-top"><h3>'.e($name ?: 'Unnamed member').'</h3><span class="status-pill status-'.e($statusClass).'">'.e($m['membership_status'] ?: 'unknown').'</span></div><p class="muted">'.e($m['callsign'] ?: 'No callsign').' • Member no. '.e($m['membership_number'] ?: 'not set').'</p><div class="member-card-meta"><span>Joined</span><strong>'.e(member_joined_display($m)).'</strong><span>Renewal</span><strong>'.e($m['renewal_date'] ?: 'Not set').'</strong><span>Email</span><strong>'.e($m['email'] ?: 'Not set').'</strong></div><div class="member-attendance"><div><span>Attendance</span><strong>'.e($pctText).'</strong><small>'.e($st['attended']).' / '.e($st['sessions_since_start']).' sessions</small></div><div class="progressbar"><span style="width:'.e($pctWidth).'%"></span></div></div></div></div><div class="member-card-actions"><a class="btn secondary" href="?route=member_view&id='.e($m['id']).'">Open</a>';
+            echo '<article class="member-card-modern"><div class="member-card-main"><div class="member-avatar">'.e($initials).'</div><div><div class="member-card-top"><h3>'.e($name ?: 'Unnamed member').'</h3><span class="status-pill status-'.e($statusClass).'">'.e($m['membership_status'] ?: 'unknown').'</span></div><p class="muted">'.e($m['callsign'] ?: 'No callsign').' • Member no. '.e($m['membership_number'] ?: 'not set').'</p><div class="member-card-meta"><span>Joined</span><strong>'.e(member_joined_display($m)).'</strong><span>Renewal</span><strong>'.e($m['renewal_date'] ?: 'Not set').'</strong><span>Email</span><strong>'.e($m['email'] ?: 'Not set').'</strong></div><div class="member-attendance"><div><span>Attendance</span><strong>'.e($pctText).'</strong><small>'.e($st['attended']).' / '.e($st['sessions_since_start']).' sessions</small></div><div class="progressbar"><span style="width:'.e($pctWidth).'%"></span></div></div></div></div><div class="member-card-actions"><a class="btn secondary" href="?route=member_view&id='.e($m['id']).'">Open</a><a class="btn secondary" href="?route=membership_card&id='.e($m['id']).'" target="_blank">Card</a>';
             if (has_permission('edit_membership_db')) echo '<form method="post" onsubmit="return confirm(&quot;Delete this member and all linked records? This cannot be undone.&quot;)">'.csrf_field().'<input type="hidden" name="delete_member" value="1"><input type="hidden" name="member_id" value="'.e($m['id']).'"><button class="danger">Delete</button></form>';
             echo '</div></article>';
         }
@@ -2712,6 +2769,29 @@ if (route() === 'user_create') {
 }
 
 
+
+if (route() === 'club_logo') {
+    require_login();
+    $cfg = app_config();
+    $file = trim((string)($cfg['club_logo'] ?? ''));
+    if ($file === '') { http_response_code(404); exit; }
+    $path = wallet_private_dir() . '/' . basename($file);
+    if (!is_file($path)) { http_response_code(404); exit; }
+
+    $mime = function_exists('mime_content_type') ? (mime_content_type($path) ?: '') : '';
+    $allowed = ['image/png','image/jpeg','image/webp'];
+    if (!in_array($mime, $allowed, true)) {
+        $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        $mime = $ext === 'png' ? 'image/png' : (($ext === 'webp') ? 'image/webp' : 'image/jpeg');
+    }
+
+    header('Content-Type: ' . $mime);
+    header('Content-Length: ' . filesize($path));
+    header('Cache-Control: private, max-age=3600');
+    readfile($path);
+    exit;
+}
+
 if (route() === 'wallet_verify') {
     $id = (int)($_GET['id'] ?? 0);
     $token = preg_replace('/[^a-f0-9]/i', '', (string)($_GET['token'] ?? ''));
@@ -2774,7 +2854,7 @@ if (route() === 'wallet_settings') {
             'google_wallet_program_name' => trim($_POST['google_wallet_program_name'] ?? ''),
         ];
 
-        foreach (['apple_signing_cert','apple_private_key','apple_wwdr_cert','google_service_account_json'] as $key) {
+        foreach (['club_logo','apple_signing_cert','apple_private_key','apple_wwdr_cert','google_service_account_json'] as $key) {
             if (!empty($_POST['delete_'.$key])) {
                 $oldFile = $cfg[$key] ?? '';
                 if ($oldFile && is_file(wallet_private_dir().'/'.basename($oldFile))) @unlink(wallet_private_dir().'/'.basename($oldFile));
@@ -2784,6 +2864,7 @@ if (route() === 'wallet_settings') {
         }
 
         try {
+            wallet_upload_file('club_logo_file', 'club_logo', $updates);
             wallet_upload_file('apple_signing_cert_file', 'apple_signing_cert', $updates);
             wallet_upload_file('apple_private_key_file', 'apple_private_key', $updates);
             wallet_upload_file('apple_wwdr_cert_file', 'apple_wwdr_cert', $updates);
@@ -2804,7 +2885,7 @@ if (route() === 'wallet_settings') {
 
     echo '<form method="post" enctype="multipart/form-data">'.csrf_field().'<div class="grid wallet-settings-grid">';
 
-    echo '<div class="card wallet-settings-card"><h2>Card appearance</h2><div class="two"><div><label>Card title</label><input name="wallet_card_title" value="'.e($cfg['wallet_card_title'] ?? 'Membership').'"></div><div><label>Card colour</label><input name="wallet_card_colour" value="'.e($cfg['wallet_card_colour'] ?? '#2f407a').'" placeholder="#2f407a"></div></div><p class="muted">These settings are used by the card preview and can also be used by future Apple/Google pass generation.</p></div>';
+    echo '<div class="card wallet-settings-card"><h2>Card appearance</h2><div class="two"><div><label>Card title</label><input name="wallet_card_title" value="'.e($cfg['wallet_card_title'] ?? 'Membership').'"></div><div><label>Card colour</label><input name="wallet_card_colour" value="'.e($cfg['wallet_card_colour'] ?? '#2f407a').'" placeholder="#2f407a"></div></div><div class="wallet-upload-list"><div><label>Club logo</label><input type="file" name="club_logo_file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"><small>'.e(wallet_file_status('club_logo')).'</small><label class="check"><input type="checkbox" name="delete_club_logo" value="1"> Delete existing logo</label></div></div><p class="muted">The uploaded logo is used on printable membership cards. PNG, JPG or WebP works best. If no logo is uploaded, the system uses a club-name fallback.</p></div>';
 
     echo '<div class="card wallet-settings-card"><h2>Apple Wallet / .pkpass</h2><div class="two"><div><label>Apple Pass Type ID</label><input name="apple_pass_type_id" value="'.e($cfg['apple_pass_type_id'] ?? '').'" placeholder="pass.uk.org.example.membership"></div><div><label>Apple Team ID</label><input name="apple_team_id" value="'.e($cfg['apple_team_id'] ?? '').'" placeholder="ABCDE12345"></div><div><label>Organisation name</label><input name="apple_organization_name" value="'.e($cfg['apple_organization_name'] ?? '').'"></div><div><label>Pass description</label><input name="apple_pass_description" value="'.e($cfg['apple_pass_description'] ?? '').'" placeholder="Club membership card"></div><div><label>Serial prefix</label><input name="apple_pass_serial_prefix" value="'.e($cfg['apple_pass_serial_prefix'] ?? 'member-').'"></div><div><label>Certificate/private key password</label><input type="password" name="apple_cert_password" value="'.e($cfg['apple_cert_password'] ?? '').'" autocomplete="new-password"></div></div>';
 
@@ -2818,8 +2899,76 @@ if (route() === 'wallet_settings') {
 
     echo '</div><div class="card wallet-settings-actions"><button>Save wallet settings</button><a class="btn secondary" href="?route=wallet_cards">Back to Wallet cards</a></div></form>';
 
-    echo '<div class="card"><h2>Current readiness</h2><div class="wallet-readiness"><span>Apple Pass Type ID: <strong>'.e(($cfg['apple_pass_type_id'] ?? '') !== '' ? 'Set' : 'Missing').'</strong></span><span>Apple signing cert: <strong>'.e(wallet_file_status('apple_signing_cert')).'</strong></span><span>Apple private key: <strong>'.e(wallet_file_status('apple_private_key')).'</strong></span><span>Apple WWDR cert: <strong>'.e(wallet_file_status('apple_wwdr_cert')).'</strong></span><span>Google issuer ID: <strong>'.e(($cfg['google_wallet_issuer_id'] ?? '') !== '' ? 'Set' : 'Missing').'</strong></span><span>Google API JSON: <strong>'.e(wallet_file_status('google_service_account_json')).'</strong></span></div></div>';
+    echo '<div class="card"><h2>Current readiness</h2><div class="wallet-readiness"><span>Club logo: <strong>'.e(wallet_file_status('club_logo')).'</strong></span><span>Apple Pass Type ID: <strong>'.e(($cfg['apple_pass_type_id'] ?? '') !== '' ? 'Set' : 'Missing').'</strong></span><span>Apple signing cert: <strong>'.e(wallet_file_status('apple_signing_cert')).'</strong></span><span>Apple private key: <strong>'.e(wallet_file_status('apple_private_key')).'</strong></span><span>Apple WWDR cert: <strong>'.e(wallet_file_status('apple_wwdr_cert')).'</strong></span><span>Google issuer ID: <strong>'.e(($cfg['google_wallet_issuer_id'] ?? '') !== '' ? 'Set' : 'Missing').'</strong></span><span>Google API JSON: <strong>'.e(wallet_file_status('google_service_account_json')).'</strong></span></div></div>';
 
+    page_footer(); exit;
+}
+
+
+if (route() === 'membership_card') {
+    require_login();
+    $id = (int)($_GET['id'] ?? 0);
+    $member = first('SELECT * FROM members WHERE id=?', [$id]);
+    if (!$member) { http_response_code(404); exit('Member not found'); }
+
+    $isOwnCard = !empty($u['member_id']) && (int)$u['member_id'] === $id;
+    if (!$isOwnCard && !has_permission('view_membership_db')) {
+        http_response_code(403);
+        page_header('Access denied');
+        echo '<div class="card"><h2>Access denied</h2><p>You can only view your own membership card.</p></div>';
+        page_footer();
+        exit;
+    }
+
+    audit('membership_card.view','member',$id);
+    page_header('Membership card');
+    echo '<section class="card membership-cards-shell single-membership-card-shell"><div class="membership-card-toolbar no-print"><div><h1>Membership card</h1><p class="muted">Physical size: 85.60 × 53.98 mm.</p></div><div class="toolbar"><button type="button" onclick="window.print()">Print card</button>';
+    if (has_permission('view_membership_db')) echo '<a class="btn secondary" href="?route=membership_cards">All member cards</a>';
+    else echo '<a class="btn secondary" href="?route=profile">Back to profile</a>';
+    echo '</div></div><div class="single-card-stage">'.render_physical_membership_card($member, false).'</div></section>';
+    page_footer(); exit;
+}
+
+if (route() === 'membership_cards') {
+    require_permission('view_membership_db');
+    page_header('Membership cards');
+    audit('membership_cards.view');
+
+    $q = trim((string)($_GET['q'] ?? ''));
+    $status = trim((string)($_GET['status'] ?? 'active'));
+    $where = '1=1';
+    $params = [];
+
+    if ($q !== '') {
+        $where .= ' AND (first_name LIKE ? OR last_name LIKE ? OR callsign LIKE ? OR membership_number LIKE ?)';
+        $like = '%' . $q . '%';
+        $params = [$like,$like,$like,$like];
+    }
+    if ($status !== '') {
+        if ($status === 'current') {
+            $where .= ' AND membership_status IN ("active","honorary","life_member")';
+        } else {
+            $where .= ' AND membership_status=?';
+            $params[] = $status;
+        }
+    }
+
+    $members = all('SELECT * FROM members WHERE '.$where.' ORDER BY last_name,first_name', $params);
+
+    echo '<section class="wallet-hero no-print"><div><span class="eyebrow">Membership database</span><h1>Membership cards</h1><p>View and print credit-card-sized membership cards with QR verification links.</p></div><div class="wallet-hero-icon">▣</div></section>';
+
+    echo '<section class="card membership-cards-shell"><div class="membership-card-toolbar no-print"><form method="get" class="membership-card-filter"><input type="hidden" name="route" value="membership_cards"><div><label>Search</label><input name="q" value="'.e($q).'" placeholder="Name, callsign or member number"></div><div><label>Status</label><select name="status"><option value="" '.($status===''?'selected':'').'>All statuses</option><option value="current" '.($status==='current'?'selected':'').'>Current members</option>';
+    foreach(['active','honorary','life_member','pending','expired','former','suspended'] as $st) echo '<option value="'.e($st).'" '.($status===$st?'selected':'').'>'.e(ucwords(str_replace('_',' ',$st))).'</option>';
+    echo '</select></div><div class="membership-card-filter-actions"><button>Apply</button><a class="btn secondary" href="?route=membership_cards">Reset</a><button type="button" onclick="window.print()">Print shown cards</button></div></form><p class="muted">'.e(count($members)).' cards shown. Each printed card is 85.60 × 53.98 mm.</p></div>';
+
+    if (!$members) {
+        echo '<div class="empty-state no-print"><strong>No members found</strong><span>No member cards match the current filter.</span></div>';
+    } else {
+        echo '<div class="physical-card-grid">';
+        foreach($members as $member) echo '<div class="physical-card-item">'.render_physical_membership_card($member, true).'</div>';
+        echo '</div>';
+    }
+    echo '</section>';
     page_footer(); exit;
 }
 
@@ -2845,7 +2994,7 @@ if (route() === 'wallet_cards') {
 
     echo '<h2>Export options</h2>';
     if ($selected) {
-        echo '<div class="wallet-actions"><a class="btn" href="?route=wallet_card_print&id='.e($selected['id']).'" target="_blank">Print / save card</a><a class="btn secondary" href="?route=wallet_card_json&id='.e($selected['id']).'">Download pass data JSON</a><a class="btn secondary" href="?route=wallet_settings">Wallet settings</a><button class="secondary" type="button" disabled>Apple .pkpass needs certificate</button><button class="secondary" type="button" disabled>Google Wallet needs issuer API</button></div>';
+        echo '<div class="wallet-actions"><a class="btn" href="?route=wallet_card_print&id='.e($selected['id']).'" target="_blank">Print / save card</a><a class="btn secondary" href="?route=wallet_card_json&id='.e($selected['id']).'">Download pass data JSON</a><a class="btn secondary" href="?route=wallet_settings">Wallet settings</a><a class="btn secondary" href="?route=membership_cards">Physical membership cards</a><button class="secondary" type="button" disabled>Apple .pkpass needs certificate</button><button class="secondary" type="button" disabled>Google Wallet needs issuer API</button></div>';
     }
     echo '<p class="muted">Apple Wallet cards require an Apple Developer Pass Type ID and signing certificate before a real .pkpass can be installed. Google/Android Wallet requires Google Wallet issuer/API credentials. This page prepares the member card data and QR verification style ready for those integrations.</p></div>';
 
