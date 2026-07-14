@@ -52,3 +52,7 @@ Added Admin > Wallet settings. Admins can upload Apple Wallet pass certificate f
 ## Door tax module
 
 Added a Door tax module under the Committee menu. Access is restricted to Chair, Vice Chair, Secretary and Treasurer. The module tracks prepaid door tax balances, payments, manual charges/adjustments, and attendance-based deductions from past events. Members can see their door tax balance and number of meetings covered on their own profile. Member admin pages also show the door tax balance and link to management. Attendance pages link into Door tax so attended events can be charged.
+
+## Physical membership cards
+
+Added a Membership cards page linked from the Committee Members area, Admin menu, member list and Wallet cards page. Cards use the ISO/IEC 7810 ID-1 credit-card dimensions of 85.60 × 53.98 mm and show the club logo, member name, membership number, join date and the same QR verification link used by Wallet cards. Members can open their own card from My Profile. The Wallet settings page now includes a private club logo upload.
