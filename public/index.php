@@ -103,7 +103,7 @@ function wallet_qr_img(string $data, int $size=220): string {
 function wallet_member_payload(array $member): array {
     $name = trim(($member['first_name'] ?? '') . ' ' . ($member['last_name'] ?? ''));
     return [
-        'club' => app_config()['society_name'] ?? 'Radio Club',
+        'club' => 'GW4LWZ',
         'type' => 'Membership',
         'member_name' => $name,
         'membership_number' => $member['membership_number'] ?? '',
@@ -115,34 +115,21 @@ function wallet_member_payload(array $member): array {
     ];
 }
 function membership_card_joined_text(array $member): string {
-    if (!empty($member['joined_before_system'])) return 'Before system records';
+    // Leave the join date blank when the original date predates system records.
+    if (!empty($member['joined_before_system'])) return '';
     $date = trim((string)($member['date_joined'] ?? ''));
-    if ($date === '') return 'Not recorded';
+    if ($date === '') return '';
     $ts = strtotime($date);
     return $ts ? date('d/m/Y', $ts) : $date;
 }
 
 function membership_card_logo_html(): string {
-    $cfg = app_config();
-    $logo = trim((string)($cfg['club_logo'] ?? ''));
-    if ($logo !== '' && is_file(wallet_private_dir() . '/' . basename($logo))) {
-        return '<img class="physical-card-logo-img" src="?route=club_logo" alt="' . e($cfg['society_name'] ?? 'Club logo') . '">';
-    }
-
-    $name = trim((string)($cfg['society_name'] ?? 'CADARS'));
-    $initials = '';
-    foreach (preg_split('/\s+/', $name) ?: [] as $word) {
-        if ($word !== '') $initials .= strtoupper(substr($word, 0, 1));
-    }
-    if ($initials === '') $initials = 'CADARS';
-    if (strlen($initials) < 3) $initials = strtoupper(substr($name, 0, 8));
-
-    return '<span class="physical-card-logo-fallback">' . e($initials) . '</span>';
+    return '<img class="physical-card-logo-img" src="?route=club_logo" alt="GW4LWZ club logo">';
 }
 
 function render_physical_membership_card(array $member, bool $printLink=false): string {
     $cfg = app_config();
-    $club = trim((string)($cfg['society_name'] ?? 'Radio Club'));
+    $club = 'GW4LWZ';
     $title = trim((string)($cfg['wallet_card_title'] ?? 'Membership'));
     $colour = trim((string)($cfg['wallet_card_colour'] ?? '#2f407a'));
     if (!preg_match('/^#[0-9A-Fa-f]{6}$/', $colour)) $colour = '#2f407a';
@@ -2164,7 +2151,7 @@ if (route() === 'assets.css') {
 @media(max-width:720px){.wallet-hero,.wallet-verify-card{grid-template-columns:1fr;padding:18px;border-radius:14px}.wallet-hero-icon{display:none}.wallet-admin-grid{grid-template-columns:1fr}.wallet-pass-preview{min-height:520px;padding:20px}.wallet-pass-field strong{font-size:1.55rem}.wallet-pass-grid{grid-template-columns:1fr}.wallet-qr-box img{width:150px;height:150px}}
 @media print{header,footer,.wallet-control-card,.wallet-preview-card h2,.wallet-print-wrap+*,main>.card:not(:has(.wallet-print-card)):not(.membership-cards-shell){display:none!important}body{background:#fff}.wallet-print-card{box-shadow:none}}.wallet-settings-grid{grid-template-columns:1fr}.wallet-settings-card{margin-top:0}.wallet-settings-card h2{margin-top:0}.wallet-upload-list{display:grid;gap:14px;margin-top:14px}.wallet-upload-list>div{border:1px solid #e5e7eb;background:#f8fafc;border-radius:12px;padding:12px}.wallet-upload-list small{display:block;color:#64748b;margin-top:6px}.wallet-settings-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.wallet-readiness{display:grid;gap:8px}.wallet-readiness span{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px}
 @media(max-width:720px){.wallet-settings-actions{display:grid}.wallet-settings-actions .btn,.wallet-settings-actions button{width:100%;box-sizing:border-box}}.email-config-card .email-test-panel{margin-top:20px;padding:18px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:14px}.email-config-card .email-test-panel h2{margin-top:0}.email-config-card .email-test-panel .toolbar{margin-top:12px}.door-tax-hero{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;background:linear-gradient(135deg,#14532d,#166534);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:0 12px 30px #0f172a22}.door-tax-hero h1{margin:.15rem 0;font-size:2rem}.door-tax-hero p{margin:0;color:#dcfce7}.door-tax-hero-stats{display:flex;gap:10px;flex-wrap:wrap}.door-tax-hero-stats div{background:#ffffff18;border:1px solid #ffffff40;border-radius:14px;padding:12px 16px;min-width:115px}.door-tax-hero-stats strong{display:block;font-size:1.35rem}.door-tax-hero-stats span{display:block;color:#dcfce7;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}.door-tax-grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.door-tax-table-card{overflow:auto}.door-tax-balance-card{border-top:4px solid #16a34a}.door-tax-balance-card h2{margin-top:0}
-@media(max-width:720px){.door-tax-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.door-tax-hero h1{font-size:1.55rem}.door-tax-hero-stats{display:grid;grid-template-columns:1fr;width:100%}.door-tax-grid{grid-template-columns:1fr}}.membership-cards-shell{padding:0;overflow:visible}.membership-card-toolbar{padding:18px;border-bottom:1px solid #e5e7eb}.membership-card-filter{display:grid;grid-template-columns:minmax(220px,1fr) 220px auto;gap:12px;align-items:end}.membership-card-filter-actions{display:flex;gap:8px;flex-wrap:wrap}.physical-card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:22px;padding:22px}.physical-card-item{display:grid;justify-items:center;gap:10px;break-inside:avoid;page-break-inside:avoid}.physical-card-actions{display:flex;justify-content:center}.physical-membership-card{width:85.6mm;height:53.98mm;box-sizing:border-box;border-radius:3.2mm;background:linear-gradient(140deg,var(--member-card-colour),#172554);color:#fff;padding:4.5mm;box-shadow:0 5mm 10mm #0f172a35;display:grid;grid-template-rows:auto 1fr;overflow:hidden;position:relative;font-family:Arial,Helvetica,sans-serif}.physical-membership-card:after{content:"";position:absolute;width:45mm;height:45mm;border-radius:50%;right:-20mm;top:-22mm;background:#ffffff0d}.physical-card-header{display:flex;justify-content:space-between;align-items:flex-start;gap:3mm;position:relative;z-index:1}.physical-card-brand{display:flex;gap:2.5mm;align-items:center;min-width:0}.physical-card-logo-img{width:14mm;height:9mm;object-fit:contain;object-position:left center;filter:drop-shadow(0 1px 1px #0003)}.physical-card-logo-fallback{min-width:14mm;height:9mm;display:grid;place-items:center;border:0.35mm solid #ffffffaa;border-radius:1.2mm;font-size:3mm;font-weight:900;letter-spacing:.2mm}.physical-card-brand div{display:grid;gap:.4mm;min-width:0}.physical-card-brand strong{font-size:3.3mm;line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:42mm}.physical-card-brand small{font-size:2.1mm;color:#dbeafe}.physical-card-label{font-size:2.2mm;letter-spacing:.35mm;font-weight:900;color:#dbeafe}.physical-card-body{display:grid;grid-template-columns:1fr 24mm;gap:4mm;align-items:end;position:relative;z-index:1}.physical-card-details{display:grid;gap:4mm;align-self:stretch;padding-top:5mm}.physical-card-field span{display:block;font-size:2mm;font-weight:900;letter-spacing:.25mm;color:#dbeafe;margin-bottom:.8mm}.physical-card-field strong{display:block;font-size:3.4mm;font-weight:500;line-height:1.1}.physical-card-name strong{font-size:5.3mm;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:48mm}.physical-card-fields-row{display:grid;grid-template-columns:1fr 1fr;gap:4mm}.physical-card-qr{background:#fff;border-radius:1.5mm;padding:1.5mm;color:#111827;text-align:center;align-self:end}.physical-card-qr img{display:block;width:20mm;height:20mm}.physical-card-qr small{display:block;font-size:2.1mm;line-height:1;margin-top:.7mm}.single-card-stage{display:grid;place-items:center;padding:30px;min-height:65vh}.membership-profile-card{border-top:4px solid #2f407a}
+@media(max-width:720px){.door-tax-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.door-tax-hero h1{font-size:1.55rem}.door-tax-hero-stats{display:grid;grid-template-columns:1fr;width:100%}.door-tax-grid{grid-template-columns:1fr}}.membership-cards-shell{padding:0;overflow:visible}.membership-card-toolbar{padding:18px;border-bottom:1px solid #e5e7eb}.membership-card-filter{display:grid;grid-template-columns:minmax(220px,1fr) 220px auto;gap:12px;align-items:end}.membership-card-filter-actions{display:flex;gap:8px;flex-wrap:wrap}.physical-card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:22px;padding:22px}.physical-card-item{display:grid;justify-items:center;gap:10px;break-inside:avoid;page-break-inside:avoid}.physical-card-actions{display:flex;justify-content:center}.physical-membership-card{width:85.6mm;height:53.98mm;box-sizing:border-box;border-radius:3.2mm;background:linear-gradient(140deg,var(--member-card-colour),#172554);color:#fff;padding:4.5mm;box-shadow:0 5mm 10mm #0f172a35;display:grid;grid-template-rows:auto 1fr;overflow:hidden;position:relative;font-family:Arial,Helvetica,sans-serif}.physical-membership-card:after{content:"";position:absolute;width:45mm;height:45mm;border-radius:50%;right:-20mm;top:-22mm;background:#ffffff0d}.physical-card-header{display:flex;justify-content:space-between;align-items:flex-start;gap:3mm;position:relative;z-index:1}.physical-card-brand{display:flex;gap:2.5mm;align-items:center;min-width:0}.physical-card-logo-img{width:19mm;height:10mm;object-fit:contain;object-position:left center;filter:drop-shadow(0 1px 1px #0003)}.physical-card-logo-fallback{min-width:14mm;height:9mm;display:grid;place-items:center;border:0.35mm solid #ffffffaa;border-radius:1.2mm;font-size:3mm;font-weight:900;letter-spacing:.2mm}.physical-card-brand div{display:grid;gap:.4mm;min-width:0}.physical-card-brand strong{font-size:3.3mm;line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:42mm}.physical-card-brand small{font-size:2.1mm;color:#dbeafe}.physical-card-label{font-size:2.2mm;letter-spacing:.35mm;font-weight:900;color:#dbeafe}.physical-card-body{display:grid;grid-template-columns:1fr 24mm;gap:4mm;align-items:end;position:relative;z-index:1}.physical-card-details{display:grid;gap:4mm;align-self:stretch;padding-top:5mm}.physical-card-field span{display:block;font-size:2mm;font-weight:900;letter-spacing:.25mm;color:#dbeafe;margin-bottom:.8mm}.physical-card-field strong{display:block;font-size:3.4mm;font-weight:500;line-height:1.1}.physical-card-name strong{font-size:5.3mm;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:48mm}.physical-card-fields-row{display:grid;grid-template-columns:1fr 1fr;gap:4mm}.physical-card-qr{background:#fff;border-radius:1.5mm;padding:1.5mm;color:#111827;text-align:center;align-self:end}.physical-card-qr img{display:block;width:20mm;height:20mm}.physical-card-qr small{display:block;font-size:2.1mm;line-height:1;margin-top:.7mm}.single-card-stage{display:grid;place-items:center;padding:30px;min-height:65vh}.membership-profile-card{border-top:4px solid #2f407a}
 @media(max-width:720px){.membership-card-filter{grid-template-columns:1fr}.membership-card-filter-actions{display:grid}.membership-card-filter-actions .btn,.membership-card-filter-actions button{width:100%;box-sizing:border-box}.physical-card-grid{grid-template-columns:1fr;padding:12px;overflow-x:auto}.physical-membership-card{transform-origin:top center;max-width:none}.single-card-stage{padding:14px;overflow-x:auto;justify-content:start}.membership-profile-card .toolbar{display:grid;gap:10px}.membership-profile-card .btn{width:100%;box-sizing:border-box}}
 @media print{@page{size:A4 portrait;margin:8mm}.no-print,header,footer{display:none!important}main{padding:0!important;margin:0!important;max-width:none!important}.membership-cards-shell{border:0!important;box-shadow:none!important;margin:0!important;padding:0!important}.physical-card-grid{display:grid!important;grid-template-columns:85.6mm 85.6mm!important;gap:7mm 8mm!important;padding:0!important;justify-content:center!important}.physical-card-item{display:block!important;width:85.6mm!important;height:53.98mm!important}.physical-membership-card{width:85.6mm!important;height:53.98mm!important;box-shadow:none!important;break-inside:avoid!important;page-break-inside:avoid!important;-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}.single-membership-card-shell{display:block!important}.single-card-stage{display:block!important;padding:0!important;min-height:0!important}.single-card-stage .physical-membership-card{margin:0 auto!important}}';
     exit;
@@ -2774,8 +2761,11 @@ if (route() === 'club_logo') {
     require_login();
     $cfg = app_config();
     $file = trim((string)($cfg['club_logo'] ?? ''));
-    if ($file === '') { http_response_code(404); exit; }
-    $path = wallet_private_dir() . '/' . basename($file);
+    $path = $file !== '' ? wallet_private_dir() . '/' . basename($file) : '';
+
+    if ($path === '' || !is_file($path)) {
+        $path = __DIR__ . '/assets/gw4lwz-logo.png';
+    }
     if (!is_file($path)) { http_response_code(404); exit; }
 
     $mime = function_exists('mime_content_type') ? (mime_content_type($path) ?: '') : '';
