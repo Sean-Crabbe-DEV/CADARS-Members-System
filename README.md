@@ -56,3 +56,14 @@ Added a Door tax module under the Committee menu. Access is restricted to Chair,
 ## Physical membership cards
 
 Added a Membership cards page linked from the Committee Members area, Admin menu, member list and Wallet cards page. Cards use the ISO/IEC 7810 ID-1 credit-card dimensions of 85.60 × 53.98 mm and show the club logo, member name, membership number, join date and the same QR verification link used by Wallet cards. Members can open their own card from My Profile. The Wallet settings page now includes a private club logo upload.
+
+## Membership card join date display
+
+Membership cards now leave the join date value blank when the member is marked as having joined before system records, or when no join date is recorded.
+
+## GW4LWZ membership-card branding
+
+- Join date is blank on cards for members marked as joined before system records.
+- Bundled the official GW4LWZ transparent logo as the default card logo.
+- Membership and wallet card headings use GW4LWZ instead of the full club name.
+- A custom logo uploaded through Wallet settings still overrides the bundled logo.
