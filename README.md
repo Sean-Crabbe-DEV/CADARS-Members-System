@@ -75,3 +75,7 @@ Refined the physical membership-card layout to better match the visual design. T
 ## Membership card print pagination update
 
 Adjusted the physical membership-card print styles so cards are not split across pages and print in batches of up to 8 per A4 sheet. Also tightened the logo/heading spacing so the GW4LWZ title sits closer to the club logo.
+
+## Membership card links page
+
+Changed the Membership cards page to a member list with separate columns for Physical card, Apple Wallet and Android/Google Wallet. Added a top-level View / print all physical cards button, which opens a dedicated print view containing all member cards. Wallet links automatically load the selected member and relevant platform on the Wallet cards page.

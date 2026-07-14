@@ -2392,6 +2392,48 @@ if (route() === 'assets.css') {
         break-after:auto!important;
         page-break-after:auto!important;
     }
+}/* Membership card link list */
+.membership-card-list-shell{padding:0;overflow:hidden}
+.membership-card-list-header{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:18px;border-bottom:1px solid #e5e7eb}
+.membership-card-list-header h2{margin:0}
+.membership-card-list-header p{margin:.25rem 0 0}
+.membership-card-list-filter{display:grid;grid-template-columns:minmax(240px,1fr) 220px auto;gap:12px;align-items:end;padding:16px 18px;background:#f8fafc;border-bottom:1px solid #e5e7eb}
+.membership-card-list-filter-actions{display:flex;gap:8px;flex-wrap:wrap}
+.membership-card-list-count{padding:0 18px;margin:14px 0 0}
+.membership-card-link-table-wrap{overflow:auto;padding:14px 18px 18px}
+.membership-card-link-table{width:100%;border-collapse:separate;border-spacing:0}
+.membership-card-link-table th{background:#f8fafc;color:#475569;font-size:.82rem;text-transform:uppercase;letter-spacing:.04em;text-align:left;padding:12px;border-top:1px solid #e5e7eb;border-bottom:1px solid #e5e7eb}
+.membership-card-link-table th:first-child{border-left:1px solid #e5e7eb;border-radius:12px 0 0 0}
+.membership-card-link-table th:last-child{border-right:1px solid #e5e7eb;border-radius:0 12px 0 0}
+.membership-card-link-table td{padding:13px 12px;border-bottom:1px solid #e5e7eb;background:#fff;vertical-align:middle}
+.membership-card-link-table td:first-child{border-left:1px solid #e5e7eb}
+.membership-card-link-table td:last-child{border-right:1px solid #e5e7eb}
+.membership-card-link-table tr:last-child td:first-child{border-radius:0 0 0 12px}
+.membership-card-link-table tr:last-child td:last-child{border-radius:0 0 12px 0}
+.membership-card-link-table td strong{display:block}
+.membership-card-link-table td small{display:block;color:#64748b;margin-top:3px}
+.membership-format-button{display:inline-flex;justify-content:center;min-width:165px}
+.apple-wallet-button{border-color:#111827}
+.google-wallet-button{border-color:#2563eb}
+.wallet-platform-status{display:grid;gap:4px;border-radius:12px;padding:12px;margin:14px 0}
+.wallet-platform-status.apple{background:#f1f5f9;border:1px solid #cbd5e1}
+.wallet-platform-status.google{background:#eff6ff;border:1px solid #bfdbfe}
+.wallet-platform-status span{color:#475569;font-size:.9rem}
+
+@media(max-width:820px){
+    .membership-card-list-header{display:grid}
+    .membership-card-list-header .btn{width:100%;box-sizing:border-box}
+    .membership-card-list-filter{grid-template-columns:1fr}
+    .membership-card-list-filter-actions{display:grid}
+    .membership-card-list-filter-actions .btn,.membership-card-list-filter-actions button{width:100%;box-sizing:border-box}
+    .membership-card-link-table-wrap{padding:12px}
+    .membership-card-link-table,.membership-card-link-table tbody,.membership-card-link-table tr,.membership-card-link-table td{display:block;width:100%}
+    .membership-card-link-table thead{display:none}
+    .membership-card-link-table tr{border:1px solid #e5e7eb;border-radius:14px;margin-bottom:12px;overflow:hidden;background:#fff}
+    .membership-card-link-table td{border:0!important;border-bottom:1px solid #e5e7eb!important;display:grid;grid-template-columns:135px 1fr;gap:10px;align-items:center;box-sizing:border-box}
+    .membership-card-link-table td:last-child{border-bottom:0!important}
+    .membership-card-link-table td:before{content:attr(data-label);font-size:.78rem;text-transform:uppercase;letter-spacing:.04em;color:#64748b;font-weight:800}
+    .membership-format-button{width:100%;min-width:0;box-sizing:border-box}
 }';
     exit;
 }
@@ -3158,13 +3200,34 @@ if (route() === 'membership_card') {
     page_footer(); exit;
 }
 
+if (route() === 'membership_cards_print') {
+    require_permission('view_membership_db');
+    page_header('Print all membership cards');
+    audit('membership_cards.print_all');
+
+    $members = all('SELECT * FROM members ORDER BY last_name,first_name');
+
+    echo '<section class="card membership-cards-shell print-all-membership-cards"><div class="membership-card-toolbar no-print"><div><h1>All physical membership cards</h1><p class="muted">'.e(count($members)).' member cards. Printing is limited to a maximum of 8 cards per A4 page.</p></div><div class="toolbar"><button type="button" onclick="window.print()">Print all cards</button><a class="btn secondary" href="?route=membership_cards">Back to card list</a></div></div>';
+
+    if (!$members) {
+        echo '<div class="empty-state no-print"><strong>No members found</strong><span>No physical membership cards are available.</span></div>';
+    } else {
+        echo '<div class="physical-card-grid">';
+        foreach($members as $member) echo '<div class="physical-card-item">'.render_physical_membership_card($member, false).'</div>';
+        echo '</div>';
+    }
+
+    echo '</section>';
+    page_footer(); exit;
+}
+
 if (route() === 'membership_cards') {
     require_permission('view_membership_db');
     page_header('Membership cards');
     audit('membership_cards.view');
 
     $q = trim((string)($_GET['q'] ?? ''));
-    $status = trim((string)($_GET['status'] ?? 'active'));
+    $status = trim((string)($_GET['status'] ?? ''));
     $where = '1=1';
     $params = [];
 
@@ -3173,6 +3236,7 @@ if (route() === 'membership_cards') {
         $like = '%' . $q . '%';
         $params = [$like,$like,$like,$like];
     }
+
     if ($status !== '') {
         if ($status === 'current') {
             $where .= ' AND membership_status IN ("active","honorary","life_member")';
@@ -3184,19 +3248,38 @@ if (route() === 'membership_cards') {
 
     $members = all('SELECT * FROM members WHERE '.$where.' ORDER BY last_name,first_name', $params);
 
-    echo '<section class="wallet-hero no-print"><div><span class="eyebrow">Membership database</span><h1>Membership cards</h1><p>View and print credit-card-sized membership cards with QR verification links.</p></div><div class="wallet-hero-icon">▣</div></section>';
+    echo '<section class="wallet-hero no-print"><div><span class="eyebrow">Membership database</span><h1>Membership cards</h1><p>Open each member’s physical, Apple Wallet or Android/Google Wallet card.</p></div><div class="wallet-hero-icon">▣</div></section>';
 
-    echo '<section class="card membership-cards-shell"><div class="membership-card-toolbar no-print"><form method="get" class="membership-card-filter"><input type="hidden" name="route" value="membership_cards"><div><label>Search</label><input name="q" value="'.e($q).'" placeholder="Name, callsign or member number"></div><div><label>Status</label><select name="status"><option value="" '.($status===''?'selected':'').'>All statuses</option><option value="current" '.($status==='current'?'selected':'').'>Current members</option>';
+    echo '<section class="card membership-card-list-shell">';
+    echo '<div class="membership-card-list-header"><div><h2>Member card links</h2><p class="muted">Choose the card format required for each member.</p></div><a class="btn" href="?route=membership_cards_print" target="_blank">View / print all physical cards</a></div>';
+
+    echo '<form method="get" class="membership-card-list-filter"><input type="hidden" name="route" value="membership_cards"><div><label>Search</label><input name="q" value="'.e($q).'" placeholder="Name, callsign or member number"></div><div><label>Status</label><select name="status"><option value="" '.($status===''?'selected':'').'>All statuses</option><option value="current" '.($status==='current'?'selected':'').'>Current members</option>';
     foreach(['active','honorary','life_member','pending','expired','former','suspended'] as $st) echo '<option value="'.e($st).'" '.($status===$st?'selected':'').'>'.e(ucwords(str_replace('_',' ',$st))).'</option>';
-    echo '</select></div><div class="membership-card-filter-actions"><button>Apply</button><a class="btn secondary" href="?route=membership_cards">Reset</a><button type="button" onclick="window.print()">Print shown cards</button></div></form><p class="muted">'.e(count($members)).' cards shown. Each printed card is 85.60 × 53.98 mm.</p></div>';
+    echo '</select></div><div class="membership-card-list-filter-actions"><button>Apply</button><a class="btn secondary" href="?route=membership_cards">Reset</a></div></form>';
+
+    echo '<p class="muted membership-card-list-count">'.e(count($members)).' members shown.</p>';
 
     if (!$members) {
-        echo '<div class="empty-state no-print"><strong>No members found</strong><span>No member cards match the current filter.</span></div>';
+        echo '<div class="empty-state"><strong>No members found</strong><span>No members match the current search or status filter.</span></div>';
     } else {
-        echo '<div class="physical-card-grid">';
-        foreach($members as $member) echo '<div class="physical-card-item">'.render_physical_membership_card($member, true).'</div>';
-        echo '</div>';
+        echo '<div class="membership-card-link-table-wrap"><table class="membership-card-link-table"><thead><tr><th>Member</th><th>Physical card</th><th>Apple Wallet</th><th>Android / Google Wallet</th></tr></thead><tbody>';
+        foreach($members as $member){
+            $name = trim(($member['first_name'] ?? '').' '.($member['last_name'] ?? ''));
+            $details = [];
+            if (!empty($member['membership_number'])) $details[] = 'No. '.$member['membership_number'];
+            if (!empty($member['callsign'])) $details[] = $member['callsign'];
+            if (!empty($member['membership_status'])) $details[] = ucwords(str_replace('_',' ',$member['membership_status']));
+
+            echo '<tr>';
+            echo '<td data-label="Member"><strong>'.e($name ?: 'Unnamed member').'</strong><small>'.e(implode(' • ', $details)).'</small></td>';
+            echo '<td data-label="Physical card"><a class="btn secondary membership-format-button" href="?route=membership_card&id='.e($member['id']).'" target="_blank">View physical card</a></td>';
+            echo '<td data-label="Apple Wallet"><a class="btn secondary membership-format-button apple-wallet-button" href="?route=wallet_cards&member_id='.e($member['id']).'&platform=apple">Apple Wallet card</a></td>';
+            echo '<td data-label="Android / Google Wallet"><a class="btn secondary membership-format-button google-wallet-button" href="?route=wallet_cards&member_id='.e($member['id']).'&platform=google">Android Wallet card</a></td>';
+            echo '</tr>';
+        }
+        echo '</tbody></table></div>';
     }
+
     echo '</section>';
     page_footer(); exit;
 }
@@ -3205,14 +3288,19 @@ if (route() === 'wallet_cards') {
     require_permission('manage_users');
     page_header('Wallet cards');
     audit('wallet_cards.view');
+    $cfg = app_config();
     $members = all('SELECT * FROM members ORDER BY last_name, first_name');
     $selectedId = (int)($_GET['member_id'] ?? ($members[0]['id'] ?? 0));
+    $platform = strtolower(trim((string)($_GET['platform'] ?? '')));
+    if (!in_array($platform, ['apple','google'], true)) $platform = '';
     $selected = $selectedId ? first('SELECT * FROM members WHERE id=?', [$selectedId]) : null;
     $payload = $selected ? wallet_member_payload($selected) : null;
 
-    echo '<section class="wallet-hero"><div><span class="eyebrow">Admin tools</span><h1>Wallet membership cards</h1><p>Generate a wallet-style membership card preview with a QR verification link for Apple/Android style membership cards.</p></div><div class="wallet-hero-icon">▣</div></section>';
+    $platformTitle = $platform === 'apple' ? 'Apple Wallet card' : ($platform === 'google' ? 'Android / Google Wallet card' : 'Wallet membership cards');
+    $platformText = $platform === 'apple' ? 'Review the selected member and Apple Wallet configuration.' : ($platform === 'google' ? 'Review the selected member and Google Wallet configuration.' : 'Generate a wallet-style membership card preview with a QR verification link.');
+    echo '<section class="wallet-hero"><div><span class="eyebrow">Admin tools</span><h1>'.e($platformTitle).'</h1><p>'.e($platformText).'</p></div><div class="wallet-hero-icon">▣</div></section>';
 
-    echo '<div class="grid wallet-admin-grid"><div class="card wallet-control-card"><h2>Select member</h2><form method="get"><input type="hidden" name="route" value="wallet_cards"><label>Member</label><select name="member_id" onchange="this.form.submit()">';
+    echo '<div class="grid wallet-admin-grid"><div class="card wallet-control-card"><h2>Select member</h2><form method="get"><input type="hidden" name="route" value="wallet_cards">'.($platform!==''?'<input type="hidden" name="platform" value="'.e($platform).'">':'').'<label>Member</label><select name="member_id" onchange="this.form.submit()">';
     foreach($members as $m){
         $label = trim(($m['first_name'] ?? '').' '.($m['last_name'] ?? ''));
         if (!empty($m['callsign'])) $label .= ' - '.$m['callsign'];
@@ -3221,6 +3309,12 @@ if (route() === 'wallet_cards') {
     }
     echo '</select><button>Load member</button></form>';
 
+    if ($platform !== '') {
+        $readyText = $platform === 'apple'
+            ? ((!empty($cfg['apple_pass_type_id']) && wallet_file_status('apple_signing_cert') !== 'Not uploaded') ? 'Apple Wallet credentials appear configured.' : 'Apple Wallet certificate/settings still need completing.')
+            : ((!empty($cfg['google_wallet_issuer_id']) && wallet_file_status('google_service_account_json') !== 'Not uploaded') ? 'Google Wallet credentials appear configured.' : 'Google Wallet issuer/API settings still need completing.');
+        echo '<div class="wallet-platform-status '.e($platform).'"><strong>'.e($platform === 'apple' ? 'Apple Wallet' : 'Android / Google Wallet').'</strong><span>'.e($readyText).'</span></div>';
+    }
     echo '<h2>Export options</h2>';
     if ($selected) {
         echo '<div class="wallet-actions"><a class="btn" href="?route=wallet_card_print&id='.e($selected['id']).'" target="_blank">Print / save card</a><a class="btn secondary" href="?route=wallet_card_json&id='.e($selected['id']).'">Download pass data JSON</a><a class="btn secondary" href="?route=wallet_settings">Wallet settings</a><a class="btn secondary" href="?route=membership_cards">Physical membership cards</a><button class="secondary" type="button" disabled>Apple .pkpass needs certificate</button><button class="secondary" type="button" disabled>Google Wallet needs issuer API</button></div>';
