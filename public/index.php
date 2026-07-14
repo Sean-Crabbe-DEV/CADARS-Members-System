@@ -2353,6 +2353,45 @@ if (route() === 'assets.css') {
         page-break-inside:avoid;
     }
     .physical-card-actions{display:none!important}
+}/* Membership card print pagination + branding spacing tweak */
+.physical-card-brand{
+    gap:1.8mm;
+    align-items:flex-start;
+}
+.physical-card-brand-copy{
+    margin-left:-.8mm;
+}
+.physical-card-brand-copy strong{
+    margin-top:.15mm;
+}
+@media print{
+    .physical-card-grid{
+        display:grid!important;
+        grid-template-columns:85.6mm 85.6mm!important;
+        grid-auto-rows:53.98mm!important;
+        gap:7mm 8mm!important;
+        padding:0!important;
+        justify-content:center!important;
+        align-content:start!important;
+    }
+    .physical-card-item{
+        width:85.6mm!important;
+        height:auto!important;
+        break-inside:avoid!important;
+        page-break-inside:avoid!important;
+        -webkit-column-break-inside:avoid!important;
+    }
+    .physical-card-actions{
+        display:none!important;
+    }
+    .physical-card-item:nth-child(8n){
+        break-after:page!important;
+        page-break-after:always!important;
+    }
+    .physical-card-item:nth-child(8n):last-child{
+        break-after:auto!important;
+        page-break-after:auto!important;
+    }
 }';
     exit;
 }

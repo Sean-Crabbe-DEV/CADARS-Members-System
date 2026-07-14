@@ -71,3 +71,7 @@ Membership cards now leave the join date value blank when the member is marked a
 ## Membership card layout refinement
 
 Refined the physical membership-card layout to better match the visual design. The QR code now sits properly centred inside the white box, spacing is more balanced, the name and metadata layout is cleaner, and the print-preview/open-card presentation is tidier without changing the card size.
+
+## Membership card print pagination update
+
+Adjusted the physical membership-card print styles so cards are not split across pages and print in batches of up to 8 per A4 sheet. Also tightened the logo/heading spacing so the GW4LWZ title sits closer to the club logo.
