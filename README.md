@@ -67,3 +67,7 @@ Membership cards now leave the join date value blank when the member is marked a
 - Bundled the official GW4LWZ transparent logo as the default card logo.
 - Membership and wallet card headings use GW4LWZ instead of the full club name.
 - A custom logo uploaded through Wallet settings still overrides the bundled logo.
+
+## Membership card layout refinement
+
+Refined the physical membership-card layout to better match the visual design. The QR code now sits properly centred inside the white box, spacing is more balanced, the name and metadata layout is cleaner, and the print-preview/open-card presentation is tidier without changing the card size.

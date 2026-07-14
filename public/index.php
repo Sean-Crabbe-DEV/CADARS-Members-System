@@ -141,11 +141,26 @@ function render_physical_membership_card(array $member, bool $printLink=false): 
     $qr = wallet_qr_img($verify, 300);
 
     $html = '<article class="physical-membership-card" style="--member-card-colour:' . e($colour) . '">';
-    $html .= '<div class="physical-card-header"><div class="physical-card-brand">' . membership_card_logo_html() . '<div><strong>' . e($club) . '</strong><small>' . e($title) . ' card</small></div></div><span class="physical-card-label">MEMBERSHIP</span></div>';
-    $html .= '<div class="physical-card-body"><div class="physical-card-details">';
+    $html .= '<div class="physical-card-accent"></div>';
+    $html .= '<div class="physical-card-header">';
+    $html .= '<div class="physical-card-brand">' . membership_card_logo_html() . '<div class="physical-card-brand-copy"><strong>' . e($club) . '</strong><small>' . e($title) . ' card</small></div></div>';
+    $html .= '<span class="physical-card-label">MEMBERSHIP</span>';
+    $html .= '</div>';
+
+    $html .= '<div class="physical-card-body">';
+    $html .= '<div class="physical-card-details">';
     $html .= '<div class="physical-card-field physical-card-name"><span>MEMBER NAME</span><strong>' . e($name ?: 'Unnamed member') . '</strong></div>';
-    $html .= '<div class="physical-card-fields-row"><div class="physical-card-field"><span>MEMBERSHIP NUMBER</span><strong>' . e($number ?: 'Not set') . '</strong></div><div class="physical-card-field"><span>JOIN DATE</span><strong>' . e($joined) . '</strong></div></div>';
-    $html .= '</div><div class="physical-card-qr"><img src="' . e($qr) . '" alt="Membership verification QR code"><small>' . e($number ?: '') . '</small></div></div>';
+    $html .= '<div class="physical-card-fields-row">';
+    $html .= '<div class="physical-card-field"><span>MEMBERSHIP NUMBER</span><strong>' . e($number ?: 'Not set') . '</strong></div>';
+    $html .= '<div class="physical-card-field"><span>JOIN DATE</span><strong>' . e($joined) . '</strong></div>';
+    $html .= '</div>';
+    $html .= '</div>';
+
+    $html .= '<div class="physical-card-qr-panel">';
+    $html .= '<div class="physical-card-qr-box"><img src="' . e($qr) . '" alt="Membership verification QR code"></div>';
+    $html .= '<small class="physical-card-qr-caption">' . e($number ?: '') . '</small>';
+    $html .= '</div>';
+    $html .= '</div>';
     $html .= '</article>';
 
     if ($printLink) {
@@ -2153,7 +2168,192 @@ if (route() === 'assets.css') {
 @media(max-width:720px){.wallet-settings-actions{display:grid}.wallet-settings-actions .btn,.wallet-settings-actions button{width:100%;box-sizing:border-box}}.email-config-card .email-test-panel{margin-top:20px;padding:18px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:14px}.email-config-card .email-test-panel h2{margin-top:0}.email-config-card .email-test-panel .toolbar{margin-top:12px}.door-tax-hero{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;background:linear-gradient(135deg,#14532d,#166534);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:0 12px 30px #0f172a22}.door-tax-hero h1{margin:.15rem 0;font-size:2rem}.door-tax-hero p{margin:0;color:#dcfce7}.door-tax-hero-stats{display:flex;gap:10px;flex-wrap:wrap}.door-tax-hero-stats div{background:#ffffff18;border:1px solid #ffffff40;border-radius:14px;padding:12px 16px;min-width:115px}.door-tax-hero-stats strong{display:block;font-size:1.35rem}.door-tax-hero-stats span{display:block;color:#dcfce7;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}.door-tax-grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.door-tax-table-card{overflow:auto}.door-tax-balance-card{border-top:4px solid #16a34a}.door-tax-balance-card h2{margin-top:0}
 @media(max-width:720px){.door-tax-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.door-tax-hero h1{font-size:1.55rem}.door-tax-hero-stats{display:grid;grid-template-columns:1fr;width:100%}.door-tax-grid{grid-template-columns:1fr}}.membership-cards-shell{padding:0;overflow:visible}.membership-card-toolbar{padding:18px;border-bottom:1px solid #e5e7eb}.membership-card-filter{display:grid;grid-template-columns:minmax(220px,1fr) 220px auto;gap:12px;align-items:end}.membership-card-filter-actions{display:flex;gap:8px;flex-wrap:wrap}.physical-card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:22px;padding:22px}.physical-card-item{display:grid;justify-items:center;gap:10px;break-inside:avoid;page-break-inside:avoid}.physical-card-actions{display:flex;justify-content:center}.physical-membership-card{width:85.6mm;height:53.98mm;box-sizing:border-box;border-radius:3.2mm;background:linear-gradient(140deg,var(--member-card-colour),#172554);color:#fff;padding:4.5mm;box-shadow:0 5mm 10mm #0f172a35;display:grid;grid-template-rows:auto 1fr;overflow:hidden;position:relative;font-family:Arial,Helvetica,sans-serif}.physical-membership-card:after{content:"";position:absolute;width:45mm;height:45mm;border-radius:50%;right:-20mm;top:-22mm;background:#ffffff0d}.physical-card-header{display:flex;justify-content:space-between;align-items:flex-start;gap:3mm;position:relative;z-index:1}.physical-card-brand{display:flex;gap:2.5mm;align-items:center;min-width:0}.physical-card-logo-img{width:19mm;height:10mm;object-fit:contain;object-position:left center;filter:drop-shadow(0 1px 1px #0003)}.physical-card-logo-fallback{min-width:14mm;height:9mm;display:grid;place-items:center;border:0.35mm solid #ffffffaa;border-radius:1.2mm;font-size:3mm;font-weight:900;letter-spacing:.2mm}.physical-card-brand div{display:grid;gap:.4mm;min-width:0}.physical-card-brand strong{font-size:3.3mm;line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:42mm}.physical-card-brand small{font-size:2.1mm;color:#dbeafe}.physical-card-label{font-size:2.2mm;letter-spacing:.35mm;font-weight:900;color:#dbeafe}.physical-card-body{display:grid;grid-template-columns:1fr 24mm;gap:4mm;align-items:end;position:relative;z-index:1}.physical-card-details{display:grid;gap:4mm;align-self:stretch;padding-top:5mm}.physical-card-field span{display:block;font-size:2mm;font-weight:900;letter-spacing:.25mm;color:#dbeafe;margin-bottom:.8mm}.physical-card-field strong{display:block;font-size:3.4mm;font-weight:500;line-height:1.1}.physical-card-name strong{font-size:5.3mm;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:48mm}.physical-card-fields-row{display:grid;grid-template-columns:1fr 1fr;gap:4mm}.physical-card-qr{background:#fff;border-radius:1.5mm;padding:1.5mm;color:#111827;text-align:center;align-self:end}.physical-card-qr img{display:block;width:20mm;height:20mm}.physical-card-qr small{display:block;font-size:2.1mm;line-height:1;margin-top:.7mm}.single-card-stage{display:grid;place-items:center;padding:30px;min-height:65vh}.membership-profile-card{border-top:4px solid #2f407a}
 @media(max-width:720px){.membership-card-filter{grid-template-columns:1fr}.membership-card-filter-actions{display:grid}.membership-card-filter-actions .btn,.membership-card-filter-actions button{width:100%;box-sizing:border-box}.physical-card-grid{grid-template-columns:1fr;padding:12px;overflow-x:auto}.physical-membership-card{transform-origin:top center;max-width:none}.single-card-stage{padding:14px;overflow-x:auto;justify-content:start}.membership-profile-card .toolbar{display:grid;gap:10px}.membership-profile-card .btn{width:100%;box-sizing:border-box}}
-@media print{@page{size:A4 portrait;margin:8mm}.no-print,header,footer{display:none!important}main{padding:0!important;margin:0!important;max-width:none!important}.membership-cards-shell{border:0!important;box-shadow:none!important;margin:0!important;padding:0!important}.physical-card-grid{display:grid!important;grid-template-columns:85.6mm 85.6mm!important;gap:7mm 8mm!important;padding:0!important;justify-content:center!important}.physical-card-item{display:block!important;width:85.6mm!important;height:53.98mm!important}.physical-membership-card{width:85.6mm!important;height:53.98mm!important;box-shadow:none!important;break-inside:avoid!important;page-break-inside:avoid!important;-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}.single-membership-card-shell{display:block!important}.single-card-stage{display:block!important;padding:0!important;min-height:0!important}.single-card-stage .physical-membership-card{margin:0 auto!important}}';
+@media print{@page{size:A4 portrait;margin:8mm}.no-print,header,footer{display:none!important}main{padding:0!important;margin:0!important;max-width:none!important}.membership-cards-shell{border:0!important;box-shadow:none!important;margin:0!important;padding:0!important}.physical-card-grid{display:grid!important;grid-template-columns:85.6mm 85.6mm!important;gap:7mm 8mm!important;padding:0!important;justify-content:center!important}.physical-card-item{display:block!important;width:85.6mm!important;height:53.98mm!important}.physical-membership-card{width:85.6mm!important;height:53.98mm!important;box-shadow:none!important;break-inside:avoid!important;page-break-inside:avoid!important;-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}.single-membership-card-shell{display:block!important}.single-card-stage{display:block!important;padding:0!important;min-height:0!important}.single-card-stage .physical-membership-card{margin:0 auto!important}}/* Membership card layout refresh */
+.physical-card-grid{gap:28px 22px}
+.physical-card-item{align-content:start}
+.physical-membership-card{
+    position:relative;
+    width:85.6mm;
+    height:53.98mm;
+    border-radius:5.4mm;
+    overflow:hidden;
+    background:
+        radial-gradient(circle at 100% 0%, rgba(255,255,255,.10) 0 18mm, transparent 18.2mm),
+        linear-gradient(180deg, color-mix(in srgb, var(--member-card-colour) 92%, #0f172a 8%) 0%, color-mix(in srgb, var(--member-card-colour) 86%, #0f172a 14%) 100%);
+    color:#fff;
+    box-shadow:0 18px 35px rgba(15,23,42,.15);
+    padding:5.4mm 4.8mm 4.8mm;
+    display:flex;
+    flex-direction:column;
+    justify-content:space-between;
+}
+.physical-card-accent{
+    position:absolute;
+    left:0; right:0;
+    top:20.5mm;
+    height:13.2mm;
+    background:rgba(255,255,255,.045);
+}
+.physical-card-header{
+    position:relative;
+    z-index:1;
+    display:flex;
+    justify-content:space-between;
+    align-items:flex-start;
+    gap:6mm;
+}
+.physical-card-brand{
+    display:flex;
+    align-items:flex-start;
+    gap:3.2mm;
+    min-width:0;
+}
+.physical-card-logo-img{
+    width:18mm;
+    height:13mm;
+    object-fit:contain;
+    object-position:left top;
+    filter:drop-shadow(0 1px 1px rgba(0,0,0,.18));
+    flex:0 0 auto;
+}
+.physical-card-brand-copy{
+    display:flex;
+    flex-direction:column;
+    gap:.35mm;
+    min-width:0;
+}
+.physical-card-brand-copy strong{
+    font-size:5.1mm;
+    line-height:1;
+    letter-spacing:-.02em;
+    font-weight:800;
+    margin-top:.6mm;
+}
+.physical-card-brand-copy small{
+    display:block;
+    font-size:2.35mm;
+    line-height:1.15;
+    opacity:.92;
+    font-weight:500;
+}
+.physical-card-label{
+    font-size:2.2mm;
+    line-height:1;
+    letter-spacing:.32em;
+    font-weight:800;
+    opacity:.9;
+    white-space:nowrap;
+    margin-top:1.2mm;
+}
+.physical-card-body{
+    position:relative;
+    z-index:1;
+    display:grid;
+    grid-template-columns:minmax(0,1fr) 25.5mm;
+    gap:4.5mm;
+    align-items:end;
+    margin-top:auto;
+}
+.physical-card-details{
+    display:flex;
+    flex-direction:column;
+    gap:6.5mm;
+    min-width:0;
+}
+.physical-card-field{
+    min-width:0;
+}
+.physical-card-field span{
+    display:block;
+    font-size:2.05mm;
+    line-height:1.15;
+    letter-spacing:.16em;
+    font-weight:800;
+    opacity:.88;
+    margin-bottom:1.05mm;
+}
+.physical-card-field strong{
+    display:block;
+    font-size:4.3mm;
+    line-height:1.05;
+    letter-spacing:-.03em;
+    font-weight:700;
+    word-break:break-word;
+}
+.physical-card-name strong{
+    font-size:6.35mm;
+    line-height:.98;
+    font-weight:500;
+}
+.physical-card-fields-row{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:4mm;
+    align-items:end;
+}
+.physical-card-fields-row .physical-card-field strong{
+    min-height:4.5mm;
+    font-size:4.15mm;
+}
+.physical-card-qr-panel{
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:flex-end;
+    gap:1.25mm;
+}
+.physical-card-qr-box{
+    width:24.4mm;
+    height:24.4mm;
+    background:#fff;
+    border-radius:2.2mm;
+    padding:1.9mm;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    box-shadow:0 5px 14px rgba(15,23,42,.18);
+}
+.physical-card-qr-box img{
+    width:100%;
+    height:100%;
+    display:block;
+    object-fit:contain;
+    object-position:center;
+    margin:0 auto;
+}
+.physical-card-qr-caption{
+    display:block;
+    color:#e5e7eb;
+    font-size:2.5mm;
+    line-height:1;
+    font-weight:600;
+    letter-spacing:.03em;
+    text-align:center;
+    min-height:2.5mm;
+}
+.physical-card-actions{
+    display:flex;
+    justify-content:center;
+    margin-top:10px;
+}
+.physical-card-actions .btn{
+    min-width:250px;
+    justify-content:center;
+}
+
+@media(max-width:720px){
+    .physical-card-grid{gap:18px;padding:12px}
+    .physical-card-actions .btn{min-width:unset;width:100%;max-width:320px}
+}
+
+@media print{
+    .physical-membership-card{
+        box-shadow:none!important;
+        break-inside:avoid;
+        page-break-inside:avoid;
+    }
+    .physical-card-actions{display:none!important}
+}';
     exit;
 }
 if (route() === 'email_open') {
