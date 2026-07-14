@@ -79,3 +79,7 @@ Adjusted the physical membership-card print styles so cards are not split across
 ## Membership card links page
 
 Changed the Membership cards page to a member list with separate columns for Physical card, Apple Wallet and Android/Google Wallet. Added a top-level View / print all physical cards button, which opens a dedicated print view containing all member cards. Wallet links automatically load the selected member and relevant platform on the Wallet cards page.
+
+## My Profile section order and wallet links
+
+Reordered My Profile so subscription/payment history appears before Door tax, with Door tax immediately below subscriptions. Moved the Membership cards section to the bottom of the page and added personal Physical, Apple Wallet and Android/Google Wallet links. The wallet links use a self-service route that only loads the member linked to the logged-in user.

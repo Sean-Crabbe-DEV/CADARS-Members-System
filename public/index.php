@@ -2434,6 +2434,21 @@ if (route() === 'assets.css') {
     .membership-card-link-table td:last-child{border-bottom:0!important}
     .membership-card-link-table td:before{content:attr(data-label);font-size:.78rem;text-transform:uppercase;letter-spacing:.04em;color:#64748b;font-weight:800}
     .membership-format-button{width:100%;min-width:0;box-sizing:border-box}
+}/* My Profile membership card links */
+.profile-card-section-head{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-bottom:14px}
+.profile-card-section-head h2{margin:0}
+.profile-card-section-head p{margin:.3rem 0 0}
+.profile-wallet-card-links{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.profile-wallet-link{display:grid;gap:5px;border:1px solid #dbe2ea;border-radius:14px;padding:16px;text-decoration:none;background:#fff;transition:.15s ease}
+.profile-wallet-link:hover{transform:translateY(-1px);box-shadow:0 10px 24px rgba(15,23,42,.10)}
+.profile-wallet-link strong{font-size:1rem;color:#0f172a}
+.profile-wallet-link span{font-size:.86rem;line-height:1.4;color:#64748b}
+.profile-wallet-link.physical{border-top:4px solid #2f407a}
+.profile-wallet-link.apple{border-top:4px solid #111827}
+.profile-wallet-link.google{border-top:4px solid #2563eb}
+
+@media(max-width:760px){
+    .profile-wallet-card-links{grid-template-columns:1fr}
 }';
     exit;
 }
@@ -2633,6 +2648,75 @@ if (route() === 'dashboard') {
     page_footer(); exit;
 }
 
+
+if (route() === 'my_wallet_card') {
+    require_login();
+
+    if (empty($u['member_id'])) {
+        page_header('Wallet membership card');
+        echo '<div class="card"><h2>No linked member record</h2><p>Your user account is not linked to a member record.</p></div>';
+        page_footer(); exit;
+    }
+
+    $platform = strtolower(trim((string)($_GET['platform'] ?? '')));
+    if (!in_array($platform, ['apple','google'], true)) redirect('profile');
+
+    $member = first('SELECT * FROM members WHERE id=?', [(int)$u['member_id']]);
+    if (!$member) {
+        page_header('Wallet membership card');
+        echo '<div class="card"><h2>Member record not found</h2></div>';
+        page_footer(); exit;
+    }
+
+    audit('my_wallet_card.view','member',(int)$member['id'],'success',null,['platform'=>$platform]);
+
+    $cfg = app_config();
+    $payload = wallet_member_payload($member);
+    $qr = wallet_qr_img($payload['verify_url'], 220);
+
+    $isApple = $platform === 'apple';
+    $title = $isApple ? 'Apple Wallet membership card' : 'Android / Google Wallet membership card';
+
+    $ready = false;
+    if ($isApple) {
+        $ready =
+            !empty($cfg['apple_pass_type_id']) &&
+            !empty($cfg['apple_team_id']) &&
+            wallet_file_status('apple_signing_cert') !== 'Not uploaded' &&
+            wallet_file_status('apple_private_key') !== 'Not uploaded' &&
+            wallet_file_status('apple_wwdr_cert') !== 'Not uploaded';
+    } else {
+        $ready =
+            !empty($cfg['google_wallet_issuer_id']) &&
+            !empty($cfg['google_wallet_class_id']) &&
+            wallet_file_status('google_service_account_json') !== 'Not uploaded';
+    }
+
+    page_header($title);
+
+    echo '<section class="wallet-hero"><div><span class="eyebrow">My membership card</span><h1>'.e($title).'</h1><p>This page is restricted to your own linked member record.</p></div><div class="wallet-hero-icon">▣</div></section>';
+
+    echo '<div class="grid wallet-admin-grid"><div class="card wallet-control-card"><h2>'.e($isApple ? 'Apple Wallet' : 'Android / Google Wallet').'</h2>';
+    echo '<p><strong>Member:</strong> '.e($payload['member_name']).'<br><strong>Membership number:</strong> '.e($payload['membership_number'] ?: 'Not set').'</p>';
+
+    if ($ready) {
+        echo '<div class="wallet-platform-status '.e($isApple ? 'apple' : 'google').'"><strong>Wallet configuration ready</strong><span>The club wallet credentials appear to be configured for this platform.</span></div>';
+    } else {
+        echo '<div class="wallet-platform-status '.e($isApple ? 'apple' : 'google').'"><strong>Wallet setup incomplete</strong><span>The club administrator still needs to complete the '.e($isApple ? 'Apple Wallet certificate' : 'Google Wallet API').' settings before an installable pass can be produced.</span></div>';
+    }
+
+    echo '<div class="wallet-actions">';
+    echo '<a class="btn secondary" href="?route=membership_card&id='.e($member['id']).'" target="_blank">View physical card</a>';
+    echo '<a class="btn secondary" href="?route=profile">Back to My Profile</a>';
+    echo '</div></div>';
+
+    echo '<div class="card wallet-preview-card"><h2>Card preview</h2>';
+    echo '<div class="wallet-pass-preview"><div class="wallet-pass-top"><div><strong>'.e($payload['club']).'</strong></div><div>Membership</div></div><div class="wallet-pass-field"><span>MEMBER NAME</span><strong>'.e($payload['member_name']).'</strong></div><div class="wallet-pass-grid"><div><span>MEMBERSHIP NUMBER</span><strong>'.e($payload['membership_number'] ?: 'Not set').'</strong></div><div><span>EXPIRES</span><strong>'.e($payload['expires'] ?: 'Not set').'</strong></div><div><span>CALLSIGN</span><strong>'.e($payload['callsign'] ?: 'Not set').'</strong></div><div><span>STATUS</span><strong>'.e($payload['status'] ?: 'Unknown').'</strong></div></div><div class="wallet-qr-box"><img src="'.e($qr).'" alt="Membership verification QR code"><small>'.e($payload['membership_number'] ?: '').'</small></div></div>';
+    echo '</div></div>';
+
+    page_footer(); exit;
+}
+
 if (route() === 'profile') {
     $m = first('SELECT * FROM members WHERE id=?',[$u['member_id']]); if (!$m) exit('No member record linked.');
     if ($_SERVER['REQUEST_METHOD']==='POST') {
@@ -2668,13 +2752,16 @@ if (route() === 'profile') {
     $dp = first('SELECT * FROM member_directory_preferences WHERE member_id=?',[$m['id']]) ?: [];
     page_header('My Profile');
     $doorTaxBalance = door_tax_member_balance((int)$m['id']);
-    echo '<div class="card door-tax-balance-card"><h2>Door tax balance</h2><p><strong>'.e(door_tax_money($doorTaxBalance)).'</strong> balance • '.e(door_tax_meetings_remaining($doorTaxBalance)).' meetings covered at '.e(door_tax_money(door_tax_charge_amount())).' per meeting.</p><p class="muted">Payments and corrections are managed by the Chair, Vice Chair, Secretary or Treasurer.</p></div>';
-    echo '<div class="card membership-profile-card"><div class="toolbar"><div><h2>Membership card</h2><p class="muted">View your printable credit-card-sized membership card and QR verification code.</p></div><a class="btn" href="?route=membership_card&id='.e($m['id']).'" target="_blank">View my card</a></div></div>';
     echo '<div class="card"><h1>My Profile</h1><p><strong>Membership number:</strong> '.e($m['membership_number'] ?: 'Not set').'<br><strong>Date joined:</strong> '.e(member_joined_display($m)).'</p><form method="post">'.csrf_field().'<div class="two"><div><label>First name</label><input name="first_name" value="'.e($m['first_name']).'"></div><div><label>Surname</label><input name="last_name" value="'.e($m['last_name']).'"></div><div><label>Callsign</label><input name="callsign" value="'.e($m['callsign']).'"></div><div><label>Licence level</label><input name="licence_level" value="'.e($m['licence_level']).'"></div><div><label>Email</label><input type="email" name="email" value="'.e($m['email']).'"></div><div><label>Phone</label><input name="phone" value="'.e(decrypt_value($m['phone_encrypted'])).'"></div><div class="full"><label>Address</label><textarea name="address">'.e(decrypt_value($m['address_encrypted'])).'</textarea></div><div class="full"><h2>Emergency contact</h2></div><div><label>Emergency contact name</label><input name="emergency_contact_name" value="'.e(decrypt_value($m['emergency_contact_name_encrypted'] ?? '')).'"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship" value="'.e(decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '')).'"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone" value="'.e(decrypt_value($m['emergency_contact_phone_encrypted'] ?? '')).'"></div></div>';
     echo '<h2>Internal directory</h2><p class="muted">If enabled, the internal directory will show only your name and callsign to logged-in members.</p><label><input type="checkbox" name="show_in_directory" '.(!empty($dp['show_callsign'])?'checked':'').'> Show my name and callsign in the internal directory</label>';
     echo '<h2>Consents</h2><p class="muted">These control how the society may contact you.</p>'.render_consent_checkboxes((int)$m['id']).'<p><button>Save profile</button></p></form></div>';
     $payments = all('SELECT * FROM subscription_payments WHERE member_id=? ORDER BY subscription_year DESC',[$m['id']]);
     echo '<div class="card"><h2>My subscription/payment history</h2><table><tr><th>Year</th><th>Due</th><th>Paid</th><th>Date</th><th>Status</th></tr>'; foreach($payments as $p) echo '<tr><td>'.e($p['subscription_year']).'</td><td>£'.e(number_format($p['amount_due'],2)).'</td><td>£'.e(number_format($p['amount_paid'],2)).'</td><td>'.e($p['payment_date']).'</td><td>'.e($p['status']).'</td></tr>'; echo '</table></div>';
+
+    echo '<div class="card door-tax-balance-card"><h2>Door tax balance</h2><p><strong>'.e(door_tax_money($doorTaxBalance)).'</strong> balance • '.e(door_tax_meetings_remaining($doorTaxBalance)).' meetings covered at '.e(door_tax_money(door_tax_charge_amount())).' per meeting.</p><p class="muted">Payments and corrections are managed by the Chair, Vice Chair, Secretary or Treasurer.</p></div>';
+
+    echo '<div class="card membership-profile-card"><div class="profile-card-section-head"><div><h2>My membership cards</h2><p class="muted">These links only open the membership card linked to your own user account.</p></div></div><div class="profile-wallet-card-links"><a class="profile-wallet-link physical" href="?route=membership_card&id='.e($m['id']).'" target="_blank"><strong>Physical card</strong><span>View or print your credit-card-sized membership card.</span></a><a class="profile-wallet-link apple" href="?route=my_wallet_card&platform=apple"><strong>Apple Wallet</strong><span>Open your personal Apple Wallet membership card.</span></a><a class="profile-wallet-link google" href="?route=my_wallet_card&platform=google"><strong>Android / Google Wallet</strong><span>Open your personal Android Wallet membership card.</span></a></div></div>';
+
     page_footer(); exit;
 }
 
