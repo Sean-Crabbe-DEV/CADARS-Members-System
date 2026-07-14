@@ -26,6 +26,7 @@ function app_config(): array {
         'smtp_password' => '',
         'resend_api_key' => '',
         'email_open_tracking_enabled' => '1',
+        'door_tax_charge_per_meeting' => '1.00',
     ];
     if (file_exists(CONFIG_PATH)) {
         $cfg = include CONFIG_PATH;
@@ -777,6 +778,97 @@ function percent_display($num, $den): string {
     return round(((float)$num / $den) * 100, 1) . '%';
 }
 
+function door_tax_manager(): bool {
+    return has_role('chair') || has_role('vice_chair') || has_role('secretary') || has_role('treasurer');
+}
+function require_door_tax_manager(): void {
+    require_login();
+    if (!door_tax_manager()) {
+        audit('permission.denied', null, null, 'denied', 'door_tax_officer_only');
+        http_response_code(403);
+        page_header('Access denied');
+        echo '<div class="card"><h2>Access denied</h2><p>Door tax can only be viewed or modified by the Chair, Vice Chair, Secretary or Treasurer.</p></div>';
+        page_footer();
+        exit;
+    }
+}
+function ensure_door_tax_schema(): void {
+    if (!installed() || !file_exists(DB_PATH)) return;
+    try {
+        exec_sql('CREATE TABLE IF NOT EXISTS door_tax_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            member_id INTEGER NOT NULL,
+            event_id INTEGER NULL,
+            transaction_type TEXT NOT NULL,
+            amount REAL NOT NULL,
+            payment_method TEXT NULL,
+            reference TEXT NULL,
+            note_encrypted TEXT NULL,
+            recorded_by_user_id INTEGER NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )');
+        exec_sql('CREATE INDEX IF NOT EXISTS idx_door_tax_member ON door_tax_transactions(member_id)');
+        exec_sql('CREATE INDEX IF NOT EXISTS idx_door_tax_event ON door_tax_transactions(event_id)');
+        exec_sql('CREATE INDEX IF NOT EXISTS idx_door_tax_type ON door_tax_transactions(transaction_type)');
+    } catch (Throwable $e) {}
+}
+function door_tax_charge_amount(): float {
+    $cfg = app_config();
+    $amount = (float)($cfg['door_tax_charge_per_meeting'] ?? 1.00);
+    return $amount > 0 ? $amount : 1.00;
+}
+function door_tax_money($amount): string {
+    return '£' . number_format((float)$amount, 2);
+}
+function door_tax_member_balance(int $member_id): float {
+    ensure_door_tax_schema();
+    $r = first('SELECT COALESCE(SUM(amount),0) balance FROM door_tax_transactions WHERE member_id=?', [$member_id]);
+    return round((float)($r['balance'] ?? 0), 2);
+}
+function door_tax_meetings_remaining(float $balance): int {
+    $charge = door_tax_charge_amount();
+    if ($charge <= 0) return 0;
+    return max(0, (int)floor($balance / $charge));
+}
+function door_tax_status_label(float $balance): string {
+    if ($balance > 0) return 'In credit';
+    if ($balance < 0) return 'Owing';
+    return 'Zero';
+}
+function door_tax_status_class(float $balance): string {
+    if ($balance > 0) return 'good';
+    if ($balance < 0) return 'needs_attention';
+    return 'unknown';
+}
+function door_tax_add_transaction(int $member_id, ?int $event_id, string $type, float $amount, string $method='', string $reference='', string $note=''): int {
+    ensure_door_tax_schema();
+    exec_sql('INSERT INTO door_tax_transactions (member_id,event_id,transaction_type,amount,payment_method,reference,note_encrypted,recorded_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,datetime("now"),datetime("now"))', [
+        $member_id,
+        $event_id ?: null,
+        $type,
+        round($amount, 2),
+        $method,
+        $reference,
+        encrypt_value($note),
+        current_user()['id'] ?? null
+    ]);
+    return (int)db()->lastInsertId();
+}
+function door_tax_event_already_charged(int $member_id, int $event_id): bool {
+    $r = first('SELECT id FROM door_tax_transactions WHERE member_id=? AND event_id=? AND transaction_type="meeting_charge" LIMIT 1', [$member_id,$event_id]);
+    return (bool)$r;
+}
+function door_tax_charge_member_for_event(int $member_id, int $event_id, float $charge): bool {
+    if (door_tax_event_already_charged($member_id, $event_id)) return false;
+    door_tax_add_transaction($member_id, $event_id, 'meeting_charge', -abs($charge), '', '', 'Door tax charged from attendance register');
+    return true;
+}
+function door_tax_recent_transactions(int $member_id, int $limit=10): array {
+    ensure_door_tax_schema();
+    return all('SELECT dt.*,e.title event_title,u.email recorded_by_email FROM door_tax_transactions dt LEFT JOIN events e ON e.id=dt.event_id LEFT JOIN users u ON u.id=dt.recorded_by_user_id WHERE dt.member_id=? ORDER BY datetime(dt.created_at) DESC, dt.id DESC LIMIT '.(int)$limit, [$member_id]);
+}
+
 function table_has_column(string $table, string $column): bool {
     try {
         $rows = db()->query('PRAGMA table_info(' . preg_replace('/[^A-Za-z0-9_]/', '', $table) . ')')->fetchAll(PDO::FETCH_ASSOC);
@@ -1215,6 +1307,7 @@ function page_header(string $title): void {
             echo '<div class="dropdown"><button type="button" class="nav-drop" aria-haspopup="true">Committee ▾</button><div class="dropdown-menu">';
             if (has_permission('view_membership_db')) echo '<a href="?route=members">Members</a>';
             if (has_permission('track_attendance')) echo '<a href="?route=attendance">Attendance</a><a href="?route=attendance_stats">Attendance stats</a>';
+            if (door_tax_manager()) echo '<a href="?route=door_tax">Door tax</a>';
             if (has_permission('send_member_emails')) echo '<a href="?route=emails">Emails</a>';
             if (has_permission('view_equipment')) echo '<a href="?route=equipment">Equipment / assets</a>';
             if (has_permission('view_committee_actions')) echo '<a href="?route=committee_actions">Actions</a>';
@@ -2016,7 +2109,8 @@ if (route() === 'assets.css') {
 @media(max-width:720px){.member-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.member-hero h1{font-size:1.55rem}.member-hero-stats{display:grid;grid-template-columns:1fr;width:100%}.member-hero-stats div{min-width:0}.member-list-card>.dash-card-head{display:grid;grid-template-columns:1fr;gap:10px}.member-header-actions{display:grid;grid-template-columns:1fr;width:100%}.member-header-actions .btn{width:100%;box-sizing:border-box}.member-card-grid{padding:12px}.member-card-modern{grid-template-columns:1fr;padding:13px}.member-card-main{grid-template-columns:44px 1fr;gap:11px}.member-avatar{width:44px;height:44px}.member-card-actions{display:grid;grid-template-columns:1fr;justify-items:stretch}.member-card-actions .btn,.member-card-actions button{width:100%;box-sizing:border-box}.member-card-meta{grid-template-columns:1fr;gap:3px}.member-card-meta strong{margin-bottom:7px}.member-attendance{grid-template-columns:1fr}.member-form-card .two{grid-template-columns:1fr!important}}.member-attendance small{display:block;color:#64748b;margin-top:2px;font-size:.78rem}.email-member-card.disabled{opacity:.65;background:#f8fafc}.email-member-card.disabled .email-check-ui{background:#e5e7eb;color:#94a3b8}.email-member-card.disabled input{cursor:not-allowed}.email-member-card.disabled *{cursor:not-allowed}.wallet-hero{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;background:linear-gradient(135deg,#27396c,#16213e);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:0 12px 30px #0f172a22}.wallet-hero h1{margin:.15rem 0;font-size:2rem}.wallet-hero p{margin:0;color:#dbeafe}.wallet-hero-icon{width:76px;height:76px;border-radius:999px;background:#ffffff18;border:1px solid #ffffff40;display:grid;place-items:center;font-size:2rem;font-weight:900}.wallet-admin-grid{grid-template-columns:minmax(280px,420px) 1fr}.wallet-control-card,.wallet-preview-card{margin-top:0}.wallet-actions{display:grid;gap:8px}.wallet-pass-preview{width:min(100%,420px);min-height:560px;background:#2f407a;color:#fff;border-radius:18px;padding:26px;box-shadow:0 18px 35px #0f172a33;display:flex;flex-direction:column;gap:28px}.wallet-pass-top{display:flex;justify-content:space-between;gap:18px;align-items:center;font-size:1.25rem}.wallet-pass-field span,.wallet-pass-grid span{display:block;font-size:.78rem;font-weight:900;letter-spacing:.08em;color:#e5e7eb}.wallet-pass-field strong{display:block;font-size:2rem;font-weight:400;margin-top:4px}.wallet-pass-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.wallet-pass-grid strong{display:block;font-size:1.2rem;font-weight:400;margin-top:4px}.wallet-qr-box{margin:auto auto 0;align-self:center;background:#fff;border-radius:8px;padding:12px;color:#111827;text-align:center}.wallet-qr-box img{display:block;width:170px;height:170px}.wallet-qr-box small{display:block;margin-top:4px}.wallet-print-wrap{display:grid;place-items:center}.wallet-print-card{width:420px}.wallet-verify-card{display:grid;grid-template-columns:1fr auto;gap:16px;align-items:center;background:linear-gradient(135deg,#166534,#15803d);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px}.wallet-verify-card h1{margin:.2rem 0}.wallet-verify-card p{margin:0;color:#dcfce7}.wallet-status{background:#ffffff20;border:1px solid #ffffff40;border-radius:999px;padding:10px 14px;font-weight:900}
 @media(max-width:720px){.wallet-hero,.wallet-verify-card{grid-template-columns:1fr;padding:18px;border-radius:14px}.wallet-hero-icon{display:none}.wallet-admin-grid{grid-template-columns:1fr}.wallet-pass-preview{min-height:520px;padding:20px}.wallet-pass-field strong{font-size:1.55rem}.wallet-pass-grid{grid-template-columns:1fr}.wallet-qr-box img{width:150px;height:150px}}
 @media print{header,footer,.wallet-control-card,.wallet-preview-card h2,.wallet-print-wrap+*,main>.card:not(:has(.wallet-print-card)){display:none!important}body{background:#fff}.wallet-print-card{box-shadow:none}}.wallet-settings-grid{grid-template-columns:1fr}.wallet-settings-card{margin-top:0}.wallet-settings-card h2{margin-top:0}.wallet-upload-list{display:grid;gap:14px;margin-top:14px}.wallet-upload-list>div{border:1px solid #e5e7eb;background:#f8fafc;border-radius:12px;padding:12px}.wallet-upload-list small{display:block;color:#64748b;margin-top:6px}.wallet-settings-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.wallet-readiness{display:grid;gap:8px}.wallet-readiness span{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px}
-@media(max-width:720px){.wallet-settings-actions{display:grid}.wallet-settings-actions .btn,.wallet-settings-actions button{width:100%;box-sizing:border-box}}.email-config-card .email-test-panel{margin-top:20px;padding:18px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:14px}.email-config-card .email-test-panel h2{margin-top:0}.email-config-card .email-test-panel .toolbar{margin-top:12px}';
+@media(max-width:720px){.wallet-settings-actions{display:grid}.wallet-settings-actions .btn,.wallet-settings-actions button{width:100%;box-sizing:border-box}}.email-config-card .email-test-panel{margin-top:20px;padding:18px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:14px}.email-config-card .email-test-panel h2{margin-top:0}.email-config-card .email-test-panel .toolbar{margin-top:12px}.door-tax-hero{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;background:linear-gradient(135deg,#14532d,#166534);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:0 12px 30px #0f172a22}.door-tax-hero h1{margin:.15rem 0;font-size:2rem}.door-tax-hero p{margin:0;color:#dcfce7}.door-tax-hero-stats{display:flex;gap:10px;flex-wrap:wrap}.door-tax-hero-stats div{background:#ffffff18;border:1px solid #ffffff40;border-radius:14px;padding:12px 16px;min-width:115px}.door-tax-hero-stats strong{display:block;font-size:1.35rem}.door-tax-hero-stats span{display:block;color:#dcfce7;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}.door-tax-grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.door-tax-table-card{overflow:auto}.door-tax-balance-card{border-top:4px solid #16a34a}.door-tax-balance-card h2{margin-top:0}
+@media(max-width:720px){.door-tax-hero{grid-template-columns:1fr;padding:18px;border-radius:14px}.door-tax-hero h1{font-size:1.55rem}.door-tax-hero-stats{display:grid;grid-template-columns:1fr;width:100%}.door-tax-grid{grid-template-columns:1fr}}';
     exit;
 }
 if (route() === 'email_open') {
@@ -2035,7 +2129,7 @@ if (route() === 'email_open') {
 }
 
 if (!installed() && route() !== 'install') redirect('install');
-if (installed()) { ensure_runtime_setup(); }
+if (installed()) { ensure_runtime_setup(); ensure_door_tax_schema(); }
 
 if (route() === 'install') {
     if (installed()) redirect('login');
@@ -2249,6 +2343,8 @@ if (route() === 'profile') {
     audit('profile.view','member',(int)$m['id']);
     $dp = first('SELECT * FROM member_directory_preferences WHERE member_id=?',[$m['id']]) ?: [];
     page_header('My Profile');
+    $doorTaxBalance = door_tax_member_balance((int)$m['id']);
+    echo '<div class="card door-tax-balance-card"><h2>Door tax balance</h2><p><strong>'.e(door_tax_money($doorTaxBalance)).'</strong> balance • '.e(door_tax_meetings_remaining($doorTaxBalance)).' meetings covered at '.e(door_tax_money(door_tax_charge_amount())).' per meeting.</p><p class="muted">Payments and corrections are managed by the Chair, Vice Chair, Secretary or Treasurer.</p></div>';
     echo '<div class="card"><h1>My Profile</h1><p><strong>Membership number:</strong> '.e($m['membership_number'] ?: 'Not set').'<br><strong>Date joined:</strong> '.e(member_joined_display($m)).'</p><form method="post">'.csrf_field().'<div class="two"><div><label>First name</label><input name="first_name" value="'.e($m['first_name']).'"></div><div><label>Surname</label><input name="last_name" value="'.e($m['last_name']).'"></div><div><label>Callsign</label><input name="callsign" value="'.e($m['callsign']).'"></div><div><label>Licence level</label><input name="licence_level" value="'.e($m['licence_level']).'"></div><div><label>Email</label><input type="email" name="email" value="'.e($m['email']).'"></div><div><label>Phone</label><input name="phone" value="'.e(decrypt_value($m['phone_encrypted'])).'"></div><div class="full"><label>Address</label><textarea name="address">'.e(decrypt_value($m['address_encrypted'])).'</textarea></div><div class="full"><h2>Emergency contact</h2></div><div><label>Emergency contact name</label><input name="emergency_contact_name" value="'.e(decrypt_value($m['emergency_contact_name_encrypted'] ?? '')).'"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship" value="'.e(decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '')).'"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone" value="'.e(decrypt_value($m['emergency_contact_phone_encrypted'] ?? '')).'"></div></div>';
     echo '<h2>Internal directory</h2><p class="muted">If enabled, the internal directory will show only your name and callsign to logged-in members.</p><label><input type="checkbox" name="show_in_directory" '.(!empty($dp['show_callsign'])?'checked':'').'> Show my name and callsign in the internal directory</label>';
     echo '<h2>Consents</h2><p class="muted">These control how the society may contact you.</p>'.render_consent_checkboxes((int)$m['id']).'<p><button>Save profile</button></p></form></div>';
@@ -2566,7 +2662,8 @@ if (route() === 'member_view') {
     echo '</div><form method="post">'.csrf_field().'<div class="two">';
     if (can_edit_membership_number()) echo '<div><label>Membership number</label><input name="membership_number" value="'.e($m['membership_number']).'"></div>'; else echo '<div><label>Membership number</label><p><strong>'.e($m['membership_number'] ?: 'Not set').'</strong><br><span class="muted">Only admin users can change this.</span></p></div>';
     echo '<div><label>Callsign</label><input name="callsign" value="'.e($m['callsign']).'"></div><div><label>First name</label><input name="first_name" value="'.e($m['first_name']).'"></div><div><label>Surname</label><input name="last_name" value="'.e($m['last_name']).'"></div><div><label>Email address</label><input type="email" name="email" value="'.e($m['email']).'"></div><div><label>Licence level</label><input name="licence_level" value="'.e($m['licence_level']).'"></div><div><label>Phone number</label><input name="phone" value="'.e(decrypt_value($m['phone_encrypted'])).'"></div><div class="full"><label>Address</label><textarea name="address">'.e(decrypt_value($m['address_encrypted'])).'</textarea></div><div class="full"><h2>Emergency contact</h2></div><div><label>Emergency contact name</label><input name="emergency_contact_name" value="'.e(decrypt_value($m['emergency_contact_name_encrypted'] ?? '')).'"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship" value="'.e(decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '')).'"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone" value="'.e(decrypt_value($m['emergency_contact_phone_encrypted'] ?? '')).'"></div><div><label>Membership type</label><input name="membership_type" value="'.e($m['membership_type']).'"></div><div><label>Date joined</label><input type="date" name="date_joined" value="'.e($m['date_joined']).'"><label class="small"><input type="checkbox" name="joined_before_system" '.(!empty($m['joined_before_system'])?'checked':'').'> Not on record / joined before system</label></div><div><label>Renewal date</label><input type="date" name="renewal_date" value="'.e($m['renewal_date']).'"></div><div><label>Membership status</label><select name="membership_status">'; foreach(['pending','active','expired','former','suspended','honorary','life_member'] as $s) echo '<option '.($m['membership_status']===$s?'selected':'').'>'.e($s).'</option>'; echo '</select></div></div><h2>Consents</h2><p class="muted">Visible and editable by Member DB users and admins.</p>'.render_consent_checkboxes($id).'<label>Private notes</label><textarea name="notes">'.e(decrypt_value($m['notes_encrypted'])).'</textarea><button>Save member</button></form></div>';
-    echo '<div class="grid"><div class="card"><h2>Attendance</h2><p>Attended sessions: '.e($stats['attended']).'</p><p>Completed sessions since start date: '.e($stats['sessions_since_start']).'</p><p>Attendance: '.e($stats['attendance_percent']===null?'N/A':$stats['attendance_percent'].'%').'</p><p class="muted">Start date used: '.e($stats['attendance_start_date'] ?: 'No join date recorded - using all past sessions').'</p></div>';
+    $doorTaxBalance = door_tax_member_balance($id);
+    echo '<div class="grid"><div class="card"><h2>Attendance</h2><p>Attended sessions: '.e($stats['attended']).'</p><p>Completed sessions since start date: '.e($stats['sessions_since_start']).'</p><p>Attendance: '.e($stats['attendance_percent']===null?'N/A':$stats['attendance_percent'].'%').'</p><p class="muted">Start date used: '.e($stats['attendance_start_date'] ?: 'No join date recorded - using all past sessions').'</p></div><div class="card door-tax-balance-card"><h2>Door tax</h2><p><strong>'.e(door_tax_money($doorTaxBalance)).'</strong> balance</p><p>'.e(door_tax_meetings_remaining($doorTaxBalance)).' meetings covered at '.e(door_tax_money(door_tax_charge_amount())).' per meeting.</p>'.(door_tax_manager()?'<p><a class="btn secondary" href="?route=door_tax&member_id='.e($id).'">Manage door tax</a></p>':'').'</div>';
     $payments=all('SELECT * FROM subscription_payments WHERE member_id=? ORDER BY subscription_year DESC',[$id]); echo '<div class="card"><h2>Payment/subs history</h2><table><tr><th>Year</th><th>Due</th><th>Paid</th><th>Date</th><th>Status</th></tr>'; foreach($payments as $p) echo '<tr><td>'.e($p['subscription_year']).'</td><td>£'.e(number_format($p['amount_due'],2)).'</td><td>£'.e(number_format($p['amount_paid'],2)).'</td><td>'.e($p['payment_date']).'</td><td>'.e($p['status']).'</td></tr>'; echo '</table></div></div>';
     echo '<div class="card"><h2>Add subs/payment record</h2><form method="post">'.csrf_field().'<input type="hidden" name="add_payment" value="1"><div class="two"><input type="number" name="subscription_year" value="'.date('Y').'" required><input type="number" step="0.01" name="amount_due" placeholder="Amount due" required><input type="number" step="0.01" name="amount_paid" placeholder="Amount paid" required><input type="date" name="payment_date"><input name="payment_method" placeholder="Payment method"><input name="payment_reference" placeholder="Payment reference"><input name="receipt_number" placeholder="Receipt number"><select name="status"><option>unpaid</option><option>part-paid</option><option>paid</option><option>waived</option><option>refunded</option></select></div><textarea name="notes" placeholder="Notes"></textarea><button>Add payment record</button></form></div>';
     $rh=all('SELECT urh.*,r.display_name FROM user_role_history urh JOIN users us ON us.id=urh.user_id JOIN roles r ON r.id=urh.role_id WHERE us.member_id=? ORDER BY changed_at DESC',[$id]); echo '<div class="card"><h2>Role history</h2><table><tr><th>Role</th><th>Action</th><th>Changed</th><th>Reason</th></tr>'; foreach($rh as $r) echo '<tr><td>'.e($r['display_name']).'</td><td>'.e($r['action']).'</td><td>'.e($r['changed_at']).'</td><td>'.e($r['reason']).'</td></tr>'; echo '</table></div>';
@@ -3300,6 +3397,7 @@ if (route() === 'event_view') {
     page_header($ev['title']);
     echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">'.e($ev['title']).'</h1>';
     if (can_manage_events()) echo '<a class="btn secondary" href="?route=event_edit&id='.e($id).'">Edit</a><form method="post" onsubmit="return confirm(\'Delete this event?\')" style="display:inline">'.csrf_field().'<button class="danger" name="delete_event" value="1">Delete</button></form>';
+    if (door_tax_manager()) echo '<a class="btn secondary" href="?route=door_tax&event_id='.e($id).'">Door tax</a>';
     echo '</div><p class="muted">'.e($ev['event_type']).'</p><div class="grid"><div><strong>Starts</strong><br>'.e(date('D j M Y H:i', strtotime($ev['start_at']))).'</div><div><strong>Ends</strong><br>'.e($ev['end_at'] ? date('D j M Y H:i', strtotime($ev['end_at'])) : 'Not set').'</div><div><strong>Location</strong><br>'.e($ev['location'] ?: 'TBC').'</div><div><strong>Max attendees</strong><br>'.e($ev['max_attendees'] ?: 'No limit').'</div></div><h2>Description</h2><p>'.nl2br(e($ev['description'] ?: 'No description added.')).'</p>';
     $atts=all('SELECT * FROM event_attachments WHERE event_id=? ORDER BY created_at DESC',[$id]); echo '<h2>Attachments</h2>'; if(!$atts) echo '<p>No attachments.</p>'; else { echo '<ul>'; foreach($atts as $a) echo '<li><a href="?route=event_attachment&id='.e($a['id']).'">'.e($a['original_filename']).'</a> <span class="muted">'.e(round($a['file_size']/1024,1)).' KB</span></li>'; echo '</ul>'; }
     echo '<form method="post">'.csrf_field().'<input type="hidden" name="signup" value="1"><button>Sign up / mark me attending</button></form></div>';
@@ -3356,11 +3454,141 @@ if (route() === 'event_edit') {
     page_footer(); exit;
 }
 
+
+if (route() === 'door_tax') {
+    require_door_tax_manager();
+    ensure_door_tax_schema();
+    page_header('Door tax');
+    audit('door_tax.view');
+
+    $charge = door_tax_charge_amount();
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        require_csrf();
+        if (isset($_POST['save_door_tax_settings'])) {
+            $newCharge = max(0.01, round((float)($_POST['door_tax_charge_per_meeting'] ?? 1), 2));
+            save_app_config(['door_tax_charge_per_meeting' => number_format($newCharge, 2, '.', '')]);
+            audit('door_tax.settings_update','config',null,'success',null,['door_tax_charge_per_meeting'=>$newCharge]);
+            flash('Door tax settings saved.');
+            redirect('door_tax');
+        }
+
+        if (isset($_POST['add_payment'])) {
+            $memberId = (int)($_POST['member_id'] ?? 0);
+            $amount = abs((float)($_POST['amount'] ?? 0));
+            if ($memberId <= 0 || $amount <= 0) { flash('Select a member and enter an amount above zero.'); redirect('door_tax'); }
+            $id = door_tax_add_transaction($memberId, null, 'payment', $amount, trim($_POST['payment_method'] ?? ''), trim($_POST['reference'] ?? ''), trim($_POST['note'] ?? ''));
+            audit('door_tax.payment','door_tax_transaction',$id,'success',null,['member_id'=>$memberId,'amount'=>$amount]);
+            flash('Door tax payment added.');
+            redirect('door_tax&member_id='.$memberId);
+        }
+
+        if (isset($_POST['add_manual_charge'])) {
+            $memberId = (int)($_POST['member_id'] ?? 0);
+            $amount = abs((float)($_POST['amount'] ?? $charge));
+            if ($memberId <= 0 || $amount <= 0) { flash('Select a member and enter an amount above zero.'); redirect('door_tax'); }
+            $id = door_tax_add_transaction($memberId, !empty($_POST['event_id'])?(int)$_POST['event_id']:null, 'manual_charge', -$amount, '', trim($_POST['reference'] ?? ''), trim($_POST['note'] ?? ''));
+            audit('door_tax.manual_charge','door_tax_transaction',$id,'success',null,['member_id'=>$memberId,'amount'=>$amount]);
+            flash('Manual door tax charge added.');
+            redirect('door_tax&member_id='.$memberId);
+        }
+
+        if (isset($_POST['add_adjustment'])) {
+            $memberId = (int)($_POST['member_id'] ?? 0);
+            $amount = round((float)($_POST['amount'] ?? 0), 2);
+            if ($memberId <= 0 || abs($amount) < 0.01) { flash('Select a member and enter a positive or negative adjustment.'); redirect('door_tax'); }
+            $id = door_tax_add_transaction($memberId, null, 'adjustment', $amount, '', trim($_POST['reference'] ?? ''), trim($_POST['note'] ?? ''));
+            audit('door_tax.adjustment','door_tax_transaction',$id,'success',null,['member_id'=>$memberId,'amount'=>$amount]);
+            flash('Door tax adjustment added.');
+            redirect('door_tax&member_id='.$memberId);
+        }
+
+        if (isset($_POST['charge_event'])) {
+            $eventId = (int)($_POST['event_id'] ?? 0);
+            $amount = abs((float)($_POST['amount'] ?? $charge));
+            $event = first('SELECT * FROM events WHERE id=?', [$eventId]);
+            if (!$event || $amount <= 0) { flash('Select an event and valid charge amount.'); redirect('door_tax'); }
+            $attendees = all('SELECT DISTINCT m.id,m.first_name,m.last_name FROM event_attendance ea JOIN members m ON m.id=ea.member_id WHERE ea.event_id=? AND ea.attended=1 ORDER BY m.last_name,m.first_name', [$eventId]);
+            $charged = 0; $skipped = 0;
+            foreach ($attendees as $att) {
+                if (door_tax_charge_member_for_event((int)$att['id'], $eventId, $amount)) $charged++;
+                else $skipped++;
+            }
+            audit('door_tax.charge_event','event',$eventId,'success',null,['charged'=>$charged,'skipped_existing'=>$skipped,'amount'=>$amount]);
+            flash('Door tax charged for '.$charged.' attended members. Skipped '.$skipped.' already charged members.');
+            redirect('door_tax&event_id='.$eventId);
+        }
+
+        if (isset($_POST['delete_transaction'])) {
+            $txId = (int)($_POST['transaction_id'] ?? 0);
+            $tx = first('SELECT * FROM door_tax_transactions WHERE id=?', [$txId]);
+            if ($tx) {
+                exec_sql('DELETE FROM door_tax_transactions WHERE id=?', [$txId]);
+                audit('door_tax.transaction_delete','door_tax_transaction',$txId,'success',null,['member_id'=>$tx['member_id'],'amount'=>$tx['amount'],'type'=>$tx['transaction_type']]);
+                flash('Door tax transaction deleted.');
+            }
+            redirect('door_tax'.(!empty($tx['member_id']) ? '&member_id='.$tx['member_id'] : ''));
+        }
+    }
+
+    $selectedMemberId = (int)($_GET['member_id'] ?? 0);
+    $selectedEventId = (int)($_GET['event_id'] ?? 0);
+    $members = all('SELECT id,first_name,last_name,callsign,membership_number,email,membership_status FROM members ORDER BY last_name,first_name');
+    $events = all('SELECT id,title,start_at,event_type FROM events WHERE start_at IS NOT NULL AND datetime(COALESCE(NULLIF(end_at,""),start_at)) <= datetime("now") ORDER BY datetime(start_at) DESC LIMIT 80');
+
+    $balanceRows = all('SELECT m.id,m.first_name,m.last_name,m.callsign,m.membership_number,m.membership_status,COALESCE(SUM(dt.amount),0) balance FROM members m LEFT JOIN door_tax_transactions dt ON dt.member_id=m.id GROUP BY m.id ORDER BY m.last_name,m.first_name');
+    $totalBalance = 0; $inCredit = 0; $owing = 0; $zero = 0;
+    foreach($balanceRows as $br){ $bal=(float)$br['balance']; $totalBalance += $bal; if($bal>0) $inCredit++; elseif($bal<0) $owing++; else $zero++; }
+
+    echo '<section class="door-tax-hero"><div><span class="eyebrow">Committee finance</span><h1>Door tax</h1><p>Track meeting door tax credit, advance payments and attendance-based deductions.</p></div><div class="door-tax-hero-stats"><div><strong>'.e(door_tax_money($totalBalance)).'</strong><span>Total balance</span></div><div><strong>'.e($inCredit).'</strong><span>In credit</span></div><div><strong>'.e($owing).'</strong><span>Owing</span></div></div></section>';
+
+    echo '<div class="grid door-tax-grid"><div class="card"><h2>Settings</h2><form method="post">'.csrf_field().'<label>Door tax per meeting</label><input type="number" step="0.01" min="0.01" name="door_tax_charge_per_meeting" value="'.e(number_format($charge,2,'.','')).'"><p class="muted">Example: £10 advance covers '.e((int)floor(10 / $charge)).' meetings at '.e(door_tax_money($charge)).' per meeting.</p><button name="save_door_tax_settings" value="1">Save settings</button></form></div>';
+
+    echo '<div class="card"><h2>Add payment / credit</h2><form method="post">'.csrf_field().'<label>Member</label><select name="member_id" required><option value="">Select member</option>';
+    foreach($members as $m){ $label=trim($m['first_name'].' '.$m['last_name']).($m['callsign']?' - '.$m['callsign']:'').($m['membership_number']?' / '.$m['membership_number']:''); echo '<option value="'.e($m['id']).'" '.($selectedMemberId===(int)$m['id']?'selected':'').'>'.e($label).'</option>'; }
+    echo '</select><div class="two"><div><label>Amount</label><input type="number" step="0.01" min="0.01" name="amount" value="10.00"></div><div><label>Payment method</label><input name="payment_method" placeholder="Cash, bank transfer, card"></div></div><label>Reference</label><input name="reference"><label>Note</label><textarea name="note" placeholder="Optional notes"></textarea><button name="add_payment" value="1">Add payment</button></form></div>';
+
+    echo '<div class="card"><h2>Charge attended event</h2><form method="post">'.csrf_field().'<label>Event</label><select name="event_id" required><option value="">Select past event</option>';
+    foreach($events as $ev){ echo '<option value="'.e($ev['id']).'" '.($selectedEventId===(int)$ev['id']?'selected':'').'>'.e(date('d/m/Y',strtotime($ev['start_at'])).' - '.$ev['title']).'</option>'; }
+    echo '</select><label>Charge amount per attended member</label><input type="number" step="0.01" min="0.01" name="amount" value="'.e(number_format($charge,2,'.','')).'"><p class="muted">Only members marked as attended will be charged. Members already charged for the same event are skipped.</p><button name="charge_event" value="1">Charge attended members</button></form></div>';
+
+    echo '<div class="card"><h2>Manual charge / adjustment</h2><form method="post">'.csrf_field().'<label>Member</label><select name="member_id" required><option value="">Select member</option>';
+    foreach($members as $m){ $label=trim($m['first_name'].' '.$m['last_name']).($m['callsign']?' - '.$m['callsign']:''); echo '<option value="'.e($m['id']).'" '.($selectedMemberId===(int)$m['id']?'selected':'').'>'.e($label).'</option>'; }
+    echo '</select><div class="two"><div><label>Manual charge amount</label><input type="number" step="0.01" min="0.01" name="amount" value="'.e(number_format($charge,2,'.','')).'"></div><div><label>Reference</label><input name="reference"></div></div><label>Note</label><textarea name="note"></textarea><div class="toolbar"><button name="add_manual_charge" value="1">Add charge</button><button class="secondary" name="add_adjustment" value="1" title="Use a positive or negative amount for corrections">Add as adjustment</button></div></form></div></div>';
+
+    echo '<div class="card door-tax-table-card"><div class="toolbar"><h2 style="margin-right:auto">Member balances</h2><span class="muted">Meetings remaining uses current charge of '.e(door_tax_money($charge)).'</span></div><table><tr><th>Member</th><th>Status</th><th>Balance</th><th>Meetings covered</th><th>Action</th></tr>';
+    foreach($balanceRows as $br){
+        $bal=round((float)$br['balance'],2); $meetings=door_tax_meetings_remaining($bal); $statusClass=door_tax_status_class($bal);
+        echo '<tr><td><strong>'.e(trim($br['first_name'].' '.$br['last_name'])).'</strong><br><span class="muted">'.e(($br['callsign']?:'No callsign').($br['membership_number']?' • '.$br['membership_number']:'')).'</span></td><td><span class="status-pill status-'.e($statusClass).'">'.e(door_tax_status_label($bal)).'</span></td><td>'.e(door_tax_money($bal)).'</td><td>'.e($meetings).'</td><td><a class="btn secondary" href="?route=door_tax&member_id='.e($br['id']).'">View transactions</a></td></tr>';
+    }
+    echo '</table></div>';
+
+    if ($selectedMemberId > 0) {
+        $sel = first('SELECT * FROM members WHERE id=?', [$selectedMemberId]);
+        if ($sel) {
+            $bal = door_tax_member_balance($selectedMemberId);
+            echo '<div class="card"><h2>Transactions for '.e(trim($sel['first_name'].' '.$sel['last_name'])).'</h2><p><strong>Current balance:</strong> '.e(door_tax_money($bal)).' / '.e(door_tax_meetings_remaining($bal)).' meetings covered</p>';
+            $txs = door_tax_recent_transactions($selectedMemberId, 50);
+            if (!$txs) echo '<p class="muted">No door tax transactions recorded yet.</p>';
+            else {
+                echo '<table><tr><th>Date</th><th>Type</th><th>Event</th><th>Amount</th><th>Method/ref</th><th>Note</th><th></th></tr>';
+                foreach($txs as $tx){ $note=decrypt_value($tx['note_encrypted'] ?? '') ?: ''; echo '<tr><td>'.e($tx['created_at']).'</td><td>'.e($tx['transaction_type']).'</td><td>'.e($tx['event_title'] ?: '').'</td><td>'.e(door_tax_money($tx['amount'])).'</td><td>'.e(trim(($tx['payment_method']?:'').' '.($tx['reference']?:''))).'</td><td>'.e($note).'</td><td><form method="post" onsubmit="return confirm(&quot;Delete this door tax transaction?&quot;)">'.csrf_field().'<input type="hidden" name="transaction_id" value="'.e($tx['id']).'"><button class="danger" name="delete_transaction" value="1">Delete</button></form></td></tr>'; }
+                echo '</table>';
+            }
+            echo '</div>';
+        }
+    }
+
+    page_footer(); exit;
+}
+
 if (route() === 'attendance') {
     require_permission('track_attendance'); audit('attendance.view'); page_header('Attendance tracking');
     $future=all('SELECT e.* FROM events e WHERE datetime(e.start_at) >= datetime("now") ORDER BY datetime(e.start_at) ASC');
     $past=all('SELECT e.* FROM events e WHERE datetime(e.start_at) < datetime("now") ORDER BY datetime(e.start_at) DESC');
-    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Attendance tracking</h1><a class="btn secondary" href="?route=attendance_stats">Attendance stats</a></div><p class="muted">Future meetings show closest first. Past meetings show most recent first.</p></div>';
+    echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">Attendance tracking</h1><a class="btn secondary" href="?route=attendance_stats">Attendance stats</a>';
+    if (door_tax_manager()) echo '<a class="btn secondary" href="?route=door_tax">Door tax</a>';
+    echo '</div><p class="muted">Future meetings show closest first. Past meetings show most recent first. Door tax can be charged from attended past events.</p></div>';
     $render = function(array $events, string $title) {
         echo '<div class="card"><h2>'.e($title).'</h2>';
         if (!$events) { echo '<p>No events in this section.</p></div>'; return; }

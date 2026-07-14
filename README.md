@@ -48,3 +48,7 @@ Added Admin > Wallet settings. Admins can upload Apple Wallet pass certificate f
 - SMTP sends support HTML email, BCC envelope recipients, Reply-To, and attachments.
 - Email settings now have a Send test email button which saves the current configuration and sends a test using the selected transport.
 - SMTP/Resend secret fields no longer display saved secrets; leaving them blank retains the existing value.
+
+## Door tax module
+
+Added a Door tax module under the Committee menu. Access is restricted to Chair, Vice Chair, Secretary and Treasurer. The module tracks prepaid door tax balances, payments, manual charges/adjustments, and attendance-based deductions from past events. Members can see their door tax balance and number of meetings covered on their own profile. Member admin pages also show the door tax balance and link to management. Attendance pages link into Door tax so attended events can be charged.
