@@ -83,3 +83,12 @@ Changed the Membership cards page to a member list with separate columns for Phy
 ## My Profile section order and wallet links
 
 Reordered My Profile so subscription/payment history appears before Door tax, with Door tax immediately below subscriptions. Moved the Membership cards section to the bottom of the page and added personal Physical, Apple Wallet and Android/Google Wallet links. The wallet links use a self-service route that only loads the member linked to the logged-in user.
+
+## Email rendering and delivery report overhaul
+
+- Plain-text textarea line breaks are converted into email-safe HTML so paragraphs do not bunch together.
+- Outgoing messages use an inline-styled GW4LWZ email template and the exact sent HTML is stored.
+- Reply-To now uses only the address configured in Admin > Email settings.
+- Added a sent-email detail page showing the exact stored message, recipient-specific copies, attachments, sender/from/reply-to, delivery status, failures, read/open counts and individual open events.
+- Immediate transport failures trigger a delivery-issue notification to the sending user and contact@gw4lwz.co.uk.
+- Note: SMTP acceptance confirms the server accepted the message; later bounces require a provider webhook or mailbox processing integration.
