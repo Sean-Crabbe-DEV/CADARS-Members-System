@@ -486,6 +486,8 @@ function ensure_email_delivery_schema(): void {
             'from_address' => 'TEXT NULL',
             'reply_to' => 'TEXT NULL',
             'transport_method' => 'TEXT NULL',
+            'email_type' => 'TEXT NULL',
+            'system_context' => 'TEXT NULL',
         ];
         foreach ($emailColumns as $column=>$definition) {
             if (!table_has_column('emails', $column)) exec_sql('ALTER TABLE emails ADD COLUMN '.$column.' '.$definition);
@@ -501,6 +503,19 @@ function ensure_email_delivery_schema(): void {
 
         exec_sql('CREATE INDEX IF NOT EXISTS idx_email_recipients_email_status ON email_recipients(email_id,status)');
         exec_sql('CREATE INDEX IF NOT EXISTS idx_email_opens_recipient ON email_opens(email_recipient_id)');
+        exec_sql('CREATE INDEX IF NOT EXISTS idx_emails_sent_at ON emails(sent_at)');
+        exec_sql('CREATE INDEX IF NOT EXISTS idx_emails_type ON emails(email_type)');
+
+        // Backfill older records where the overall sent time was not populated.
+        // Recipient sent_at is preferred; updated_at is the fallback for legacy
+        // records already marked as sent.
+        exec_sql('UPDATE emails
+            SET sent_at=COALESCE(
+                (SELECT MAX(er.sent_at) FROM email_recipients er WHERE er.email_id=emails.id AND er.sent_at IS NOT NULL),
+                updated_at
+            )
+            WHERE sent_at IS NULL
+              AND status IN ("sent","sent_bcc","partial_failed")');
     } catch (Throwable $e) {}
 }
 
@@ -540,6 +555,108 @@ function email_render_template(string $content, string $subject=''): string {
         . '</td></tr></table></td></tr></table></body></html>';
 }
 
+function record_system_email_log(
+    string $emailType,
+    string $systemContext,
+    array $to,
+    string $subject,
+    string $html,
+    array $cfg,
+    array $sendResult,
+    ?int $actorUserId=null,
+    array $attachments=[]
+): int {
+    ensure_email_delivery_schema();
+
+    $to = normalise_email_list($to);
+    $fromAddress = trim((string)($cfg['email_from_address'] ?? ''));
+    $fromName = trim((string)($cfg['email_from_name'] ?? 'GW4LWZ'));
+    $replyTo = trim((string)($cfg['email_reply_to'] ?? $fromAddress));
+    $method = trim((string)($cfg['email_method'] ?? 'php_mail'));
+    $ok = !empty($sendResult['ok']);
+    $status = $ok ? 'sent' : 'failed';
+
+    exec_sql('INSERT INTO emails
+        (subject,body_html,body_text,status,category,created_by_user_id,from_name,from_address,reply_to,transport_method,email_type,system_context,sent_at,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime("now"),datetime("now"),datetime("now"))', [
+        $subject,
+        $html,
+        strip_tags($html),
+        $status,
+        'system',
+        $actorUserId,
+        $fromName,
+        $fromAddress,
+        $replyTo,
+        $method,
+        $emailType,
+        $systemContext
+    ]);
+    $emailId = (int)db()->lastInsertId();
+
+    $transportResponse = $sendResult['provider_response'] ?? ($sendResult['diagnostic'] ?? null);
+    foreach ($to as $address) {
+        exec_sql('INSERT INTO email_recipients
+            (email_id,email_address,recipient_name,tracking_enabled,status,sent_body_html,transport_response,sent_at,failed_at,failure_reason,created_at,updated_at)
+            VALUES (?,?,?,0,?,?,?,CASE WHEN ?=1 THEN datetime("now") ELSE NULL END,CASE WHEN ?=0 THEN datetime("now") ELSE NULL END,?,datetime("now"),datetime("now"))', [
+            $emailId,
+            $address,
+            $address,
+            $status,
+            $html,
+            $transportResponse,
+            $ok ? 1 : 0,
+            $ok ? 1 : 0,
+            $ok ? null : ($sendResult['error'] ?? 'Unknown delivery error')
+        ]);
+    }
+
+    foreach ($attachments as $attachment) {
+        if (empty($attachment['stored_filename'])) continue;
+        exec_sql('INSERT INTO email_attachments
+            (email_id,original_filename,stored_filename,mime_type,file_size,uploaded_by_user_id,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,datetime("now"),datetime("now"))', [
+            $emailId,
+            $attachment['original_filename'] ?? $attachment['filename'] ?? basename($attachment['stored_filename']),
+            $attachment['stored_filename'],
+            $attachment['mime_type'] ?? 'application/octet-stream',
+            (int)($attachment['file_size'] ?? 0),
+            $actorUserId ?: 0
+        ]);
+    }
+
+    return $emailId;
+}
+
+function send_and_log_system_email(
+    array $cfg,
+    array $to,
+    string $subject,
+    string $html,
+    string $emailType,
+    string $systemContext,
+    ?int $actorUserId=null,
+    array $attachments=[]
+): array {
+    $fromAddress = trim((string)($cfg['email_from_address'] ?? ''));
+    $fromName = trim((string)($cfg['email_from_name'] ?? 'GW4LWZ'));
+    $replyTo = trim((string)($cfg['email_reply_to'] ?? $fromAddress));
+
+    $result = send_configured_email($cfg, $to, [], $subject, $html, $fromName, $fromAddress, $replyTo, $attachments);
+    $result['email_log_id'] = record_system_email_log(
+        $emailType,
+        $systemContext,
+        $to,
+        $subject,
+        $html,
+        $cfg,
+        $result,
+        $actorUserId,
+        $attachments
+    );
+    return $result;
+}
+
 function email_delivery_issue_notification(array $cfg, array $senderUser, int $emailId, string $subject, array $failures): array {
     if (!$failures) return ['ok'=>true];
 
@@ -568,15 +685,14 @@ function email_delivery_issue_notification(array $cfg, array $senderUser, int $e
         'Email delivery issue'
     );
 
-    return send_configured_email(
+    return send_and_log_system_email(
         $cfg,
         $recipients,
-        [],
         'Email delivery issue: '.$subject,
         $body,
-        $fromName,
-        $fromAddress,
-        $replyTo
+        'delivery_issue',
+        'Delivery issue notification for email #'.$emailId,
+        isset($senderUser['id']) ? (int)$senderUser['id'] : null
     );
 }
 
@@ -611,8 +727,17 @@ function send_user_access_email(array $targetUser, string $purpose, ?int $create
         ? 'An account has been created for you on the society membership system.'
         : 'A password reset has been requested for your society membership system account.';
     $html = '<p>Hello,</p><p>' . e($intro) . '</p><p><a href="' . e($link) . '">Click here to set your password</a></p><p>This link expires in 48 hours. If the button does not work, copy this link into your browser:</p><p>' . e($link) . '</p><p>Kind regards,<br>' . $society . '</p>';
-    $send = send_configured_email($cfg, [$targetUser['email']], [], $subject, $html, $fromName, $fromAddress, $replyTo);
-    audit($purpose === 'invite' ? 'user.invite_email_sent' : 'user.password_reset_email_sent', 'user', (int)$targetUser['id'], !empty($send['ok']) ? 'success' : 'failed', $send['error'] ?? null, ['purpose'=>$purpose]);
+    $styledHtml = email_render_template($html, $subject);
+    $send = send_and_log_system_email(
+        $cfg,
+        [$targetUser['email']],
+        $subject,
+        $styledHtml,
+        $purpose === 'invite' ? 'account_invite' : 'password_reset',
+        $purpose === 'invite' ? 'User account invitation' : 'Password reset',
+        $created_by_user_id
+    );
+    audit($purpose === 'invite' ? 'user.invite_email_sent' : 'user.password_reset_email_sent', 'user', (int)$targetUser['id'], !empty($send['ok']) ? 'success' : 'failed', $send['error'] ?? null, ['purpose'=>$purpose,'email_log_id'=>$send['email_log_id'] ?? null]);
     return $send;
 }
 
@@ -1454,6 +1579,7 @@ function page_header(string $title): void {
             echo '<a href="?route=users">Users</a>';
             echo '<a href="?route=audit">Audit logs</a>';
             echo '<a href="?route=email_config">Email settings</a>';
+            echo '<a href="?route=master_email_logs">Master email logs</a>';
             echo '<a href="?route=wallet_cards">Wallet cards</a>';
             echo '<a href="?route=membership_cards">Membership cards</a>';
             echo '<a href="?route=wallet_settings">Wallet settings</a>';
@@ -2539,7 +2665,9 @@ if (route() === 'assets.css') {
 .email-sent-preview{max-width:680px;margin:0 auto;border:1px solid #dbe2ea;border-radius:12px;overflow:auto;background:#eef2f7;padding:14px}
 .email-attachment-list{display:grid;gap:8px}.email-attachment-item{display:grid;gap:3px;border:1px solid #dbe2ea;border-radius:10px;padding:12px;text-decoration:none}.email-attachment-item span{color:#64748b;font-size:.85rem}
 .email-report-table-wrap{overflow:auto}.email-copy-row td{background:#f8fafc!important}.email-copy-row .email-sent-preview{max-width:760px}
-@media(max-width:760px){.email-detail-hero{grid-template-columns:1fr}.email-detail-stats{display:grid;grid-template-columns:1fr 1fr}.email-detail-meta{grid-template-columns:1fr}.email-detail-meta strong{margin-bottom:8px}}';
+@media(max-width:760px){.email-detail-hero{grid-template-columns:1fr}.email-detail-stats{display:grid;grid-template-columns:1fr 1fr}.email-detail-meta{grid-template-columns:1fr}.email-detail-meta strong{margin-bottom:8px}}/* Master email logs */
+.master-email-filter{padding:16px}.master-email-filter form{display:grid;grid-template-columns:minmax(260px,1fr) 220px 180px auto;gap:12px;align-items:end}.master-email-filter-actions{display:flex;gap:8px}.master-email-log-card{overflow:hidden}.master-email-table-wrap{overflow:auto}.master-email-log-card td small{display:block;color:#64748b;margin-top:3px;max-width:320px}
+@media(max-width:850px){.master-email-filter form{grid-template-columns:1fr}.master-email-filter-actions{display:grid}.master-email-filter-actions .btn,.master-email-filter-actions button{width:100%;box-sizing:border-box}}';
     exit;
 }
 if (route() === 'email_open') {
@@ -4455,7 +4583,7 @@ if (route() === 'email_detail') {
     page_header('Sent email detail');
     echo '<section class="email-detail-hero"><div><span class="eyebrow">Sent email record</span><h1>'.e($email['subject']).'</h1><p>Created '.e($email['created_at']).' • Sent '.e($email['sent_at'] ?: 'Not sent').'</p></div><div class="email-detail-stats"><div><strong>'.e(count($recipients)).'</strong><span>Recipients</span></div><div><strong>'.e($sentCount).'</strong><span>Accepted</span></div><div><strong>'.e($openedCount).'</strong><span>Opened</span></div><div><strong>'.e($failedCount).'</strong><span>Issues</span></div></div></section>';
 
-    echo '<div class="card email-detail-summary"><div class="toolbar"><h2 style="margin-right:auto">Message details</h2><a class="btn secondary" href="?route=emails">Back to emails</a></div><div class="email-detail-meta"><span>From</span><strong>'.e(trim(($email['from_name'] ?: '').' <'.($email['from_address'] ?: '').'>')).'</strong><span>Reply-To</span><strong>'.e($email['reply_to'] ?: 'Not recorded').'</strong><span>Transport</span><strong>'.e(strtoupper($email['transport_method'] ?: 'Not recorded')).'</strong><span>Status</span><strong>'.e($email['status']).'</strong><span>Sender account</span><strong>'.e($email['sender_email'] ?: 'Not recorded').'</strong></div></div>';
+    echo '<div class="card email-detail-summary"><div class="toolbar"><h2 style="margin-right:auto">Message details</h2><a class="btn secondary" href="?route=emails">Back to emails</a></div><div class="email-detail-meta"><span>From</span><strong>'.e(trim(($email['from_name'] ?: '').' <'.($email['from_address'] ?: '').'>')).'</strong><span>Reply-To</span><strong>'.e($email['reply_to'] ?: 'Not recorded').'</strong><span>Transport</span><strong>'.e(strtoupper($email['transport_method'] ?: 'Not recorded')).'</strong><span>Status</span><strong>'.e($email['status']).'</strong><span>Sent by user</span><strong>'.e($email['sender_email'] ?: ($email['created_by_user_id'] ? 'User #'.$email['created_by_user_id'] : 'System / unauthenticated process')).'</strong><span>Email type</span><strong>'.e(ucwords(str_replace('_',' ',$email['email_type'] ?: 'member_email'))).'</strong><span>System context</span><strong>'.e($email['system_context'] ?: 'Not applicable').'</strong></div></div>';
 
     echo '<div class="card"><h2>Exact sent email preview</h2><p class="muted">This is the stored HTML used for the sent message. Personalised names and tracking pixels can differ by recipient; choose a recipient below to see that recipient’s stored version.</p><div class="email-sent-preview">'.($email['body_html'] ?: '<p>No message body stored.</p>').'</div></div>';
 
@@ -4517,7 +4645,7 @@ if (route() === 'emails') {
         $replyTo = trim($cfg['email_reply_to'] ?: $fromAddress);
         $transportMethod = trim((string)($cfg['email_method'] ?? 'php_mail'));
 
-        exec_sql('INSERT INTO emails (subject,body_html,body_text,status,category,created_by_user_id,from_name,from_address,reply_to,transport_method,created_at,updated_at) VALUES (?,?,?,"draft",?,?,?,?,?,?,datetime("now"),datetime("now"))',[
+        exec_sql('INSERT INTO emails (subject,body_html,body_text,status,category,created_by_user_id,from_name,from_address,reply_to,transport_method,email_type,system_context,created_at,updated_at) VALUES (?,?,?,"draft",?,?,?,?,?,?,?,? ,datetime("now"),datetime("now"))',[
             $emailSubject,
             $emailTemplate,
             strip_tags((string)($_POST['body_html'] ?? '')),
@@ -4526,7 +4654,9 @@ if (route() === 'emails') {
             $fromName,
             $fromAddress,
             $replyTo,
-            $transportMethod
+            $transportMethod,
+            'member_email',
+            'Email compose page'
         ]);
         $email_id=(int)db()->lastInsertId();
         if (!empty($_FILES['attachment']['name']) && $_FILES['attachment']['error']===UPLOAD_ERR_OK) {
@@ -4596,7 +4726,11 @@ if (route() === 'emails') {
                 ]);
             }
             $overallStatus = $failCount === 0 ? 'sent' : ($successCount > 0 ? 'partial_failed' : 'failed');
-            exec_sql('UPDATE emails SET status=?, sent_at=CASE WHEN ?=1 THEN datetime("now") ELSE sent_at END, updated_at=datetime("now") WHERE id=?',[$overallStatus,$successCount>0?1:0,$email_id]);
+            if ($successCount > 0) {
+                exec_sql('UPDATE emails SET status=?, sent_at=datetime("now"), updated_at=datetime("now") WHERE id=?',[$overallStatus,$email_id]);
+            } else {
+                exec_sql('UPDATE emails SET status=?, sent_at=datetime("now"), updated_at=datetime("now") WHERE id=?',[$overallStatus,$email_id]);
+            }
             $notificationResult = null;
             if ($failures) {
                 $notificationResult = email_delivery_issue_notification($cfg, $u, $email_id, $emailSubject, $failures);
@@ -4611,7 +4745,14 @@ if (route() === 'emails') {
         audit('email.draft_created','email',$email_id,'success',null,['recipient_count'=>count($members),'recipient_mode'=>$recipientMode]);
         flash('Email draft created with recipients.'); redirect('emails');
     }
-    $emails=all('SELECT * FROM emails ORDER BY created_at DESC LIMIT 25');
+    $emails=all('SELECT em.*,u.email sender_email,m.first_name sender_first_name,m.last_name sender_last_name,
+        COALESCE(em.sent_at,(SELECT MAX(er.sent_at) FROM email_recipients er WHERE er.email_id=em.id),CASE WHEN em.status IN ("sent","sent_bcc","partial_failed","failed") THEN em.updated_at ELSE NULL END) display_sent_at
+        FROM emails em
+        LEFT JOIN users u ON u.id=em.created_by_user_id
+        LEFT JOIN members m ON m.id=u.member_id
+        WHERE COALESCE(em.email_type,"member_email")="member_email"
+        ORDER BY datetime(COALESCE(em.sent_at,em.updated_at,em.created_at)) DESC
+        LIMIT 25');
     $eligible=all('SELECT DISTINCT m.id,m.first_name,m.last_name,m.callsign,m.email,m.membership_status, CASE WHEN m.email IS NOT NULL AND m.email <> "" THEN 1 ELSE 0 END AS can_email, (SELECT sp.status FROM subscription_payments sp WHERE sp.member_id=m.id ORDER BY sp.subscription_year DESC, COALESCE(sp.payment_date, "") DESC, sp.id DESC LIMIT 1) AS latest_subs_status, EXISTS(SELECT 1 FROM users uu JOIN user_roles ur ON ur.user_id=uu.id JOIN roles rr ON rr.id=ur.role_id WHERE uu.member_id=m.id AND rr.name IN ("committee","chair","vice_chair","secretary","treasurer") AND (ur.expires_at IS NULL OR ur.expires_at > datetime("now"))) AS is_committee FROM members m ORDER BY m.last_name,m.first_name');
     $fromAddress = trim($cfg['email_from_address'] ?: ('no-reply@' . ($_SERVER['HTTP_HOST'] ?? 'localhost')));
     $fromName = trim($cfg['email_from_name'] ?: ($cfg['society_name'] ?? 'Membership System'));
@@ -4634,10 +4775,14 @@ if (route() === 'emails') {
     }
     echo '</div></aside><section class="email-compose"><div class="email-fields"><div class="email-row"><label>To:</label><input id="emailToSummary" value="0 members selected" readonly></div><div class="email-row"><label>From:</label><input value="'.e($fromName).' <'.e($fromAddress).'>" readonly></div><div class="email-row"><label>Reply-To:</label><input value="'.e($cfg['email_reply_to'] ?: $fromAddress).'" readonly></div><div class="email-row"><label>Subject:</label><input name="subject" placeholder="Email subject..." required></div></div><div class="email-toolbar"><label class="email-attach-btn">📎 Attach<input type="file" name="attachment" id="emailAttachment"></label><span id="emailAttachName" class="email-help">Line breaks and paragraphs will be preserved. Use <code>{member_name}</code> to personalise each email.</span></div><textarea class="email-message" name="body_html" placeholder="Write your message here. Blank lines and paragraphs will be preserved in the sent email. Use {member_name} to personalise." required></textarea><div class="email-sendbar"><span class="muted">All member records are shown automatically. Members without an email address are visible but cannot be selected. No recipients are selected by default. Use All or filters to select recipients.</span><div><button class="secondary" type="submit">Save draft</button> <button name="send_now" value="1">Send now</button></div></div></section></div></form></div>';
 
-    echo '<div class="card"><h2>Recent emails</h2><table><tr><th>Subject</th><th>Status</th><th>Sent</th><th>Recipients</th><th>Opens</th><th>Issues</th><th></th></tr>';
+    echo '<div class="card"><div class="toolbar"><h2 style="margin-right:auto">Recent emails</h2>';
+    if (is_admin_user()) echo '<a class="btn secondary" href="?route=master_email_logs">Master email logs</a>';
+    echo '</div><table><tr><th>Subject</th><th>Status</th><th>Sent date/time</th><th>Sent by</th><th>Recipients</th><th>Opens</th><th>Issues</th><th></th></tr>';
     foreach($emails as $em){
         $rc=first('SELECT COUNT(*) c, SUM(open_count) opens, SUM(CASE WHEN status="failed" THEN 1 ELSE 0 END) failures FROM email_recipients WHERE email_id=?',[$em['id']]);
-        echo '<tr><td>'.e($em['subject']).'</td><td>'.e($em['status']).'</td><td>'.e($em['sent_at']).'</td><td>'.e($rc['c']).'</td><td>'.e($rc['opens'] ?: 0).'</td><td>'.e($rc['failures'] ?: 0).'</td><td><a class="btn secondary" href="?route=email_detail&id='.e($em['id']).'">View sent email</a></td></tr>';
+        $senderName=trim(($em['sender_first_name'] ?? '').' '.($em['sender_last_name'] ?? ''));
+        $sentBy=$em['created_by_user_id'] ? (($senderName!==''?$senderName.' • ':'').($em['sender_email'] ?: 'User #'.$em['created_by_user_id'])) : 'System';
+        echo '<tr><td>'.e($em['subject']).'</td><td>'.e($em['status']).'</td><td>'.e($em['display_sent_at'] ?: '').'</td><td>'.e($sentBy).'</td><td>'.e($rc['c']).'</td><td>'.e($rc['opens'] ?: 0).'</td><td>'.e($rc['failures'] ?: 0).'</td><td><a class="btn secondary" href="?route=email_detail&id='.e($em['id']).'">View sent email</a></td></tr>';
     }
     echo '</table></div>';
     echo <<<'HTML'
@@ -4702,6 +4847,84 @@ HTML;
     page_footer(); exit;
 }
 
+
+if (route() === 'master_email_logs') {
+    if (!is_admin_user()) {
+        http_response_code(403);
+        page_header('Access denied');
+        echo '<div class="card"><h2>Access denied</h2><p>Master email logs are restricted to administrators.</p></div>';
+        page_footer(); exit;
+    }
+
+    ensure_email_delivery_schema();
+    page_header('Master email logs');
+    audit('master_email_logs.view');
+
+    $q = trim((string)($_GET['q'] ?? ''));
+    $type = trim((string)($_GET['type'] ?? ''));
+    $status = trim((string)($_GET['status'] ?? ''));
+
+    $where = '1=1';
+    $params = [];
+    if ($q !== '') {
+        $where .= ' AND (em.subject LIKE ? OR em.system_context LIKE ? OR u.email LIKE ? OR EXISTS(SELECT 1 FROM email_recipients erq WHERE erq.email_id=em.id AND erq.email_address LIKE ?))';
+        $like = '%'.$q.'%';
+        $params = [$like,$like,$like,$like];
+    }
+    if ($type !== '') {
+        $where .= ' AND COALESCE(em.email_type,"member_email")=?';
+        $params[] = $type;
+    }
+    if ($status !== '') {
+        $where .= ' AND em.status=?';
+        $params[] = $status;
+    }
+
+    $rows = all('SELECT em.*,u.email sender_email,m.first_name sender_first_name,m.last_name sender_last_name,
+        (SELECT COUNT(*) FROM email_recipients er WHERE er.email_id=em.id) recipient_count,
+        (SELECT COUNT(*) FROM email_recipients er WHERE er.email_id=em.id AND er.status="failed") issue_count,
+        (SELECT COUNT(*) FROM email_recipients er WHERE er.email_id=em.id AND er.opened_at IS NOT NULL) opened_count,
+        COALESCE(em.sent_at,(SELECT MAX(er.sent_at) FROM email_recipients er WHERE er.email_id=em.id),em.updated_at) display_sent_at
+        FROM emails em
+        LEFT JOIN users u ON u.id=em.created_by_user_id
+        LEFT JOIN members m ON m.id=u.member_id
+        WHERE '.$where.'
+        ORDER BY datetime(COALESCE(em.sent_at,em.updated_at,em.created_at)) DESC,em.id DESC
+        LIMIT 500', $params);
+
+    $total = (int)(first('SELECT COUNT(*) c FROM emails')['c'] ?? 0);
+    $systemTotal = (int)(first('SELECT COUNT(*) c FROM emails WHERE COALESCE(email_type,"member_email")<>"member_email"')['c'] ?? 0);
+    $failedTotal = (int)(first('SELECT COUNT(*) c FROM emails WHERE status IN ("failed","partial_failed")')['c'] ?? 0);
+
+    echo '<section class="email-detail-hero"><div><span class="eyebrow">Admin email audit</span><h1>Master email logs</h1><p>All member and system-generated emails recorded by the membership system.</p></div><div class="email-detail-stats"><div><strong>'.e($total).'</strong><span>Total</span></div><div><strong>'.e($systemTotal).'</strong><span>System</span></div><div><strong>'.e($failedTotal).'</strong><span>Issues</span></div></div></section>';
+
+    echo '<section class="card master-email-filter"><form method="get"><input type="hidden" name="route" value="master_email_logs"><div><label>Search</label><input name="q" value="'.e($q).'" placeholder="Subject, context, sender or recipient"></div><div><label>Email type</label><select name="type"><option value="">All types</option>';
+    $types = [
+        'member_email'=>'Member email',
+        'password_reset'=>'Password reset',
+        'account_invite'=>'Account invite',
+        'configuration_test'=>'Configuration test',
+        'delivery_issue'=>'Delivery issue',
+        'automated_reminder'=>'Automated reminder',
+        'notification'=>'System notification'
+    ];
+    foreach($types as $value=>$label) echo '<option value="'.e($value).'" '.($type===$value?'selected':'').'>'.e($label).'</option>';
+    echo '</select></div><div><label>Status</label><select name="status"><option value="">All statuses</option>';
+    foreach(['sent','partial_failed','failed','draft'] as $st) echo '<option value="'.e($st).'" '.($status===$st?'selected':'').'>'.e($st).'</option>';
+    echo '</select></div><div class="master-email-filter-actions"><button>Apply</button><a class="btn secondary" href="?route=master_email_logs">Reset</a></div></form></section>';
+
+    echo '<section class="card master-email-log-card"><div class="toolbar"><h2 style="margin-right:auto">Email records</h2><a class="btn secondary" href="?route=email_config">Email settings</a></div><div class="master-email-table-wrap"><table><tr><th>Sent date/time</th><th>Type</th><th>Subject</th><th>Sent by</th><th>Recipients</th><th>Opened</th><th>Issues</th><th>Status</th><th></th></tr>';
+    foreach($rows as $row){
+        $senderName = trim(($row['sender_first_name'] ?? '').' '.($row['sender_last_name'] ?? ''));
+        $sentBy = $row['created_by_user_id'] ? (($senderName !== '' ? $senderName.' • ' : '').($row['sender_email'] ?: 'User #'.$row['created_by_user_id'])) : 'System / unauthenticated process';
+        $emailType = $row['email_type'] ?: 'member_email';
+        echo '<tr><td>'.e($row['display_sent_at'] ?: $row['created_at']).'</td><td>'.e(ucwords(str_replace('_',' ',$emailType))).'</td><td><strong>'.e($row['subject']).'</strong><small>'.e($row['system_context'] ?: '').'</small></td><td>'.e($sentBy).'</td><td>'.e($row['recipient_count']).'</td><td>'.e($row['opened_count']).'</td><td>'.e($row['issue_count']).'</td><td>'.e($row['status']).'</td><td><a class="btn secondary" href="?route=email_detail&id='.e($row['id']).'">View</a></td></tr>';
+    }
+    echo '</table></div></section>';
+
+    page_footer(); exit;
+}
+
 if (route() === 'email_config') {
     if (!is_admin_user()) require_permission('system_admin');
     page_header('Email system config');
@@ -4745,7 +4968,16 @@ if (route() === 'email_config') {
             $subject = 'Email configuration test - ' . ($cfg['society_name'] ?? 'Membership System');
             $html = '<h2>Email configuration test</h2><p>This is a test email sent by the membership system.</p><p><strong>Method:</strong> ' . e($cfg['email_method'] ?? 'php_mail') . '<br><strong>Time:</strong> ' . e(date('d/m/Y H:i:s')) . '</p><p>If you received this, the configured email transport accepted the message.</p>';
 
-            $result = send_configured_email($cfg, [$testRecipient], [], $subject, $html, $fromName, $fromAddress, $replyTo);
+            $styledTestHtml = email_render_template($html, $subject);
+            $result = send_and_log_system_email(
+                $cfg,
+                [$testRecipient],
+                $subject,
+                $styledTestHtml,
+                'configuration_test',
+                'Email configuration test',
+                (int)$u['id']
+            );
             $auditMeta = [
                 'method' => $cfg['email_method'] ?? 'php_mail',
                 'recipient' => $testRecipient,
