@@ -2863,7 +2863,31 @@ if (route() === 'assets.css') {
 .attendance-session-total strong,.attendance-session-total span{display:block}.attendance-session-total span{font-size:.8rem;color:#475569;margin-top:3px}
 .attendance-summary-grid{grid-template-columns:1fr 1fr}
 .admin-directory-preferences{border-top:4px solid #7c3aed}.directory-preference-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:14px 0}.directory-preference-grid label{border:1px solid #e2e8f0;border-radius:10px;padding:10px;background:#f8fafc}
-@media(max-width:850px){.attendance-matrix-filter form{grid-template-columns:1fr}.attendance-matrix-filter-actions{display:grid}.attendance-matrix-filter-actions .btn,.attendance-matrix-filter-actions button{width:100%;box-sizing:border-box}.attendance-matrix-hero{grid-template-columns:1fr}.attendance-matrix-hero-stats{display:grid;grid-template-columns:1fr 1fr}.attendance-summary-grid{grid-template-columns:1fr}.directory-preference-grid{grid-template-columns:1fr}.attendance-matrix .attendance-sticky-member{min-width:165px;max-width:165px}.attendance-matrix .attendance-sticky-total{left:165px}.attendance-matrix .attendance-sticky-percent{left:249px}}';
+@media(max-width:850px){.attendance-matrix-filter form{grid-template-columns:1fr}.attendance-matrix-filter-actions{display:grid}.attendance-matrix-filter-actions .btn,.attendance-matrix-filter-actions button{width:100%;box-sizing:border-box}.attendance-matrix-hero{grid-template-columns:1fr}.attendance-matrix-hero-stats{display:grid;grid-template-columns:1fr 1fr}.attendance-summary-grid{grid-template-columns:1fr}.directory-preference-grid{grid-template-columns:1fr}.attendance-matrix .attendance-sticky-member{min-width:165px;max-width:165px}.attendance-matrix .attendance-sticky-total{left:165px}.attendance-matrix .attendance-sticky-percent{left:249px}}/* Brickworks criteria accordion */
+.bw-accordion-card{padding:0!important;overflow:hidden}
+.bw-accordion-card summary{list-style:none}
+.bw-accordion-card summary::-webkit-details-marker{display:none}
+.bw-card-summary{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:18px;align-items:center;padding:18px 20px;cursor:pointer;background:#fff}
+.bw-card-summary:hover{background:#f8fafc}
+.bw-summary-main{min-width:0}
+.bw-summary-main h3{margin:.2rem 0 .35rem}
+.bw-summary-main p{margin:0;color:#475569;line-height:1.45}
+.bw-summary-side{display:grid;justify-items:end;gap:8px}
+.bw-expand-label{font-size:.78rem;color:#64748b;font-weight:700}
+.bw-card-summary:after{content:"+";font-size:1.5rem;font-weight:700;color:#64748b;grid-column:2;justify-self:end}
+.bw-accordion-card[open] .bw-card-summary:after{content:"−"}
+.bw-accordion-card[open] .bw-expand-label{color:#1d4ed8}
+.bw-card-details{border-top:1px solid #e2e8f0;padding:18px 20px;background:#f8fafc}
+.bw-complete-message{display:grid;gap:4px;padding:14px;border-radius:12px;background:#ecfdf5;border:1px solid #bbf7d0;color:#166534}
+.bw-status.none{background:#f1f5f9;color:#475569}
+.bw-status.pending{background:#fff7ed;color:#9a3412}
+.bw-status.complete{background:#ecfdf5;color:#166534}
+@media(max-width:720px){
+  .bw-card-summary{grid-template-columns:1fr;padding:16px}
+  .bw-summary-side{justify-items:start}
+  .bw-card-summary:after{grid-column:1;justify-self:end;margin-top:-30px}
+  .bw-card-details{padding:16px}
+}';
     exit;
 }
 if (route() === 'email_open') {
@@ -4869,20 +4893,36 @@ if (route() === 'brickworks') {
     $manageButton = (has_permission('review_brickworks_evidence') || has_permission('manage_brickworks_criteria')) ? '<a class="btn" href="?route=brickworks_manage">Brickworks management</a>' : '';
     echo '<section class="brickworks-hero"><div><span class="eyebrow">Brickworks Scheme</span><div class="toolbar"><h1 style="margin-right:auto">Your Brickworks progress</h1>'.$manageButton.'</div><p>Track criteria, upload evidence and see reviewer feedback in one place.</p><div class="progressbar brickworks-progress"><span style="width:'.e($pct).'%"></span></div><div class="bw-steps"><div class="bw-step"><span>Completed</span><strong>'.e($complete).' / '.e($totalCriteria).'</strong></div><div class="bw-step"><span>Pending approval</span><strong>'.e($pending).'</strong></div><div class="bw-step"><span>Current award</span><strong>'.e($award ?: 'None yet').'</strong></div></div></div><div class="brickworks-score"><strong>'.e($pct).'%</strong><span>complete</span></div></section>';
     $rows=all('SELECT bp.*,bc.title,bc.description,bc.evidence_guidance,bt.name theme FROM brickworks_progress bp JOIN brickworks_criteria bc ON bc.id=bp.criterion_id JOIN brickworks_themes bt ON bt.id=bc.theme_id WHERE bp.participant_id=? ORDER BY bt.sort_order,bc.sort_order',[$participant['id']]);
-    echo '<section class="card brickworks-list-card"><div class="dash-card-head"><div><h2>Criteria</h2><p class="muted">Open items to add evidence notes and upload files for review.</p></div><span class="pill">'.e(count($rows)).' items</span></div><div class="bw-grid">';
+    echo '<section class="card brickworks-list-card"><div class="dash-card-head"><div><h2>Criteria</h2><p class="muted">Select a criterion to view guidance, feedback and submit evidence.</p></div><span class="pill">'.e(count($rows)).' items</span></div><div class="bw-grid">';
     foreach($rows as $r){
         $isComplete=$r['status']==='complete';
         $isPending=$r['status']==='pending_approval';
-        $status=$isComplete?'Complete - '.$r['completed_at']:($isPending?'In progress / Pending approval':'Not completed');
+        $status=$isComplete?'Completed':($isPending?'In progress':'Incomplete');
         $statusClass=$isComplete?'complete':($isPending?'pending':'none');
         $memberComment=decrypt_value($r['member_comment_encrypted']);
         $reviewerComment=decrypt_value($r['reviewer_comment_encrypted']);
-        echo '<section class="bw-card '.e($statusClass).'"><div class="bw-card-head"><div><div class="bw-theme">'.e($r['theme']).'</div><h3>'.e($r['title']).'</h3></div><span class="bw-status '.e($statusClass).'">'.e($status).'</span></div><p>'.e($r['description']).'</p>';
+        $criterionId='bw-criterion-'.(int)$r['id'];
+
+        echo '<details class="bw-card bw-accordion-card '.e($statusClass).'" id="'.e($criterionId).'">';
+        echo '<summary class="bw-card-summary"><div class="bw-summary-main"><div class="bw-theme">'.e($r['theme']).'</div><h3>'.e($r['title']).'</h3><p>'.e($r['description']).'</p></div><div class="bw-summary-side"><span class="bw-status '.e($statusClass).'">'.e($status).'</span><span class="bw-expand-label">More info</span></div></summary>';
+        echo '<div class="bw-card-details">';
+
         if(!empty($r['evidence_guidance'])) echo '<p class="bw-muted-line"><strong>Evidence guidance:</strong> '.e($r['evidence_guidance']).'</p>';
-        if($memberComment || $reviewerComment){ echo '<div class="bw-comments">'; if($memberComment) echo '<p><strong>Your note:</strong><br>'.nl2br(e($memberComment)).'</p>'; if($reviewerComment) echo '<p><strong>Reviewer feedback:</strong><br><em>'.nl2br(e($reviewerComment)).'</em></p>'; echo '</div>'; }
-        if(!$isComplete){ echo '<form class="bw-form" method="post" enctype="multipart/form-data">'.csrf_field().'<input type="hidden" name="submit_evidence" value="1"><input type="hidden" name="progress_id" value="'.e($r['id']).'"><label>Evidence notes / comments</label><textarea name="member_comment" placeholder="Add a short note for the reviewer">'.e($memberComment).'</textarea><label>Upload evidence</label><input type="file" name="evidence"><button>Submit evidence for approval</button></form>'; }
-        else { echo '<p class="muted">This criterion has been approved. No further evidence is needed.</p>'; }
-        echo '</section>';
+
+        if($memberComment || $reviewerComment){
+            echo '<div class="bw-comments">';
+            if($memberComment) echo '<p><strong>Your note:</strong><br>'.nl2br(e($memberComment)).'</p>';
+            if($reviewerComment) echo '<p><strong>Reviewer feedback:</strong><br><em>'.nl2br(e($reviewerComment)).'</em></p>';
+            echo '</div>';
+        }
+
+        if(!$isComplete){
+            echo '<form class="bw-form" method="post" enctype="multipart/form-data">'.csrf_field().'<input type="hidden" name="submit_evidence" value="1"><input type="hidden" name="progress_id" value="'.e($r['id']).'"><label>Evidence notes / comments</label><textarea name="member_comment" placeholder="Add a short note for the reviewer">'.e($memberComment).'</textarea><label>Upload evidence</label><input type="file" name="evidence"><button>Submit evidence for approval</button></form>';
+        } else {
+            echo '<div class="bw-complete-message"><strong>Criterion completed</strong><span>Approved '.e(uk_date($r['completed_at'])).'. No further evidence is needed.</span></div>';
+        }
+
+        echo '</div></details>';
     }
     echo '</div></section>';
     if(has_permission('review_brickworks_evidence')) echo '<div class="card brickworks-manager-card"><div class="toolbar"><div><h2>Reviewer tools</h2><p class="muted">Review submitted evidence and approve criteria.</p></div><a class="btn" href="?route=brickworks_manage">Open Brickworks management</a><a class="btn secondary" href="?route=brickworks_review">Pending only</a></div></div>';
