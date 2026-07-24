@@ -99,7 +99,7 @@ function membership_card_joined_text(array $member): string {
     $date = trim((string)($member['date_joined'] ?? ''));
     if ($date === '') return '';
     $ts = strtotime($date);
-    return $ts ? date('d/m/Y', $ts) : $date;
+    return $ts ? date('d-m-Y', $ts) : $date;
 }
 
 function membership_card_logo_html(): string {
@@ -1038,6 +1038,66 @@ function percent_display($num, $den): string {
     if ($den <= 0) return 'N/A';
     return round(((float)$num / $den) * 100, 1) . '%';
 }
+function ensure_attendance_snapshot_schema(): void {
+    if (!installed() || !file_exists(DB_PATH)) return;
+    try {
+        exec_sql('CREATE TABLE IF NOT EXISTS attendance_event_snapshots (
+            event_id INTEGER PRIMARY KEY,
+            eligible_member_count INTEGER NOT NULL DEFAULT 0,
+            captured_at TEXT NOT NULL,
+            captured_by_user_id INTEGER NULL,
+            updated_at TEXT NOT NULL
+        )');
+    } catch (Throwable $e) {}
+}
+
+function attendance_estimated_member_count_at_event(array $event): int {
+    $eventDate = trim((string)($event['start_at'] ?? ''));
+    if ($eventDate === '') return 0;
+
+    $row = first('SELECT COUNT(*) c
+        FROM members
+        WHERE joined_before_system=1
+           OR date_joined IS NULL
+           OR date_joined=""
+           OR date(date_joined) <= date(?)', [$eventDate]);
+
+    return (int)($row['c'] ?? 0);
+}
+
+function attendance_event_member_snapshot(array $event, bool $capture=true): int {
+    ensure_attendance_snapshot_schema();
+    $eventId = (int)($event['id'] ?? 0);
+    if ($eventId <= 0) return 0;
+
+    $snapshot = first('SELECT eligible_member_count FROM attendance_event_snapshots WHERE event_id=?', [$eventId]);
+    if ($snapshot) return (int)$snapshot['eligible_member_count'];
+
+    $count = attendance_estimated_member_count_at_event($event);
+    if ($capture) {
+        exec_sql('INSERT OR IGNORE INTO attendance_event_snapshots
+            (event_id,eligible_member_count,captured_at,captured_by_user_id,updated_at)
+            VALUES (?,?,datetime("now"),?,datetime("now"))', [
+                $eventId,
+                $count,
+                current_user()['id'] ?? null
+            ]);
+    }
+    return $count;
+}
+
+function attendance_member_was_eligible(array $member, array $event): bool {
+    if (!empty($member['joined_before_system'])) return true;
+    $joined = trim((string)($member['date_joined'] ?? ''));
+    if ($joined === '') return true;
+
+    $eventDate = trim((string)($event['start_at'] ?? ''));
+    if ($eventDate === '') return false;
+
+    return strtotime($joined) <= strtotime($eventDate);
+}
+
+
 
 function door_tax_manager(): bool {
     return has_role('chair') || has_role('vice_chair') || has_role('secretary') || has_role('treasurer');
@@ -1124,6 +1184,63 @@ function door_tax_charge_member_for_event(int $member_id, int $event_id, float $
     if (door_tax_event_already_charged($member_id, $event_id)) return false;
     door_tax_add_transaction($member_id, $event_id, 'meeting_charge', -abs($charge), '', '', 'Door tax charged from attendance register');
     return true;
+}
+
+function door_tax_event_is_completed(array $event): bool {
+    $finish = trim((string)($event['end_at'] ?? ''));
+    if ($finish === '') $finish = trim((string)($event['start_at'] ?? ''));
+    if ($finish === '') return false;
+    $timestamp = strtotime($finish);
+    return $timestamp !== false && $timestamp <= time();
+}
+
+function door_tax_remove_event_charge(int $member_id, int $event_id): int {
+    ensure_door_tax_schema();
+    $rows = all('SELECT id FROM door_tax_transactions WHERE member_id=? AND event_id=? AND transaction_type="meeting_charge"', [$member_id,$event_id]);
+    if (!$rows) return 0;
+    exec_sql('DELETE FROM door_tax_transactions WHERE member_id=? AND event_id=? AND transaction_type="meeting_charge"', [$member_id,$event_id]);
+    return count($rows);
+}
+
+function door_tax_sync_member_attendance(int $member_id, array $event, bool $attended): array {
+    $eventId = (int)($event['id'] ?? 0);
+    if ($eventId <= 0 || !door_tax_event_is_completed($event)) {
+        return ['charged'=>0,'reversed'=>0,'skipped_future'=>1];
+    }
+    if ($attended) {
+        $charged = door_tax_charge_member_for_event($member_id, $eventId, door_tax_charge_amount()) ? 1 : 0;
+        return ['charged'=>$charged,'reversed'=>0,'skipped_future'=>0];
+    }
+    $reversed = door_tax_remove_event_charge($member_id, $eventId);
+    return ['charged'=>0,'reversed'=>$reversed,'skipped_future'=>0];
+}
+
+function door_tax_sync_event_attendance(int $event_id): array {
+    ensure_door_tax_schema();
+    $event = first('SELECT * FROM events WHERE id=?', [$event_id]);
+    if (!$event) return ['charged'=>0,'reversed'=>0,'skipped_future'=>0,'members'=>0,'completed'=>false];
+    if (!door_tax_event_is_completed($event)) {
+        return ['charged'=>0,'reversed'=>0,'skipped_future'=>1,'members'=>0,'completed'=>false];
+    }
+
+    $members = all('SELECT m.id,COALESCE(ea.attended,0) attended
+        FROM members m
+        LEFT JOIN event_attendance ea ON ea.member_id=m.id AND ea.event_id=?
+        WHERE m.membership_status IN ("active","honorary","life_member")', [$event_id]);
+
+    $charged = 0;
+    $reversed = 0;
+    foreach ($members as $member) {
+        $result = door_tax_sync_member_attendance((int)$member['id'], $event, (int)$member['attended'] === 1);
+        $charged += (int)$result['charged'];
+        $reversed += (int)$result['reversed'];
+    }
+
+    return ['charged'=>$charged,'reversed'=>$reversed,'skipped_future'=>0,'members'=>count($members),'completed'=>true];
+}
+
+function door_tax_event_charge_status(int $member_id, int $event_id): bool {
+    return door_tax_event_already_charged($member_id, $event_id);
 }
 function door_tax_recent_transactions(int $member_id, int $limit=10): array {
     ensure_door_tax_schema();
@@ -1213,10 +1330,57 @@ function active_admin_count(): int {
     return (int)(first('SELECT COUNT(DISTINCT ur.user_id) AS c FROM user_roles ur JOIN roles r ON r.id=ur.role_id JOIN users u ON u.id=ur.user_id WHERE r.name="admin" AND u.status="active" AND (ur.expires_at IS NULL OR ur.expires_at > datetime("now"))')['c'] ?? 0);
 }
 function can_edit_membership_number(): bool { return is_admin_user(); }
+function uk_date($value, string $empty=''): string {
+    if ($value === null) return $empty;
+    $value = trim((string)$value);
+    if ($value === '' || $value === '0000-00-00') return $empty;
+    $timestamp = strtotime($value);
+    return $timestamp === false ? $value : date('d-m-Y', $timestamp);
+}
+
+function uk_datetime($value, string $empty=''): string {
+    if ($value === null) return $empty;
+    $value = trim((string)$value);
+    if ($value === '' || str_starts_with($value, '0000-00-00')) return $empty;
+    $timestamp = strtotime($value);
+    return $timestamp === false ? $value : date('d-m-Y H:i', $timestamp);
+}
+
+function uk_time($value, string $empty=''): string {
+    if ($value === null) return $empty;
+    $value = trim((string)$value);
+    if ($value === '') return $empty;
+    $timestamp = strtotime($value);
+    return $timestamp === false ? $value : date('H:i', $timestamp);
+}
+
+function uk_month_year($value, string $empty=''): string {
+    if ($value === null) return $empty;
+    $value = trim((string)$value);
+    if ($value === '') return $empty;
+    $timestamp = strtotime($value);
+    return $timestamp === false ? $value : date('F Y', $timestamp);
+}
+
+function friendly_datetime($value, string $empty=''): string {
+    if ($value === null) return $empty;
+    $value = trim((string)$value);
+    if ($value === '') return $empty;
+    $timestamp = strtotime($value);
+    if ($timestamp === false) return $value;
+
+    $today = date('Y-m-d');
+    $date = date('Y-m-d', $timestamp);
+    if ($date === $today) return 'Today ' . date('H:i', $timestamp);
+    if ($date === date('Y-m-d', strtotime('-1 day'))) return 'Yesterday ' . date('H:i', $timestamp);
+
+    return date('d-m-Y H:i', $timestamp);
+}
+
 function member_joined_display(array $m): string {
     if (!empty($m['joined_before_system']) && empty($m['date_joined'])) return 'Not on record - joined before system';
-    if (!empty($m['joined_before_system'])) return ($m['date_joined'] ?: 'Not on record') . ' - joined before system';
-    return $m['date_joined'] ?: 'Not on record';
+    if (!empty($m['joined_before_system'])) return uk_date(uk_date($m['date_joined']), 'Not on record') . ' - joined before system';
+    return uk_date(uk_date($m['date_joined']), 'Not on record');
 }
 function consent_labels(): array {
     return [
@@ -2667,7 +2831,39 @@ if (route() === 'assets.css') {
 .email-report-table-wrap{overflow:auto}.email-copy-row td{background:#f8fafc!important}.email-copy-row .email-sent-preview{max-width:760px}
 @media(max-width:760px){.email-detail-hero{grid-template-columns:1fr}.email-detail-stats{display:grid;grid-template-columns:1fr 1fr}.email-detail-meta{grid-template-columns:1fr}.email-detail-meta strong{margin-bottom:8px}}/* Master email logs */
 .master-email-filter{padding:16px}.master-email-filter form{display:grid;grid-template-columns:minmax(260px,1fr) 220px 180px auto;gap:12px;align-items:end}.master-email-filter-actions{display:flex;gap:8px}.master-email-log-card{overflow:hidden}.master-email-table-wrap{overflow:auto}.master-email-log-card td small{display:block;color:#64748b;margin-top:3px;max-width:320px}
-@media(max-width:850px){.master-email-filter form{grid-template-columns:1fr}.master-email-filter-actions{display:grid}.master-email-filter-actions .btn,.master-email-filter-actions button{width:100%;box-sizing:border-box}}';
+@media(max-width:850px){.master-email-filter form{grid-template-columns:1fr}.master-email-filter-actions{display:grid}.master-email-filter-actions .btn,.master-email-filter-actions button{width:100%;box-sizing:border-box}}/* Attendance and door-tax integration */
+.attendance-door-tax-sync{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.attendance-door-tax{display:grid;justify-items:end;min-width:105px;color:#92400e}
+.attendance-door-tax strong{font-size:.95rem}
+.attendance-door-tax small{font-size:.72rem;white-space:nowrap}
+.attendance-door-tax.charged{color:#166534}
+@media(max-width:760px){.attendance-door-tax-sync{display:grid}.attendance-door-tax-sync .btn,.attendance-door-tax-sync button{width:100%;box-sizing:border-box}.attendance-door-tax{justify-items:start;grid-column:2}}/* Attendance matrix overview */
+.attendance-matrix-hero{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center;background:linear-gradient(135deg,#263858,#172554);color:#fff;border-radius:16px;padding:24px;margin-bottom:16px}
+.attendance-matrix-hero h1{margin:.15rem 0}.attendance-matrix-hero p{margin:0;color:#dbeafe}
+.attendance-matrix-hero-stats{display:flex;gap:10px}.attendance-matrix-hero-stats div{min-width:100px;padding:12px 15px;border:1px solid #ffffff38;background:#ffffff18;border-radius:13px}
+.attendance-matrix-hero-stats strong{display:block;font-size:1.35rem}.attendance-matrix-hero-stats span{font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:#dbeafe}
+.attendance-matrix-filter form{display:grid;grid-template-columns:minmax(180px,1fr) 180px 180px auto;gap:12px;align-items:end}
+.attendance-matrix-filter-actions{display:flex;gap:8px;flex-wrap:wrap}
+.attendance-matrix-shell{padding:0;overflow:hidden}.attendance-matrix-note{display:grid;gap:4px;padding:15px 18px;background:#eff6ff;border-bottom:1px solid #bfdbfe}.attendance-matrix-note span{color:#475569;font-size:.9rem}
+.attendance-matrix-wrap{overflow:auto;max-height:72vh}
+.attendance-matrix{border-collapse:separate;border-spacing:0;min-width:max-content;width:100%}
+.attendance-matrix th,.attendance-matrix td{padding:11px 12px;border-right:1px solid #e2e8f0;border-bottom:1px solid #e2e8f0;background:#fff;text-align:center;vertical-align:middle}
+.attendance-matrix thead th{position:sticky;top:0;z-index:5;background:#f1f5f9}
+.attendance-matrix .attendance-sticky-member{position:sticky;left:0;z-index:4;text-align:left;min-width:205px;max-width:205px;background:#fff}
+.attendance-matrix thead .attendance-sticky-member{z-index:8;background:#f1f5f9}
+.attendance-matrix .attendance-sticky-total{position:sticky;left:205px;z-index:4;min-width:84px;background:#fff}
+.attendance-matrix thead .attendance-sticky-total{z-index:8;background:#f1f5f9}
+.attendance-matrix .attendance-sticky-percent{position:sticky;left:289px;z-index:4;min-width:75px;background:#fff;box-shadow:5px 0 8px rgba(15,23,42,.06)}
+.attendance-matrix thead .attendance-sticky-percent{z-index:8;background:#f1f5f9}
+.attendance-sticky-member strong,.attendance-sticky-member small{display:block}.attendance-sticky-member small,.attendance-sticky-total small{color:#64748b;margin-top:3px}
+.attendance-session-heading{min-width:165px;max-width:165px;text-align:left!important}.attendance-session-heading strong,.attendance-session-heading span{display:block}.attendance-session-heading span{font-size:.8rem;color:#64748b;margin-top:4px;white-space:normal}
+.attendance-cell.yes{background:#ecfdf5;color:#166534}.attendance-cell.no{background:#fff;color:#334155}.attendance-cell.not-eligible{background:#f8fafc;color:#94a3b8}.attendance-cell small{display:block;font-size:.7rem;margin-top:2px}
+.attendance-matrix tfoot th{position:sticky;bottom:0;z-index:6;background:#f8fafc;border-top:2px solid #94a3b8}
+.attendance-matrix tfoot .attendance-sticky-member,.attendance-matrix tfoot .attendance-sticky-total,.attendance-matrix tfoot .attendance-sticky-percent{z-index:9;background:#f8fafc}
+.attendance-session-total strong,.attendance-session-total span{display:block}.attendance-session-total span{font-size:.8rem;color:#475569;margin-top:3px}
+.attendance-summary-grid{grid-template-columns:1fr 1fr}
+.admin-directory-preferences{border-top:4px solid #7c3aed}.directory-preference-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:14px 0}.directory-preference-grid label{border:1px solid #e2e8f0;border-radius:10px;padding:10px;background:#f8fafc}
+@media(max-width:850px){.attendance-matrix-filter form{grid-template-columns:1fr}.attendance-matrix-filter-actions{display:grid}.attendance-matrix-filter-actions .btn,.attendance-matrix-filter-actions button{width:100%;box-sizing:border-box}.attendance-matrix-hero{grid-template-columns:1fr}.attendance-matrix-hero-stats{display:grid;grid-template-columns:1fr 1fr}.attendance-summary-grid{grid-template-columns:1fr}.directory-preference-grid{grid-template-columns:1fr}.attendance-matrix .attendance-sticky-member{min-width:165px;max-width:165px}.attendance-matrix .attendance-sticky-total{left:165px}.attendance-matrix .attendance-sticky-percent{left:249px}}';
     exit;
 }
 if (route() === 'email_open') {
@@ -2686,7 +2882,7 @@ if (route() === 'email_open') {
 }
 
 if (!installed() && route() !== 'install') redirect('install');
-if (installed()) { ensure_runtime_setup(); ensure_door_tax_schema(); ensure_email_delivery_schema(); }
+if (installed()) { ensure_runtime_setup(); ensure_door_tax_schema(); ensure_email_delivery_schema(); ensure_attendance_snapshot_schema(); }
 
 if (route() === 'install') {
     if (installed()) redirect('login');
@@ -2839,7 +3035,7 @@ if (route() === 'dashboard') {
     } else {
         echo '<div class="dash-event-grid">';
         foreach ($upcomingEvents as $ev) {
-            $ts = strtotime($ev['start_at']);
+            $ts = strtotime(uk_datetime($ev['start_at']));
             echo '<a class="dash-event-card" href="?route=event_view&id='.e($ev['id']).'"><div class="programme-datebox"><strong>'.e($ts ? date('d',$ts) : '?').'</strong><span>'.e($ts ? date('M',$ts) : 'TBC').'</span></div><div><span class="pill category-pill">'.e($ev['event_type'] ?: 'Other').'</span><h3>'.e($ev['title']).'</h3><p class="muted">'.e($ts ? date('D j M Y H:i',$ts) : 'Date TBC').($ev['location'] ? ' • '.e($ev['location']) : '').'</p></div><span class="programme-open">Open ›</span></a>';
         }
         echo '</div>';
@@ -2974,7 +3170,7 @@ if (route() === 'profile') {
     echo '<h2>Internal directory</h2><p class="muted">If enabled, the internal directory will show only your name and callsign to logged-in members.</p><label><input type="checkbox" name="show_in_directory" '.(!empty($dp['show_callsign'])?'checked':'').'> Show my name and callsign in the internal directory</label>';
     echo '<h2>Consents</h2><p class="muted">These control how the society may contact you.</p>'.render_consent_checkboxes((int)$m['id']).'<p><button>Save profile</button></p></form></div>';
     $payments = all('SELECT * FROM subscription_payments WHERE member_id=? ORDER BY subscription_year DESC',[$m['id']]);
-    echo '<div class="card"><h2>My subscription/payment history</h2><table><tr><th>Year</th><th>Due</th><th>Paid</th><th>Date</th><th>Status</th></tr>'; foreach($payments as $p) echo '<tr><td>'.e($p['subscription_year']).'</td><td>£'.e(number_format($p['amount_due'],2)).'</td><td>£'.e(number_format($p['amount_paid'],2)).'</td><td>'.e($p['payment_date']).'</td><td>'.e($p['status']).'</td></tr>'; echo '</table></div>';
+    echo '<div class="card"><h2>My subscription/payment history</h2><table><tr><th>Year</th><th>Due</th><th>Paid</th><th>Date</th><th>Status</th></tr>'; foreach($payments as $p) echo '<tr><td>'.e($p['subscription_year']).'</td><td>£'.e(number_format($p['amount_due'],2)).'</td><td>£'.e(number_format($p['amount_paid'],2)).'</td><td>'.e(uk_date(uk_date($p['payment_date']))).'</td><td>'.e($p['status']).'</td></tr>'; echo '</table></div>';
 
     echo '<div class="card door-tax-balance-card"><h2>Door tax balance</h2><p><strong>'.e(door_tax_money($doorTaxBalance)).'</strong> balance • '.e(door_tax_meetings_remaining($doorTaxBalance)).' meetings covered at '.e(door_tax_money(door_tax_charge_amount())).' per meeting.</p><p class="muted">Payments and corrections are managed by the Chair, Vice Chair, Secretary or Treasurer.</p></div>';
 
@@ -2984,39 +3180,63 @@ if (route() === 'profile') {
 }
 
 if (route() === 'directory') {
-    require_permission('view_internal_directory'); audit('directory.view'); page_header('Internal Directory');
+    require_permission('view_internal_directory');
+    audit('directory.view');
+    page_header('Internal Directory');
+
     $q = trim((string)($_GET['q'] ?? ''));
-    $sql = 'SELECT m.* FROM member_directory_preferences d JOIN members m ON m.id=d.member_id WHERE d.show_callsign=1 AND m.membership_status="active"';
+    $sql = 'SELECT m.*,d.show_callsign,d.show_first_name,d.show_surname,d.show_licence_level,d.show_email,d.show_phone
+        FROM member_directory_preferences d
+        JOIN members m ON m.id=d.member_id
+        WHERE (
+            d.show_callsign=1 OR d.show_first_name=1 OR d.show_surname=1
+            OR d.show_licence_level=1 OR d.show_email=1 OR d.show_phone=1
+        )
+        AND m.membership_status IN ("active","honorary","life_member")';
     $params = [];
+
     if ($q !== '') {
-        $sql .= ' AND (m.first_name LIKE ? OR m.last_name LIKE ? OR m.callsign LIKE ?)';
-        $like = '%' . $q . '%';
-        $params = [$like,$like,$like];
+        $sql .= ' AND (m.first_name LIKE ? OR m.last_name LIKE ? OR m.callsign LIKE ? OR m.email LIKE ?)';
+        $like = '%'.$q.'%';
+        $params = [$like,$like,$like,$like];
     }
-    $sql .= ' ORDER BY m.last_name, m.first_name, m.callsign';
+
+    $sql .= ' ORDER BY m.last_name,m.first_name,m.callsign';
     $rows = all($sql, $params);
 
-    echo '<section class="directory-hero"><div><span class="eyebrow">Internal directory</span><h1>Member directory</h1><p>Opt-in directory showing member name and callsign only.</p></div><div class="directory-count"><strong>'.e(count($rows)).'</strong><span>listed</span></div></section>';
+    echo '<section class="directory-hero"><div><span class="eyebrow">Internal directory</span><h1>Member directory</h1><p>Member-controlled listings, with admin management available from individual member records.</p></div><div class="directory-count"><strong>'.e(count($rows)).'</strong><span>listed</span></div></section>';
 
-    echo '<div class="card directory-filter"><form method="get" class="programme-filter"><input type="hidden" name="route" value="directory"><div class="programme-search"><label>Search directory</label><input name="q" value="'.e($q).'" placeholder="Search name or callsign"></div><div class="programme-filter-actions"><button>Search</button><a class="btn secondary" href="?route=directory">Clear</a></div></form></div>';
+    echo '<div class="card directory-filter"><form method="get" class="programme-filter"><input type="hidden" name="route" value="directory"><div class="programme-search"><label>Search directory</label><input name="q" value="'.e($q).'" placeholder="Search name, callsign or email"></div><div class="programme-filter-actions"><button>Search</button><a class="btn secondary" href="?route=directory">Clear</a></div></form></div>';
 
-    echo '<section class="card directory-card"><div class="dash-card-head"><div><h2>Opted-in members</h2><p class="muted">Only members who have chosen to show their name and callsign appear here.</p></div></div>';
+    echo '<section class="card directory-card"><div class="dash-card-head"><div><h2>Listed members</h2><p class="muted">Only the fields enabled in each member’s preferences are displayed.</p></div></div>';
+
     if (!$rows) {
-        echo '<div class="empty-state"><strong>No members found</strong><span>No opted-in members match that search.</span></div>';
+        echo '<div class="empty-state"><strong>No members found</strong><span>No listed members match the current search.</span></div>';
     } else {
         echo '<div class="directory-grid">';
-        foreach($rows as $r){
-            $name=trim(($r['first_name'] ?? '').' '.($r['last_name'] ?? ''));
-            $initials = strtoupper(substr(trim($r['first_name'] ?? ''),0,1).substr(trim($r['last_name'] ?? ''),0,1));
-            if ($initials === '') $initials = strtoupper(substr($r['callsign'] ?: '?',0,2));
-            echo '<article class="directory-card-item"><div class="directory-avatar">'.e($initials).'</div><div><strong>'.e($name ?: 'Unnamed member').'</strong><span>'.e($r['callsign'] ?: 'No callsign').'</span></div></article>';
+        foreach($rows as $row) {
+            $nameParts = [];
+            if (!empty($row['show_first_name'])) $nameParts[] = $row['first_name'];
+            if (!empty($row['show_surname'])) $nameParts[] = $row['last_name'];
+            $displayName = trim(implode(' ', $nameParts));
+            if ($displayName === '') $displayName = !empty($row['show_callsign']) ? $row['callsign'] : 'Member';
+
+            $initials = strtoupper(substr($displayName,0,1));
+            if (!empty($row['show_surname'])) $initials .= strtoupper(substr((string)$row['last_name'],0,1));
+
+            echo '<article class="directory-card-item"><div class="directory-avatar">'.e($initials ?: '?').'</div><div><strong>'.e($displayName).'</strong>';
+            if (!empty($row['show_callsign'])) echo '<span>'.e($row['callsign'] ?: 'No callsign').'</span>';
+            if (!empty($row['show_licence_level'])) echo '<span>'.e($row['licence_level'] ?: 'Licence not set').'</span>';
+            if (!empty($row['show_email'])) echo '<span><a href="mailto:'.e($row['email']).'">'.e($row['email']).'</a></span>';
+            if (!empty($row['show_phone'])) echo '<span>'.e(decrypt_value($row['phone_encrypted']) ?: 'Phone not set').'</span>';
+            echo '</div></article>';
         }
         echo '</div>';
     }
+
     echo '</section>';
     page_footer(); exit;
 }
-
 
 if (route() === 'member_create') {
     require_permission('edit_membership_db');
@@ -3120,7 +3340,7 @@ if (route() === 'members') {
             $initials=strtoupper(substr(trim($m['first_name'] ?? ''),0,1).substr(trim($m['last_name'] ?? ''),0,1));
             if($initials==='') $initials=strtoupper(substr($m['callsign'] ?: '?',0,2));
             $statusClass=preg_replace('/[^a-z0-9_]+/','_',strtolower($m['membership_status'] ?: 'unknown'));
-            echo '<article class="member-card-modern"><div class="member-card-main"><div class="member-avatar">'.e($initials).'</div><div><div class="member-card-top"><h3>'.e($name ?: 'Unnamed member').'</h3><span class="status-pill status-'.e($statusClass).'">'.e($m['membership_status'] ?: 'unknown').'</span></div><p class="muted">'.e($m['callsign'] ?: 'No callsign').' • Member no. '.e($m['membership_number'] ?: 'not set').'</p><div class="member-card-meta"><span>Joined</span><strong>'.e(member_joined_display($m)).'</strong><span>Renewal</span><strong>'.e($m['renewal_date'] ?: 'Not set').'</strong><span>Email</span><strong>'.e($m['email'] ?: 'Not set').'</strong></div><div class="member-attendance"><div><span>Attendance</span><strong>'.e($pctText).'</strong><small>'.e($st['attended']).' / '.e($st['sessions_since_start']).' sessions</small></div><div class="progressbar"><span style="width:'.e($pctWidth).'%"></span></div></div></div></div><div class="member-card-actions"><a class="btn secondary" href="?route=member_view&id='.e($m['id']).'">Open</a><a class="btn secondary" href="?route=membership_card&id='.e($m['id']).'" target="_blank">Card</a>';
+            echo '<article class="member-card-modern"><div class="member-card-main"><div class="member-avatar">'.e($initials).'</div><div><div class="member-card-top"><h3>'.e($name ?: 'Unnamed member').'</h3><span class="status-pill status-'.e($statusClass).'">'.e($m['membership_status'] ?: 'unknown').'</span></div><p class="muted">'.e($m['callsign'] ?: 'No callsign').' • Member no. '.e($m['membership_number'] ?: 'not set').'</p><div class="member-card-meta"><span>Joined</span><strong>'.e(member_joined_display($m)).'</strong><span>Renewal</span><strong>'.e(uk_date(uk_date($m['renewal_date']), 'Not set')).'</strong><span>Email</span><strong>'.e($m['email'] ?: 'Not set').'</strong></div><div class="member-attendance"><div><span>Attendance</span><strong>'.e($pctText).'</strong><small>'.e($st['attended']).' / '.e($st['sessions_since_start']).' sessions</small></div><div class="progressbar"><span style="width:'.e($pctWidth).'%"></span></div></div></div></div><div class="member-card-actions"><a class="btn secondary" href="?route=member_view&id='.e($m['id']).'">Open</a><a class="btn secondary" href="?route=membership_card&id='.e($m['id']).'" target="_blank">Card</a>';
             if (has_permission('edit_membership_db')) echo '<form method="post" onsubmit="return confirm(&quot;Delete this member and all linked records? This cannot be undone.&quot;)">'.csrf_field().'<input type="hidden" name="delete_member" value="1"><input type="hidden" name="member_id" value="'.e($m['id']).'"><button class="danger">Delete</button></form>';
             echo '</div></article>';
         }
@@ -3263,6 +3483,66 @@ if (route() === 'member_view') {
             flash($msg);
             redirect('members');
         }
+        if (isset($_POST['update_directory_preferences'])) {
+            if (!is_admin_user()) {
+                http_response_code(403);
+                flash('Only admin users can change another member’s directory preferences.');
+                redirect('member_view&id='.$id);
+            }
+
+            exec_sql('INSERT OR IGNORE INTO member_directory_preferences
+                (member_id,created_at,updated_at)
+                VALUES (?,datetime("now"),datetime("now"))', [$id]);
+
+            $listed = isset($_POST['directory_listed']) ? 1 : 0;
+            $showFirst = $listed && isset($_POST['show_first_name']) ? 1 : 0;
+            $showSurname = $listed && isset($_POST['show_surname']) ? 1 : 0;
+            $showCallsign = $listed && isset($_POST['show_callsign']) ? 1 : 0;
+            $showLicence = $listed && isset($_POST['show_licence_level']) ? 1 : 0;
+            $showEmail = $listed && isset($_POST['show_email']) ? 1 : 0;
+            $showPhone = $listed && isset($_POST['show_phone']) ? 1 : 0;
+
+            $oldPreferences = first('SELECT * FROM member_directory_preferences WHERE member_id=?', [$id]) ?: [];
+
+            exec_sql('UPDATE member_directory_preferences SET
+                show_first_name=?,
+                show_surname=?,
+                show_callsign=?,
+                show_licence_level=?,
+                show_email=?,
+                show_phone=?,
+                consent_given_at=CASE WHEN ?=1 THEN COALESCE(consent_given_at,datetime("now")) ELSE consent_given_at END,
+                consent_updated_at=datetime("now"),
+                updated_at=datetime("now")
+                WHERE member_id=?', [
+                    $showFirst,
+                    $showSurname,
+                    $showCallsign,
+                    $showLicence,
+                    $showEmail,
+                    $showPhone,
+                    $listed,
+                    $id
+                ]);
+
+            audit('member.directory_preferences_update','member',$id,'success',null,[
+                'admin_override'=>true,
+                'old'=>$oldPreferences,
+                'new'=>[
+                    'directory_listed'=>$listed,
+                    'show_first_name'=>$showFirst,
+                    'show_surname'=>$showSurname,
+                    'show_callsign'=>$showCallsign,
+                    'show_licence_level'=>$showLicence,
+                    'show_email'=>$showEmail,
+                    'show_phone'=>$showPhone
+                ]
+            ]);
+
+            flash('Directory preferences updated.');
+            redirect('member_view&id='.$id);
+        }
+
         if (isset($_POST['add_payment'])) { exec_sql('INSERT INTO subscription_payments (member_id,subscription_year,amount_due,amount_paid,payment_date,payment_method,payment_reference,receipt_number,status,recorded_by_user_id,notes_encrypted,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime("now"),datetime("now"))',[$id,(int)$_POST['subscription_year'],(float)$_POST['amount_due'],(float)$_POST['amount_paid'],$_POST['payment_date'],$_POST['payment_method'],$_POST['payment_reference'],$_POST['receipt_number'],$_POST['status'],$u['id'],encrypt_value($_POST['notes']??'')]); audit('subscription.create','member',$id); flash('Payment/subs record added.'); redirect('member_view&id='.$id); }
         $membershipNumber = can_edit_membership_number() ? trim($_POST['membership_number'] ?? '') : $m['membership_number'];
         $joinedBeforeSystem = isset($_POST['joined_before_system']) ? 1 : 0;
@@ -3291,12 +3571,24 @@ if (route() === 'member_view') {
     if (has_permission('edit_membership_db')) echo '<form method="post" onsubmit="return confirm(&quot;Delete this member and all linked records? This cannot be undone.&quot;)" style="display:inline">'.csrf_field().'<input type="hidden" name="delete_member" value="1"><button class="danger">Delete member</button></form>';
     echo '</div><form method="post">'.csrf_field().'<div class="two">';
     if (can_edit_membership_number()) echo '<div><label>Membership number</label><input name="membership_number" value="'.e($m['membership_number']).'"></div>'; else echo '<div><label>Membership number</label><p><strong>'.e($m['membership_number'] ?: 'Not set').'</strong><br><span class="muted">Only admin users can change this.</span></p></div>';
-    echo '<div><label>Callsign</label><input name="callsign" value="'.e($m['callsign']).'"></div><div><label>First name</label><input name="first_name" value="'.e($m['first_name']).'"></div><div><label>Surname</label><input name="last_name" value="'.e($m['last_name']).'"></div><div><label>Email address</label><input type="email" name="email" value="'.e($m['email']).'"></div><div><label>Licence level</label><input name="licence_level" value="'.e($m['licence_level']).'"></div><div><label>Phone number</label><input name="phone" value="'.e(decrypt_value($m['phone_encrypted'])).'"></div><div class="full"><label>Address</label><textarea name="address">'.e(decrypt_value($m['address_encrypted'])).'</textarea></div><div class="full"><h2>Emergency contact</h2></div><div><label>Emergency contact name</label><input name="emergency_contact_name" value="'.e(decrypt_value($m['emergency_contact_name_encrypted'] ?? '')).'"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship" value="'.e(decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '')).'"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone" value="'.e(decrypt_value($m['emergency_contact_phone_encrypted'] ?? '')).'"></div><div><label>Membership type</label><input name="membership_type" value="'.e($m['membership_type']).'"></div><div><label>Date joined</label><input type="date" name="date_joined" value="'.e($m['date_joined']).'"><label class="small"><input type="checkbox" name="joined_before_system" '.(!empty($m['joined_before_system'])?'checked':'').'> Not on record / joined before system</label></div><div><label>Renewal date</label><input type="date" name="renewal_date" value="'.e($m['renewal_date']).'"></div><div><label>Membership status</label><select name="membership_status">'; foreach(['pending','active','expired','former','suspended','honorary','life_member'] as $s) echo '<option '.($m['membership_status']===$s?'selected':'').'>'.e($s).'</option>'; echo '</select></div></div><h2>Consents</h2><p class="muted">Visible and editable by Member DB users and admins.</p>'.render_consent_checkboxes($id).'<label>Private notes</label><textarea name="notes">'.e(decrypt_value($m['notes_encrypted'])).'</textarea><button>Save member</button></form></div>';
+    echo '<div><label>Callsign</label><input name="callsign" value="'.e($m['callsign']).'"></div><div><label>First name</label><input name="first_name" value="'.e($m['first_name']).'"></div><div><label>Surname</label><input name="last_name" value="'.e($m['last_name']).'"></div><div><label>Email address</label><input type="email" name="email" value="'.e($m['email']).'"></div><div><label>Licence level</label><input name="licence_level" value="'.e($m['licence_level']).'"></div><div><label>Phone number</label><input name="phone" value="'.e(decrypt_value($m['phone_encrypted'])).'"></div><div class="full"><label>Address</label><textarea name="address">'.e(decrypt_value($m['address_encrypted'])).'</textarea></div><div class="full"><h2>Emergency contact</h2></div><div><label>Emergency contact name</label><input name="emergency_contact_name" value="'.e(decrypt_value($m['emergency_contact_name_encrypted'] ?? '')).'"></div><div><label>Relationship to member</label><input name="emergency_contact_relationship" value="'.e(decrypt_value($m['emergency_contact_relationship_encrypted'] ?? '')).'"></div><div><label>Emergency contact phone</label><input name="emergency_contact_phone" value="'.e(decrypt_value($m['emergency_contact_phone_encrypted'] ?? '')).'"></div><div><label>Membership type</label><input name="membership_type" value="'.e($m['membership_type']).'"></div><div><label>Date joined</label><input type="date" name="date_joined" value="'.e(uk_date($m['date_joined'])).'"><label class="small"><input type="checkbox" name="joined_before_system" '.(!empty($m['joined_before_system'])?'checked':'').'> Not on record / joined before system</label></div><div><label>Renewal date</label><input type="date" name="renewal_date" value="'.e(uk_date($m['renewal_date'])).'"></div><div><label>Membership status</label><select name="membership_status">'; foreach(['pending','active','expired','former','suspended','honorary','life_member'] as $s) echo '<option '.($m['membership_status']===$s?'selected':'').'>'.e($s).'</option>'; echo '</select></div></div><h2>Consents</h2><p class="muted">Visible and editable by Member DB users and admins.</p>'.render_consent_checkboxes($id).'<label>Private notes</label><textarea name="notes">'.e(decrypt_value($m['notes_encrypted'])).'</textarea><button>Save member</button></form></div>';
+    if (is_admin_user()) {
+        $directoryPreferences = first('SELECT * FROM member_directory_preferences WHERE member_id=?', [$id]) ?: [];
+        $directoryListed = !empty($directoryPreferences['show_first_name'])
+            || !empty($directoryPreferences['show_surname'])
+            || !empty($directoryPreferences['show_callsign'])
+            || !empty($directoryPreferences['show_licence_level'])
+            || !empty($directoryPreferences['show_email'])
+            || !empty($directoryPreferences['show_phone']);
+
+        echo '<div class="card admin-directory-preferences"><div class="toolbar"><div><h2>Internal directory preferences</h2><p class="muted">Admin override for this member’s directory listing.</p></div><span class="status-pill '.($directoryListed?'status-active':'status-former').'">'.e($directoryListed?'Listed':'Not listed').'</span></div><form method="post">'.csrf_field().'<input type="hidden" name="update_directory_preferences" value="1"><label class="check"><input type="checkbox" name="directory_listed" '.($directoryListed?'checked':'').'><span><strong>Include this member in the internal directory</strong><small>Unticking this removes them from the directory.</small></span></label><div class="directory-preference-grid"><label><input type="checkbox" name="show_first_name" '.(!empty($directoryPreferences['show_first_name'])?'checked':'').'> First name</label><label><input type="checkbox" name="show_surname" '.(!empty($directoryPreferences['show_surname'])?'checked':'').'> Surname</label><label><input type="checkbox" name="show_callsign" '.(!empty($directoryPreferences['show_callsign'])?'checked':'').'> Callsign</label><label><input type="checkbox" name="show_licence_level" '.(!empty($directoryPreferences['show_licence_level'])?'checked':'').'> Licence level</label><label><input type="checkbox" name="show_email" '.(!empty($directoryPreferences['show_email'])?'checked':'').'> Email address</label><label><input type="checkbox" name="show_phone" '.(!empty($directoryPreferences['show_phone'])?'checked':'').'> Phone number</label></div><button>Save directory preferences</button></form></div>';
+    }
+
     $doorTaxBalance = door_tax_member_balance($id);
     echo '<div class="grid"><div class="card"><h2>Attendance</h2><p>Attended sessions: '.e($stats['attended']).'</p><p>Completed sessions since start date: '.e($stats['sessions_since_start']).'</p><p>Attendance: '.e($stats['attendance_percent']===null?'N/A':$stats['attendance_percent'].'%').'</p><p class="muted">Start date used: '.e($stats['attendance_start_date'] ?: 'No join date recorded - using all past sessions').'</p></div><div class="card door-tax-balance-card"><h2>Door tax</h2><p><strong>'.e(door_tax_money($doorTaxBalance)).'</strong> balance</p><p>'.e(door_tax_meetings_remaining($doorTaxBalance)).' meetings covered at '.e(door_tax_money(door_tax_charge_amount())).' per meeting.</p>'.(door_tax_manager()?'<p><a class="btn secondary" href="?route=door_tax&member_id='.e($id).'">Manage door tax</a></p>':'').'</div>';
-    $payments=all('SELECT * FROM subscription_payments WHERE member_id=? ORDER BY subscription_year DESC',[$id]); echo '<div class="card"><h2>Payment/subs history</h2><table><tr><th>Year</th><th>Due</th><th>Paid</th><th>Date</th><th>Status</th></tr>'; foreach($payments as $p) echo '<tr><td>'.e($p['subscription_year']).'</td><td>£'.e(number_format($p['amount_due'],2)).'</td><td>£'.e(number_format($p['amount_paid'],2)).'</td><td>'.e($p['payment_date']).'</td><td>'.e($p['status']).'</td></tr>'; echo '</table></div></div>';
+    $payments=all('SELECT * FROM subscription_payments WHERE member_id=? ORDER BY subscription_year DESC',[$id]); echo '<div class="card"><h2>Payment/subs history</h2><table><tr><th>Year</th><th>Due</th><th>Paid</th><th>Date</th><th>Status</th></tr>'; foreach($payments as $p) echo '<tr><td>'.e($p['subscription_year']).'</td><td>£'.e(number_format($p['amount_due'],2)).'</td><td>£'.e(number_format($p['amount_paid'],2)).'</td><td>'.e(uk_date(uk_date($p['payment_date']))).'</td><td>'.e($p['status']).'</td></tr>'; echo '</table></div></div>';
     echo '<div class="card"><h2>Add subs/payment record</h2><form method="post">'.csrf_field().'<input type="hidden" name="add_payment" value="1"><div class="two"><input type="number" name="subscription_year" value="'.date('Y').'" required><input type="number" step="0.01" name="amount_due" placeholder="Amount due" required><input type="number" step="0.01" name="amount_paid" placeholder="Amount paid" required><input type="date" name="payment_date"><input name="payment_method" placeholder="Payment method"><input name="payment_reference" placeholder="Payment reference"><input name="receipt_number" placeholder="Receipt number"><select name="status"><option>unpaid</option><option>part-paid</option><option>paid</option><option>waived</option><option>refunded</option></select></div><textarea name="notes" placeholder="Notes"></textarea><button>Add payment record</button></form></div>';
-    $rh=all('SELECT urh.*,r.display_name FROM user_role_history urh JOIN users us ON us.id=urh.user_id JOIN roles r ON r.id=urh.role_id WHERE us.member_id=? ORDER BY changed_at DESC',[$id]); echo '<div class="card"><h2>Role history</h2><table><tr><th>Role</th><th>Action</th><th>Changed</th><th>Reason</th></tr>'; foreach($rh as $r) echo '<tr><td>'.e($r['display_name']).'</td><td>'.e($r['action']).'</td><td>'.e($r['changed_at']).'</td><td>'.e($r['reason']).'</td></tr>'; echo '</table></div>';
+    $rh=all('SELECT urh.*,r.display_name FROM user_role_history urh JOIN users us ON us.id=urh.user_id JOIN roles r ON r.id=urh.role_id WHERE us.member_id=? ORDER BY changed_at DESC',[$id]); echo '<div class="card"><h2>Role history</h2><table><tr><th>Role</th><th>Action</th><th>Changed</th><th>Reason</th></tr>'; foreach($rh as $r) echo '<tr><td>'.e($r['display_name']).'</td><td>'.e($r['action']).'</td><td>'.e(uk_datetime($r['changed_at'])).'</td><td>'.e($r['reason']).'</td></tr>'; echo '</table></div>';
     page_footer(); exit;
 }
 
@@ -3378,7 +3670,7 @@ if (route() === 'wallet_verify') {
         page_footer(); exit;
     }
     echo '<section class="wallet-verify-card"><div><span class="eyebrow">Membership verified</span><h1>'.e(trim($m['first_name'].' '.$m['last_name'])).'</h1><p>'.e($m['callsign'] ?: 'No callsign').' • Member no. '.e($m['membership_number'] ?: 'Not set').'</p></div><div class="wallet-status">'.e($m['membership_status'] ?: 'Unknown').'</div></section>';
-    echo '<div class="card"><h2>Membership details</h2><p><strong>Expires / renewal date:</strong> '.e($m['renewal_date'] ?: 'Not set').'</p><p><strong>Licence level:</strong> '.e($m['licence_level'] ?: 'Not set').'</p><p class="muted">This page verifies that the QR code was generated by the membership system. It does not replace normal identity checks where required.</p></div>';
+    echo '<div class="card"><h2>Membership details</h2><p><strong>Expires / renewal date:</strong> '.e(uk_date(uk_date($m['renewal_date']), 'Not set')).'</p><p><strong>Licence level:</strong> '.e($m['licence_level'] ?: 'Not set').'</p><p class="muted">This page verifies that the QR code was generated by the membership system. It does not replace normal identity checks where required.</p></div>';
     page_footer(); exit;
 }
 
@@ -3819,7 +4111,7 @@ if (route() === 'equipment') {
     $totalAssets=count($rows);
     $dueSoon=0; $needsAttention=0;
     foreach($rows as $r){
-        if(!empty($r['maintenance_due_at']) && strtotime($r['maintenance_due_at']) !== false && strtotime($r['maintenance_due_at']) <= strtotime('+30 days')) $dueSoon++;
+        if(!empty($r['maintenance_due_at']) && strtotime(uk_date($r['maintenance_due_at'])) !== false && strtotime(uk_date($r['maintenance_due_at'])) <= strtotime('+30 days')) $dueSoon++;
         if(stripos((string)$r['condition'],'repair')!==false || stripos((string)$r['condition'],'fault')!==false || stripos((string)$r['condition'],'poor')!==false) $needsAttention++;
     }
     echo '<section class="asset-hero"><div><span class="eyebrow">Club assets</span><h1>Equipment / asset database</h1><p>Track club equipment, locations, values and maintenance history in one place.</p></div><div class="asset-hero-stats"><div><strong>'.e($totalAssets).'</strong><span>Total assets</span></div><div><strong>'.e($dueSoon).'</strong><span>Due soon</span></div><div><strong>'.e($needsAttention).'</strong><span>Attention</span></div></div></section>';
@@ -3835,7 +4127,7 @@ if (route() === 'equipment') {
             $value = ($r['value']!==null && $r['value']!=='' ? '£'.number_format((float)$r['value'],2) : 'Unknown');
             $purchase = ($r['purchase_amount']!==null && $r['purchase_amount']!=='' ? '£'.number_format((float)$r['purchase_amount'],2) : 'Unknown');
             $conditionClass = preg_replace('/[^a-z0-9_]+/','_',strtolower($r['condition'] ?: 'unknown'));
-            echo '<article class="asset-card-modern"><a href="?route=equipment_view&id='.e($r['id']).'"><div class="asset-card-top"><div><span class="asset-number">'.e($r['asset_number'] ?: 'No asset no.').'</span><h3>'.e($r['name']).'</h3></div><span class="status-pill status-'.e($conditionClass).'">'.e($r['condition'] ?: 'Unknown').'</span></div><div class="asset-card-meta"><span>Model</span><strong>'.e(trim(($r['manufacturer']??'').' '.($r['model']??'')) ?: 'Unknown').'</strong><span>Location</span><strong>'.e($r['location'] ?: 'Unknown').'</strong><span>Purchased</span><strong>'.e($r['purchase_date'] ?: 'Unknown').' • '.e($purchase).'</strong><span>Value</span><strong>'.e($value).'</strong><span>Maintenance due</span><strong>'.e($r['maintenance_due_at'] ?: 'Not set').'</strong></div><span class="programme-open">Open ›</span></a></article>';
+            echo '<article class="asset-card-modern"><a href="?route=equipment_view&id='.e($r['id']).'"><div class="asset-card-top"><div><span class="asset-number">'.e($r['asset_number'] ?: 'No asset no.').'</span><h3>'.e($r['name']).'</h3></div><span class="status-pill status-'.e($conditionClass).'">'.e($r['condition'] ?: 'Unknown').'</span></div><div class="asset-card-meta"><span>Model</span><strong>'.e(trim(($r['manufacturer']??'').' '.($r['model']??'')) ?: 'Unknown').'</strong><span>Location</span><strong>'.e($r['location'] ?: 'Unknown').'</strong><span>Purchased</span><strong>'.e(uk_date($r['purchase_date'], 'Unknown')).' • '.e($purchase).'</strong><span>Value</span><strong>'.e($value).'</strong><span>Maintenance due</span><strong>'.e(uk_date($r['maintenance_due_at'], 'Not set')).'</strong></div><span class="programme-open">Open ›</span></a></article>';
         }
         echo '</div>';
     }
@@ -3872,7 +4164,7 @@ if (route() === 'equipment_view') {
         echo '<div class="card asset-form-card"><h2>Add maintenance ticket</h2><p class="muted">Create a maintenance/history ticket for this asset.</p><form method="post">'.csrf_field().'<input type="hidden" name="add_ticket" value="1"><div class="two"><div><label>Ticket title / fault</label><input name="title" required></div><div><label>Priority</label><select name="priority"><option>low</option><option selected>normal</option><option>high</option><option>urgent</option></select></div><div><label>Due date</label><input type="date" name="due_date"></div><div><label>Assign to user</label><select name="assigned_user_id"><option value="">Unassigned</option>'; foreach($users as $usr) echo '<option value="'.e($usr['id']).'">'.e(trim(($usr['first_name']??'').' '.($usr['last_name']??'')).($usr['callsign']?' - '.$usr['callsign']:'').' / '.$usr['email']).'</option>'; echo '</select></div><div><label>Estimated/current cost</label><input name="cost" type="number" step="0.01"></div></div><label>Description</label><textarea name="description" placeholder="Fault, maintenance needed, parts required, etc."></textarea><button>Create ticket</button></form></div>';
     }
     $tickets=all('SELECT t.*,u.email,m.first_name,m.last_name FROM equipment_maintenance_tickets t LEFT JOIN users u ON u.id=t.assigned_user_id LEFT JOIN members m ON m.id=u.member_id WHERE t.equipment_id=? ORDER BY CASE t.status WHEN "open" THEN 1 WHEN "in_progress" THEN 2 WHEN "closed" THEN 3 ELSE 4 END, datetime(t.created_at) DESC',[$id]);
-    echo '<div class="card maintenance-list-card"><div class="dash-card-head"><div><h2>Maintenance tickets / history</h2><p class="muted">Ticket-style repair, inspection and maintenance log.</p></div></div>'; if(!$tickets) echo '<p>No maintenance tickets have been recorded for this item yet.</p>'; foreach($tickets as $t){ $cls=str_replace(' ','_',strtolower($t['status'])); echo '<div class="ticket '.e($cls).'"><div class="ticket-head"><div><strong>'.e($t['title']).'</strong><br><span class="muted">Created '.e($t['created_at']).' • Due '.e($t['due_date'] ?: 'not set').' • Assigned to '.e(trim(($t['first_name']??'').' '.($t['last_name']??'')) ?: ($t['email'] ?: 'Unassigned')).'</span></div><span class="status-pill status-'.e($cls).'">'.e($t['status']).'</span></div><p>'.nl2br(e(decrypt_value($t['description_encrypted']))).'</p>'; if($t['action_taken_encrypted']) echo '<p><strong>Action/history:</strong><br>'.nl2br(e(decrypt_value($t['action_taken_encrypted']))).'</p>'; if(has_permission('edit_equipment')){ echo '<details><summary>Edit ticket</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="update_ticket" value="1"><input type="hidden" name="ticket_id" value="'.e($t['id']).'"><label>Status</label><select name="status"><option '.($t['status']==='open'?'selected':'').'>open</option><option '.($t['status']==='in_progress'?'selected':'').'>in_progress</option><option '.($t['status']==='closed'?'selected':'').'>closed</option><option '.($t['status']==='cancelled'?'selected':'').'>cancelled</option></select><label>Priority</label><select name="priority"><option '.($t['priority']==='low'?'selected':'').'>low</option><option '.($t['priority']==='normal'?'selected':'').'>normal</option><option '.($t['priority']==='high'?'selected':'').'>high</option><option '.($t['priority']==='urgent'?'selected':'').'>urgent</option></select><label>Due date</label><input type="date" name="due_date" value="'.e($t['due_date']).'"><label>Assign to user</label><select name="assigned_user_id"><option value="">Unassigned</option>'; foreach($users as $usr) echo '<option value="'.e($usr['id']).'" '.((int)$t['assigned_user_id']===(int)$usr['id']?'selected':'').'>'.e(trim(($usr['first_name']??'').' '.($usr['last_name']??'')).($usr['callsign']?' - '.$usr['callsign']:'').' / '.$usr['email']).'</option>'; echo '</select><label>Description</label><textarea name="description">'.e(decrypt_value($t['description_encrypted'])).'</textarea><label>Action taken / history</label><textarea name="action_taken">'.e(decrypt_value($t['action_taken_encrypted'])).'</textarea><label>Cost</label><input name="cost" type="number" step="0.01" value="'.e($t['cost']).'"><button>Update ticket</button></form></details>'; } echo '</div>'; }
+    echo '<div class="card maintenance-list-card"><div class="dash-card-head"><div><h2>Maintenance tickets / history</h2><p class="muted">Ticket-style repair, inspection and maintenance log.</p></div></div>'; if(!$tickets) echo '<p>No maintenance tickets have been recorded for this item yet.</p>'; foreach($tickets as $t){ $cls=str_replace(' ','_',strtolower($t['status'])); echo '<div class="ticket '.e($cls).'"><div class="ticket-head"><div><strong>'.e($t['title']).'</strong><br><span class="muted">Created '.e(uk_datetime($t['created_at'])).' • Due '.e(uk_date($t['due_date'], 'not set')).' • Assigned to '.e(trim(($t['first_name']??'').' '.($t['last_name']??'')) ?: ($t['email'] ?: 'Unassigned')).'</span></div><span class="status-pill status-'.e($cls).'">'.e($t['status']).'</span></div><p>'.nl2br(e(decrypt_value($t['description_encrypted']))).'</p>'; if($t['action_taken_encrypted']) echo '<p><strong>Action/history:</strong><br>'.nl2br(e(decrypt_value($t['action_taken_encrypted']))).'</p>'; if(has_permission('edit_equipment')){ echo '<details><summary>Edit ticket</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="update_ticket" value="1"><input type="hidden" name="ticket_id" value="'.e($t['id']).'"><label>Status</label><select name="status"><option '.($t['status']==='open'?'selected':'').'>open</option><option '.($t['status']==='in_progress'?'selected':'').'>in_progress</option><option '.($t['status']==='closed'?'selected':'').'>closed</option><option '.($t['status']==='cancelled'?'selected':'').'>cancelled</option></select><label>Priority</label><select name="priority"><option '.($t['priority']==='low'?'selected':'').'>low</option><option '.($t['priority']==='normal'?'selected':'').'>normal</option><option '.($t['priority']==='high'?'selected':'').'>high</option><option '.($t['priority']==='urgent'?'selected':'').'>urgent</option></select><label>Due date</label><input type="date" name="due_date" value="'.e(uk_date($t['due_date'])).'"><label>Assign to user</label><select name="assigned_user_id"><option value="">Unassigned</option>'; foreach($users as $usr) echo '<option value="'.e($usr['id']).'" '.((int)$t['assigned_user_id']===(int)$usr['id']?'selected':'').'>'.e(trim(($usr['first_name']??'').' '.($usr['last_name']??'')).($usr['callsign']?' - '.$usr['callsign']:'').' / '.$usr['email']).'</option>'; echo '</select><label>Description</label><textarea name="description">'.e(decrypt_value($t['description_encrypted'])).'</textarea><label>Action taken / history</label><textarea name="action_taken">'.e(decrypt_value($t['action_taken_encrypted'])).'</textarea><label>Cost</label><input name="cost" type="number" step="0.01" value="'.e($t['cost']).'"><button>Update ticket</button></form></details>'; } echo '</div>'; }
     echo '</div>';
     page_footer(); exit;
 }
@@ -3960,12 +4252,12 @@ if (route() === 'committee_actions') {
         $cls=str_replace(' ','_',strtolower($a['status']));
         $assignedMember=trim(($a['member_first']??'').' '.($a['member_last']??'')).($a['member_callsign']?' - '.$a['member_callsign']:'');
         $history=all('SELECT cu.*,u.email,m.first_name,m.last_name,m.callsign FROM committee_action_updates cu LEFT JOIN users u ON u.id=cu.created_by_user_id LEFT JOIN members m ON m.id=u.member_id WHERE cu.action_id=? ORDER BY datetime(cu.created_at) DESC, cu.id DESC',[$a['id']]);
-        echo '<article class="ticket action-ticket '.e($cls).'"><div class="ticket-head"><div><span class="ticket-kicker">Committee action</span><strong>'.e($a['title']).'</strong><br><span class="muted">Created '.e($a['created_at']).' • Due '.e($a['due_date'] ?: 'not set').' • Assigned member: '.e($assignedMember ?: 'Unassigned').'</span></div><span class="status-pill status-'.e($cls).'">'.e($a['status']).'</span></div><div class="action-ticket-body"><p><strong>Action:</strong> '.e($a['action_required']).'</p><p>'.nl2br(e(decrypt_value($a['description_encrypted']))).'</p></div>';
+        echo '<article class="ticket action-ticket '.e($cls).'"><div class="ticket-head"><div><span class="ticket-kicker">Committee action</span><strong>'.e($a['title']).'</strong><br><span class="muted">Created '.e(uk_datetime($a['created_at'])).' • Due '.e(uk_date($a['due_date'], 'not set')).' • Assigned member: '.e($assignedMember ?: 'Unassigned').'</span></div><span class="status-pill status-'.e($cls).'">'.e($a['status']).'</span></div><div class="action-ticket-body"><p><strong>Action:</strong> '.e($a['action_required']).'</p><p>'.nl2br(e(decrypt_value($a['description_encrypted']))).'</p></div>';
         echo '<details><summary>Updates / history ('.e(count($history)).')</summary>';
         if(!$history) echo '<p class="muted">No updates yet.</p>';
         foreach($history as $h){
             $by=trim(($h['first_name']??'').' '.($h['last_name']??'')) ?: ($h['email'] ?: 'System');
-            echo '<div class="asset-field"><span>'.e($h['created_at']).' • '.e($h['update_type']).' • '.e($by).'</span>';
+            echo '<div class="asset-field"><span>'.e(uk_datetime($h['created_at'])).' • '.e($h['update_type']).' • '.e($by).'</span>';
             $note=decrypt_value($h['update_encrypted'] ?? ''); if($note) echo '<strong>'.nl2br(e($note)).'</strong>';
             $changes=json_decode($h['changes_json'] ?? '', true);
             if($changes){ echo '<ul class="small">'; foreach($changes as $field=>$change){ echo '<li><strong>'.e($field).':</strong> '.e($change['from'] ?? '').' → '.e($change['to'] ?? '').'</li>'; } echo '</ul>'; }
@@ -3974,7 +4266,7 @@ if (route() === 'committee_actions') {
         echo '</details>';
         if(has_permission('manage_committee_actions')){
             echo '<details><summary>Add update</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="add_action_update" value="1"><input type="hidden" name="action_id" value="'.e($a['id']).'"><label>Update note</label><textarea name="update_note" placeholder="Add progress update, decision, phone call note, etc"></textarea><button>Add update</button></form></details>';
-            echo '<details><summary>Edit action</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="update_action" value="1"><input type="hidden" name="action_id" value="'.e($a['id']).'"><label>Title</label><input name="title" value="'.e($a['title']).'" required><label>Status</label><select name="status"><option '.($a['status']==='open'?'selected':'').'>open</option><option '.($a['status']==='in_progress'?'selected':'').'>in_progress</option><option '.($a['status']==='closed'?'selected':'').'>closed</option><option '.($a['status']==='cancelled'?'selected':'').'>cancelled</option></select><label>Priority</label><select name="priority"><option '.($a['priority']==='low'?'selected':'').'>low</option><option '.($a['priority']==='normal'?'selected':'').'>normal</option><option '.($a['priority']==='high'?'selected':'').'>high</option><option '.($a['priority']==='urgent'?'selected':'').'>urgent</option></select><label>Due date</label><input type="date" name="due_date" value="'.e($a['due_date']).'"><label>Assign to member</label><select name="assigned_member_id"><option value="">Unassigned</option>'; foreach($members as $m) echo '<option value="'.e($m['id']).'" '.((int)$a['assigned_member_id']===(int)$m['id']?'selected':'').'>'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'' )).'</option>'; echo '</select><label>Action required</label><input name="action_required" value="'.e($a['action_required']).'" required><label>Description</label><textarea name="description">'.e(decrypt_value($a['description_encrypted'])).'</textarea><label>Update note / reason for change</label><textarea name="update_note" placeholder="Optional explanation for this edit"></textarea><button>Update action</button></form></details>';
+            echo '<details><summary>Edit action</summary><form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="update_action" value="1"><input type="hidden" name="action_id" value="'.e($a['id']).'"><label>Title</label><input name="title" value="'.e($a['title']).'" required><label>Status</label><select name="status"><option '.($a['status']==='open'?'selected':'').'>open</option><option '.($a['status']==='in_progress'?'selected':'').'>in_progress</option><option '.($a['status']==='closed'?'selected':'').'>closed</option><option '.($a['status']==='cancelled'?'selected':'').'>cancelled</option></select><label>Priority</label><select name="priority"><option '.($a['priority']==='low'?'selected':'').'>low</option><option '.($a['priority']==='normal'?'selected':'').'>normal</option><option '.($a['priority']==='high'?'selected':'').'>high</option><option '.($a['priority']==='urgent'?'selected':'').'>urgent</option></select><label>Due date</label><input type="date" name="due_date" value="'.e(uk_date($a['due_date'])).'"><label>Assign to member</label><select name="assigned_member_id"><option value="">Unassigned</option>'; foreach($members as $m) echo '<option value="'.e($m['id']).'" '.((int)$a['assigned_member_id']===(int)$m['id']?'selected':'').'>'.e($m['first_name'].' '.$m['last_name'].($m['callsign']?' - '.$m['callsign']:'' )).'</option>'; echo '</select><label>Action required</label><input name="action_required" value="'.e($a['action_required']).'" required><label>Description</label><textarea name="description">'.e(decrypt_value($a['description_encrypted'])).'</textarea><label>Update note / reason for change</label><textarea name="update_note" placeholder="Optional explanation for this edit"></textarea><button>Update action</button></form></details>';
         }
         echo '</article>';
     }
@@ -4095,7 +4387,7 @@ if (route() === 'events') {
         for($i=0;$i<42;$i++){
             $date=$day->format('Y-m-d'); $muted=$day->format('Y-m')!==$month?' muted-day':'';
             echo '<div class="calendar-day'.$muted.'"><div class="calendar-date">'.e($day->format('j')).'</div>';
-            foreach(($byDate[$date]??[]) as $ev) echo '<a class="calendar-event" href="?route=event_view&id='.e($ev['id']).'"><span class="small">'.e(date('H:i', strtotime($ev['start_at']))).'</span> '.e($ev['title']).'<br><span class="small">'.e($ev['event_type']).'</span></a>';
+            foreach(($byDate[$date]??[]) as $ev) echo '<a class="calendar-event" href="?route=event_view&id='.e($ev['id']).'"><span class="small">'.e(date('H:i', strtotime(uk_datetime($ev['start_at'])))).'</span> '.e($ev['title']).'<br><span class="small">'.e($ev['event_type']).'</span></a>';
             echo '</div>'; $day->modify('+1 day');
         }
         echo '</div></div>';
@@ -4127,9 +4419,9 @@ if (route() === 'events') {
         echo '<div class="programme-event-grid">';
         if (!$rows) echo '<p>'.e($empty).'</p>';
         foreach($rows as $ev){
-            $startTs = strtotime($ev['start_at']);
+            $startTs = strtotime(uk_datetime($ev['start_at']));
             $dateBox = $startTs ? '<div class="programme-datebox"><strong>'.e(date('d', $startTs)).'</strong><span>'.e(date('M', $startTs)).'</span></div>' : '<div class="programme-datebox"><strong>?</strong><span>TBC</span></div>';
-            echo '<article class="programme-event-card"><a class="programme-card-link" href="?route=event_view&id='.e($ev['id']).'"><div class="programme-card-main">'.$dateBox.'<div><div class="programme-card-top"><span class="pill category-pill">'.e($ev['event_type'] ?: 'Other').'</span><span class="muted">'.e($startTs ? date('D j M Y H:i', $startTs) : 'Date TBC').($ev['end_at']?' - '.e(date('H:i', strtotime($ev['end_at']))):'').'</span></div><h3>'.e($ev['title']).'</h3><p>'.nl2br(e(mb_strimwidth((string)$ev['description'],0,180,'…'))).'</p><div class="programme-meta"><span>📍 '.e($ev['location'] ?: 'TBC').'</span><span>👥 '.e($ev['attendee_count']).' signed up</span></div></div></div><span class="programme-open">Open ›</span></a></article>';
+            echo '<article class="programme-event-card"><a class="programme-card-link" href="?route=event_view&id='.e($ev['id']).'"><div class="programme-card-main">'.$dateBox.'<div><div class="programme-card-top"><span class="pill category-pill">'.e($ev['event_type'] ?: 'Other').'</span><span class="muted">'.e($startTs ? date('D j M Y H:i', $startTs) : 'Date TBC').($ev['end_at']?' - '.e(date('H:i', strtotime(uk_datetime($ev['end_at'])))):'').'</span></div><h3>'.e($ev['title']).'</h3><p>'.nl2br(e(mb_strimwidth((string)$ev['description'],0,180,'…'))).'</p><div class="programme-meta"><span>📍 '.e($ev['location'] ?: 'TBC').'</span><span>👥 '.e($ev['attendee_count']).' signed up</span></div></div></div><span class="programme-open">Open ›</span></a></article>';
         }
         echo '</div></div>';
     }
@@ -4148,6 +4440,14 @@ if (route() === 'event_view') {
         if (isset($_POST['add_member_attendance'])) { require_permission('track_attendance'); $memberId=(int)$_POST['member_id']; if($memberId>0){ exec_sql('INSERT OR IGNORE INTO event_attendance (event_id,member_id,status,signed_up_at,created_at,updated_at) VALUES (?,? ,"signed_up",datetime("now"),datetime("now"),datetime("now"))',[$id,$memberId]); audit('attendance.member_added','event',$id,'success',null,['member_id'=>$memberId]); flash('Member added to attendance list.'); } redirect('event_view&id='.$id); }
         if (isset($_POST['delete_event'])) { if (!can_manage_events()) require_permission('manage_events'); exec_sql('DELETE FROM event_attendance WHERE event_id=?',[$id]); exec_sql('DELETE FROM event_guests WHERE event_id=?',[$id]); exec_sql('DELETE FROM event_attachments WHERE event_id=?',[$id]); exec_sql('DELETE FROM events WHERE id=?',[$id]); audit('event.delete','event',$id); flash('Event deleted.'); redirect('events'); }
         if (isset($_POST['add_guest_attendance'])) { require_permission('track_attendance'); $guestName=trim($_POST['guest_name'] ?? ''); if($guestName!==''){ exec_sql('INSERT INTO event_guests (event_id,name,comment_encrypted,attended,added_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,datetime("now"),datetime("now"))',[$id,$guestName,encrypt_value(trim($_POST['guest_comment'] ?? '')),0,$u['id']]); audit('attendance.guest_added','event',$id); flash('Guest / visitor added.'); } redirect('event_view&id='.$id); }
+        if (isset($_POST['sync_door_tax'])) {
+            require_door_tax_manager();
+            $sync = door_tax_sync_event_attendance($id);
+            audit('door_tax.sync_from_attendance','event',$id,'success',null,$sync);
+            if (!$sync['completed']) flash('Door tax was not changed because this meeting has not finished.');
+            else flash('Door tax synced from attendance: '.$sync['charged'].' charged and '.$sync['reversed'].' reversed.');
+            redirect('event_view&id='.$id);
+        }
         if (isset($_POST['mark_attendance'])) { require_permission('track_attendance');
             $checkedMembers=$_POST['member_attended'] ?? [];
             $oldMemberRows=all('SELECT ea.member_id,ea.attended,ea.status,m.first_name,m.last_name,m.callsign FROM event_attendance ea JOIN members m ON m.id=ea.member_id WHERE ea.event_id=?',[$id]);
@@ -4169,17 +4469,36 @@ if (route() === 'event_view') {
                 }
             }
             $guestRows=all('SELECT id,name,attended,comment_encrypted FROM event_guests WHERE event_id=?',[$id]); $checkedGuests=$_POST['guest_attended'] ?? []; foreach($guestRows as $row){ $guestId=(int)$row['id']; $isAttended=isset($checkedGuests[$guestId]) ? 1 : 0; $comment=trim($_POST['guest_comment_existing'][$guestId] ?? ''); $oldPresent=(int)($row['attended'] ?? 0)===1; $oldComment=decrypt_value($row['comment_encrypted'] ?? '') ?: ''; if($oldPresent !== (bool)$isAttended || $oldComment !== $comment){ $guestChanges['guest_'.$guestId]=['label'=>'Guest: '.($row['name'] ?? $guestId),'old'=>($oldPresent?'Present':'Absent').($oldComment!==''?' / '.$oldComment:''),'new'=>($isAttended?'Present':'Absent').($comment!==''?' / '.$comment:'')]; } exec_sql('UPDATE event_guests SET attended=?, comment_encrypted=?, updated_at=datetime("now") WHERE event_id=? AND id=?',[$isAttended,encrypt_value($comment),$id,$guestId]); }
-            audit('attendance.update','event',$id,'success',null,['field_changes'=>array_merge($memberChanges,$guestChanges),'member_changes'=>count($memberChanges),'guest_changes'=>count($guestChanges)]); flash('Attendance updated.'); redirect('event_view&id='.$id); }
+            attendance_event_member_snapshot($ev, true);
+            $doorTaxSync = door_tax_sync_event_attendance($id);
+            audit('attendance.update','event',$id,'success',null,[
+                'field_changes'=>array_merge($memberChanges,$guestChanges),
+                'member_changes'=>count($memberChanges),
+                'guest_changes'=>count($guestChanges),
+                'door_tax_charged'=>$doorTaxSync['charged'],
+                'door_tax_reversed'=>$doorTaxSync['reversed'],
+                'door_tax_skipped_future'=>$doorTaxSync['skipped_future']
+            ]);
+            $message = 'Attendance updated.';
+            if (!empty($doorTaxSync['completed'])) {
+                $message .= ' Door tax synced: '.$doorTaxSync['charged'].' charged';
+                if ($doorTaxSync['reversed']) $message .= ', '.$doorTaxSync['reversed'].' reversed';
+                $message .= '.';
+            } else {
+                $message .= ' Door tax was not charged because the meeting has not finished.';
+            }
+            flash($message);
+            redirect('event_view&id='.$id); }
     }
     page_header($ev['title']);
     echo '<div class="card"><div class="toolbar"><h1 style="margin-right:auto">'.e($ev['title']).'</h1>';
     if (can_manage_events()) echo '<a class="btn secondary" href="?route=event_edit&id='.e($id).'">Edit</a><form method="post" onsubmit="return confirm(\'Delete this event?\')" style="display:inline">'.csrf_field().'<button class="danger" name="delete_event" value="1">Delete</button></form>';
     if (door_tax_manager()) echo '<a class="btn secondary" href="?route=door_tax&event_id='.e($id).'">Door tax</a>';
-    echo '</div><p class="muted">'.e($ev['event_type']).'</p><div class="grid"><div><strong>Starts</strong><br>'.e(date('D j M Y H:i', strtotime($ev['start_at']))).'</div><div><strong>Ends</strong><br>'.e($ev['end_at'] ? date('D j M Y H:i', strtotime($ev['end_at'])) : 'Not set').'</div><div><strong>Location</strong><br>'.e($ev['location'] ?: 'TBC').'</div><div><strong>Max attendees</strong><br>'.e($ev['max_attendees'] ?: 'No limit').'</div></div><h2>Description</h2><p>'.nl2br(e($ev['description'] ?: 'No description added.')).'</p>';
+    echo '</div><p class="muted">'.e($ev['event_type']).'</p><div class="grid"><div><strong>Starts</strong><br>'.e(date('D j M Y H:i', strtotime(uk_datetime($ev['start_at'])))).'</div><div><strong>Ends</strong><br>'.e($ev['end_at'] ? date('D j M Y H:i', strtotime(uk_datetime($ev['end_at']))) : 'Not set').'</div><div><strong>Location</strong><br>'.e($ev['location'] ?: 'TBC').'</div><div><strong>Max attendees</strong><br>'.e($ev['max_attendees'] ?: 'No limit').'</div></div><h2>Description</h2><p>'.nl2br(e($ev['description'] ?: 'No description added.')).'</p>';
     $atts=all('SELECT * FROM event_attachments WHERE event_id=? ORDER BY created_at DESC',[$id]); echo '<h2>Attachments</h2>'; if(!$atts) echo '<p>No attachments.</p>'; else { echo '<ul>'; foreach($atts as $a) echo '<li><a href="?route=event_attachment&id='.e($a['id']).'">'.e($a['original_filename']).'</a> <span class="muted">'.e(round($a['file_size']/1024,1)).' KB</span></li>'; echo '</ul>'; }
     echo '<form method="post">'.csrf_field().'<input type="hidden" name="signup" value="1"><button>Sign up / mark me attending</button></form></div>';
     if (is_committee_or_admin()) {
-        $membersForRegister=all('SELECT m.id,m.first_name,m.last_name,m.callsign,m.email,ea.status,ea.attended,ea.signed_up_at FROM members m LEFT JOIN event_attendance ea ON ea.member_id=m.id AND ea.event_id=? WHERE m.membership_status IN ("active","honorary","life_member") ORDER BY m.last_name,m.first_name',[$id]);
+        $membersForRegister=all('SELECT m.id,m.first_name,m.last_name,m.callsign,m.email,ea.status,ea.attended,ea.signed_up_at,COALESCE((SELECT SUM(dt.amount) FROM door_tax_transactions dt WHERE dt.member_id=m.id),0) door_tax_balance,EXISTS(SELECT 1 FROM door_tax_transactions dtc WHERE dtc.member_id=m.id AND dtc.event_id=? AND dtc.transaction_type="meeting_charge") door_tax_charged FROM members m LEFT JOIN event_attendance ea ON ea.member_id=m.id AND ea.event_id=? WHERE m.membership_status IN ("active","honorary","life_member") ORDER BY m.last_name,m.first_name',[$id,$id]);
         $guests=all('SELECT * FROM event_guests WHERE event_id=? ORDER BY name',[$id]);
         $memberTotal=count($membersForRegister);
         $memberPresent=0;
@@ -4188,7 +4507,9 @@ if (route() === 'event_view') {
         foreach($guests as $row){ if((string)$row['attended']==='1') $guestPresent++; }
         $memberAbsent=max(0,$memberTotal-$memberPresent);
         echo '<div class="card attendance-modern" data-attendance-register>';
-        echo '<div class="attendance-modern-head"><div><h2>'.e($ev['title']).'</h2><div class="attendance-date">'.e(date('l j F Y, H:i', strtotime($ev['start_at']))).'</div><p class="muted">Committee members can mark attendance here. Members can still self sign up in advance from the event page.</p></div><div class="attendance-counts"><div><span>Members</span><strong class="present" data-count-members>'.e($memberPresent).'</strong></div><div><span>Guests</span><strong class="guest" data-count-guests>'.e($guestPresent).'</strong></div><div><span>Absent</span><strong class="absent" data-count-absent>'.e($memberAbsent).'</strong></div></div></div>';
+        echo '<div class="attendance-modern-head"><div><h2>'.e($ev['title']).'</h2><div class="attendance-date">'.e(date('l j F Y, H:i', strtotime(uk_datetime($ev['start_at'])))).'</div><p class="muted">Committee members can mark attendance here. Saving a completed meeting automatically deducts '.e(door_tax_money(door_tax_charge_amount())).' from attending members and reverses the automatic charge if attendance is corrected.</p>';
+        if (door_tax_manager()) echo '<form method="post" class="attendance-door-tax-sync">'.csrf_field().'<button class="secondary" name="sync_door_tax" value="1">Sync door tax from attendance</button><a class="btn secondary" href="?route=door_tax&event_id='.e($id).'">Open door tax</a></form>';
+        echo '</div><div class="attendance-counts"><div><span>Members</span><strong class="present" data-count-members>'.e($memberPresent).'</strong></div><div><span>Guests</span><strong class="guest" data-count-guests>'.e($guestPresent).'</strong></div><div><span>Absent</span><strong class="absent" data-count-absent>'.e($memberAbsent).'</strong></div></div></div>';
         echo '<form method="post">'.csrf_field().'<input type="hidden" name="mark_attendance" value="1">';
         echo '<div class="attendance-modern-controls"><div class="attendance-search-wrap"><input class="attendance-search" data-att-search placeholder="Search members..."></div><select class="attendance-filter" data-att-filter><option value="all">All</option><option value="members">Members</option><option value="guests">Guests</option><option value="present">Present</option><option value="absent">Absent</option><option value="signed_up">Signed up</option></select><button type="button" class="secondary" data-att-all>✓ All</button><button type="button" class="secondary" data-att-none>× None</button></div>';
         echo '<div class="attendance-modern-list">';
@@ -4199,14 +4520,20 @@ if (route() === 'event_view') {
             $filterStatus=$present?'present':($signed?'signed_up':'absent');
             $statusLabel=$present?'Present':($signed?'Signed up':'Absent');
             $secondary=$a['callsign'] ?: $a['email'];
-            echo '<label class="attendance-modern-row" data-att-row data-kind="member" data-status="'.e($filterStatus).'" data-name="'.e(strtolower($a['first_name'].' '.$a['last_name'].' '.$a['callsign'].' '.$a['email'])).'"><input class="attendance-check" type="checkbox" name="member_attended['.e($a['id']).']" value="1" '.($present?'checked':'').'><span class="attendance-person"><strong>'.e($a['first_name'].' '.$a['last_name']).'</strong><span>'.e($secondary ?: 'No callsign/email recorded').'</span></span><span class="attendance-row-status '.($present?'present':'').'" data-row-status>'.e($statusLabel).'</span></label>';
+            $doorTaxInfo = '';
+            if (door_tax_manager()) {
+                $balance = (float)($a['door_tax_balance'] ?? 0);
+                $chargedForEvent = !empty($a['door_tax_charged']);
+                $doorTaxInfo = '<span class="attendance-door-tax '.($chargedForEvent?'charged':'').'"><strong>'.e(door_tax_money($balance)).'</strong><small>'.e($chargedForEvent?'Door tax charged':'Not charged for meeting').'</small></span>';
+            }
+            echo '<label class="attendance-modern-row" data-att-row data-kind="member" data-status="'.e($filterStatus).'" data-name="'.e(strtolower($a['first_name'].' '.$a['last_name'].' '.$a['callsign'].' '.$a['email'])).'"><input class="attendance-check" type="checkbox" name="member_attended['.e($a['id']).']" value="1" '.($present?'checked':'').'><span class="attendance-person"><strong>'.e($a['first_name'].' '.$a['last_name']).'</strong><span>'.e($secondary ?: 'No callsign/email recorded').'</span></span>'.$doorTaxInfo.'<span class="attendance-row-status '.($present?'present':'').'" data-row-status>'.e($statusLabel).'</span></label>';
         }
         foreach($guests as $g){
             $present=(string)$g['attended']==='1';
             $comment=decrypt_value($g['comment_encrypted']);
             echo '<label class="attendance-modern-row" data-att-row data-kind="guest" data-status="'.($present?'present':'absent').'" data-name="'.e(strtolower($g['name'].' '.$comment)).'"><input class="attendance-check" type="checkbox" name="guest_attended['.e($g['id']).']" value="1" '.($present?'checked':'').'><span class="attendance-person"><strong>'.e($g['name']).'</strong><span><input name="guest_comment_existing['.e($g['id']).']" value="'.e($comment).'" placeholder="Guest comments"></span></span><span class="attendance-row-status '.($present?'present':'guest').'" data-row-status>'.e($present?'Present':'Guest absent').'</span></label>';
         }
-        echo '</div><div class="attendance-savebar"><span class="muted">Tick members/guests who attended, then save the register.</span><button>Save attendance register</button></div></form>';
+        echo '</div><div class="attendance-savebar"><span class="muted">Tick those who attended, then save. Completed meetings also update prepaid door-tax balances automatically.</span><button>Save attendance register</button></div></form>';
         echo '<form method="post" class="attendance-modern-footer">'.csrf_field().'<input type="hidden" name="add_guest_attendance" value="1"><div><label>Add visitor / guest</label><input name="guest_name" placeholder="Guest / visitor name"></div><div><label>Guest comments</label><input name="guest_comment" placeholder="Notes, callsign, reason for attending, etc."></div><button>Add guest</button></form>';
         echo '</div>';
         echo '<script>(function(){var root=document.querySelector("[data-attendance-register]");if(!root)return;var search=root.querySelector("[data-att-search]"),filter=root.querySelector("[data-att-filter]");function rows(){return Array.prototype.slice.call(root.querySelectorAll("[data-att-row]"));}function update(){var q=(search.value||"").toLowerCase(),f=filter.value||"all",mp=0,gp=0,totalMembers=0;rows().forEach(function(r){var cb=r.querySelector(".attendance-check"),kind=r.dataset.kind,status=cb.checked?"present":(r.dataset.status==="signed_up"?"signed_up":"absent"),name=r.dataset.name||"";r.dataset.status=status;var okSearch=!q||name.indexOf(q)>-1;var okFilter=f==="all"||(f==="members"&&kind==="member")||(f==="guests"&&kind==="guest")||f===status; r.style.display=(okSearch&&okFilter)?"grid":"none";var label=r.querySelector("[data-row-status]");if(label){label.classList.toggle("present",cb.checked);if(kind==="guest"&&!cb.checked){label.classList.add("guest");}else{label.classList.remove("guest");}label.textContent=cb.checked?"Present":(kind==="guest"?"Guest absent":(status==="signed_up"?"Signed up":"Absent"));} if(kind==="member"){totalMembers++; if(cb.checked)mp++;} if(kind==="guest"&&cb.checked)gp++;});root.querySelector("[data-count-members]").textContent=mp;root.querySelector("[data-count-guests]").textContent=gp;root.querySelector("[data-count-absent]").textContent=Math.max(0,totalMembers-mp);}root.querySelector("[data-att-all]").addEventListener("click",function(){rows().forEach(function(r){if(r.style.display!=="none")r.querySelector(".attendance-check").checked=true;});update();});root.querySelector("[data-att-none]").addEventListener("click",function(){rows().forEach(function(r){if(r.style.display!=="none")r.querySelector(".attendance-check").checked=false;});update();});root.addEventListener("change",function(e){if(e.target.matches(".attendance-check,[data-att-filter]"))update();});search.addEventListener("input",update);update();})();</script>';
@@ -4326,7 +4653,7 @@ if (route() === 'door_tax') {
     echo '</select><div class="two"><div><label>Amount</label><input type="number" step="0.01" min="0.01" name="amount" value="10.00"></div><div><label>Payment method</label><input name="payment_method" placeholder="Cash, bank transfer, card"></div></div><label>Reference</label><input name="reference"><label>Note</label><textarea name="note" placeholder="Optional notes"></textarea><button name="add_payment" value="1">Add payment</button></form></div>';
 
     echo '<div class="card"><h2>Charge attended event</h2><form method="post">'.csrf_field().'<label>Event</label><select name="event_id" required><option value="">Select past event</option>';
-    foreach($events as $ev){ echo '<option value="'.e($ev['id']).'" '.($selectedEventId===(int)$ev['id']?'selected':'').'>'.e(date('d/m/Y',strtotime($ev['start_at'])).' - '.$ev['title']).'</option>'; }
+    foreach($events as $ev){ echo '<option value="'.e($ev['id']).'" '.($selectedEventId===(int)$ev['id']?'selected':'').'>'.e(date('d/m/Y',strtotime(uk_datetime($ev['start_at']))).' - '.$ev['title']).'</option>'; }
     echo '</select><label>Charge amount per attended member</label><input type="number" step="0.01" min="0.01" name="amount" value="'.e(number_format($charge,2,'.','')).'"><p class="muted">Only members marked as attended will be charged. Members already charged for the same event are skipped.</p><button name="charge_event" value="1">Charge attended members</button></form></div>';
 
     echo '<div class="card"><h2>Manual charge / adjustment</h2><form method="post">'.csrf_field().'<label>Member</label><select name="member_id" required><option value="">Select member</option>';
@@ -4349,7 +4676,7 @@ if (route() === 'door_tax') {
             if (!$txs) echo '<p class="muted">No door tax transactions recorded yet.</p>';
             else {
                 echo '<table><tr><th>Date</th><th>Type</th><th>Event</th><th>Amount</th><th>Method/ref</th><th>Note</th><th></th></tr>';
-                foreach($txs as $tx){ $note=decrypt_value($tx['note_encrypted'] ?? '') ?: ''; echo '<tr><td>'.e($tx['created_at']).'</td><td>'.e($tx['transaction_type']).'</td><td>'.e($tx['event_title'] ?: '').'</td><td>'.e(door_tax_money($tx['amount'])).'</td><td>'.e(trim(($tx['payment_method']?:'').' '.($tx['reference']?:''))).'</td><td>'.e($note).'</td><td><form method="post" onsubmit="return confirm(&quot;Delete this door tax transaction?&quot;)">'.csrf_field().'<input type="hidden" name="transaction_id" value="'.e($tx['id']).'"><button class="danger" name="delete_transaction" value="1">Delete</button></form></td></tr>'; }
+                foreach($txs as $tx){ $note=decrypt_value($tx['note_encrypted'] ?? '') ?: ''; echo '<tr><td>'.e(uk_datetime(uk_datetime($tx['created_at']))).'</td><td>'.e($tx['transaction_type']).'</td><td>'.e($tx['event_title'] ?: '').'</td><td>'.e(door_tax_money($tx['amount'])).'</td><td>'.e(trim(($tx['payment_method']?:'').' '.($tx['reference']?:''))).'</td><td>'.e($note).'</td><td><form method="post" onsubmit="return confirm(&quot;Delete this door tax transaction?&quot;)">'.csrf_field().'<input type="hidden" name="transaction_id" value="'.e($tx['id']).'"><button class="danger" name="delete_transaction" value="1">Delete</button></form></td></tr>'; }
                 echo '</table>';
             }
             echo '</div>';
@@ -4369,8 +4696,14 @@ if (route() === 'attendance') {
     $render = function(array $events, string $title) {
         echo '<div class="card"><h2>'.e($title).'</h2>';
         if (!$events) { echo '<p>No events in this section.</p></div>'; return; }
-        echo '<table><tr><th>Event</th><th>Category</th><th>Date</th><th>Members listed</th><th>Guests listed</th><th>Total attended</th><th>Action</th></tr>';
-        foreach($events as $ev){ $c=event_attendance_counts((int)$ev['id']); echo '<tr><td>'.e($ev['title']).'</td><td>'.e($ev['event_type'] ?: 'Other').'</td><td>'.e(date('D j M Y H:i', strtotime($ev['start_at']))).'</td><td>'.e($c['member_total']).'</td><td>'.e($c['guest_total']).'</td><td>'.e($c['total_attended']).'</td><td><a class="btn secondary" href="?route=event_view&id='.e($ev['id']).'">Open register</a></td></tr>'; }
+        echo '<table><tr><th>Event</th><th>Category</th><th>Date</th><th>Members listed</th><th>Guests listed</th><th>Total attended</th><th>Door tax</th><th>Action</th></tr>';
+        foreach($events as $ev){
+            $c=event_attendance_counts((int)$ev['id']);
+            $completed=door_tax_event_is_completed($ev);
+            $chargedCount=(int)(first('SELECT COUNT(*) c FROM door_tax_transactions WHERE event_id=? AND transaction_type="meeting_charge"',[(int)$ev['id']])['c'] ?? 0);
+            $doorTaxText=$completed ? ($chargedCount.' charged') : 'Not due';
+            echo '<tr><td>'.e($ev['title']).'</td><td>'.e($ev['event_type'] ?: 'Other').'</td><td>'.e(uk_datetime($ev['start_at'])).'</td><td>'.e($c['member_total']).'</td><td>'.e($c['guest_total']).'</td><td>'.e($c['total_attended']).'</td><td>'.e($doorTaxText).'</td><td><a class="btn secondary" href="?route=event_view&id='.e($ev['id']).'">Open register</a></td></tr>';
+        }
         echo '</table></div>';
     };
     $render($future, 'Upcoming events');
@@ -4379,20 +4712,133 @@ if (route() === 'attendance') {
 }
 
 if (route() === 'attendance_stats') {
-    require_permission('track_attendance'); audit('attendance.stats.view'); page_header('Attendance stats');
-    echo '<div class="card"><h1>Attendance stats</h1><p class="muted">Stats include member attendance plus visitors/guests where recorded.</p></div>';
-    $types = all('SELECT COALESCE(NULLIF(event_type,""),"Other") event_type, COUNT(*) event_count FROM events GROUP BY COALESCE(NULLIF(event_type,""),"Other") ORDER BY event_type');
-    echo '<div class="card"><h2>Attendance by event type</h2><table><tr><th>Event type</th><th>Events</th><th>Total member attendance</th><th>Total guest attendance</th><th>Total attendance</th><th>Average total/event</th><th>Average members/event</th><th>Average guests/event</th></tr>';
-    foreach($types as $t){ $type=$t['event_type']; $stats=first('SELECT COUNT(DISTINCT e.id) events, COUNT(CASE WHEN ea.attended=1 THEN 1 END) member_attended FROM events e LEFT JOIN event_attendance ea ON ea.event_id=e.id WHERE COALESCE(NULLIF(e.event_type,""),"Other")=?',[$type]); $guest=first('SELECT COUNT(CASE WHEN g.attended=1 THEN 1 END) guest_attended FROM events e LEFT JOIN event_guests g ON g.event_id=e.id WHERE COALESCE(NULLIF(e.event_type,""),"Other")=?',[$type]); $events=max(1,(int)$stats['events']); $ma=(int)($stats['member_attended'] ?? 0); $ga=(int)($guest['guest_attended'] ?? 0); echo '<tr><td>'.e($type).'</td><td>'.e($stats['events']).'</td><td>'.e($ma).'</td><td>'.e($ga).'</td><td>'.e($ma+$ga).'</td><td>'.e(round(($ma+$ga)/$events,1)).'</td><td>'.e(round($ma/$events,1)).'</td><td>'.e(round($ga/$events,1)).'</td></tr>'; }
-    echo '</table></div>';
-    $months = all('SELECT strftime("%Y-%m", start_at) ym, COUNT(*) event_count FROM events GROUP BY ym ORDER BY ym DESC');
-    echo '<div class="card"><h2>Attendance by month & year</h2><table><tr><th>Month</th><th>Events</th><th>Member attendance</th><th>Guest attendance</th><th>Total attendance</th><th>Average/event</th></tr>';
-    foreach($months as $mrow){ $ym=$mrow['ym']; $stats=first('SELECT COUNT(DISTINCT e.id) events, COUNT(CASE WHEN ea.attended=1 THEN 1 END) member_attended FROM events e LEFT JOIN event_attendance ea ON ea.event_id=e.id WHERE strftime("%Y-%m", e.start_at)=?',[$ym]); $guest=first('SELECT COUNT(CASE WHEN g.attended=1 THEN 1 END) guest_attended FROM events e LEFT JOIN event_guests g ON g.event_id=e.id WHERE strftime("%Y-%m", e.start_at)=?',[$ym]); $events=max(1,(int)$stats['events']); $ma=(int)($stats['member_attended'] ?? 0); $ga=(int)($guest['guest_attended'] ?? 0); echo '<tr><td>'.e(date('F Y', strtotime($ym.'-01'))).'</td><td>'.e($stats['events']).'</td><td>'.e($ma).'</td><td>'.e($ga).'</td><td>'.e($ma+$ga).'</td><td>'.e(round(($ma+$ga)/$events,1)).'</td></tr>'; }
-    echo '</table></div>';
-    $people=all('SELECT m.id,m.first_name,m.last_name,m.callsign, COUNT(ea.id) listed, SUM(CASE WHEN ea.attended=1 THEN 1 ELSE 0 END) attended FROM members m LEFT JOIN event_attendance ea ON ea.member_id=m.id GROUP BY m.id ORDER BY attended DESC, m.last_name, m.first_name');
-    echo '<div class="card"><h2>Attendance by person</h2><table><tr><th>Member</th><th>Callsign</th><th>Listed/signed up</th><th>Attended</th><th>Attendance %</th></tr>';
-    foreach($people as $p){ echo '<tr><td>'.e($p['first_name'].' '.$p['last_name']).'</td><td>'.e($p['callsign']).'</td><td>'.e((int)$p['listed']).'</td><td>'.e((int)$p['attended']).'</td><td>'.e(percent_display($p['attended'],$p['listed'])).'</td></tr>'; }
-    echo '</table></div>';
+    require_permission('track_attendance');
+    ensure_attendance_snapshot_schema();
+    audit('attendance.stats.view');
+    page_header('Attendance overview');
+
+    $eventType = trim((string)($_GET['event_type'] ?? ''));
+    $dateFrom = trim((string)($_GET['date_from'] ?? ''));
+    $dateTo = trim((string)($_GET['date_to'] ?? ''));
+
+    $eventWhere = 'e.start_at IS NOT NULL AND datetime(COALESCE(NULLIF(e.end_at,""),e.start_at)) <= datetime("now")';
+    $eventParams = [];
+
+    if ($eventType !== '') {
+        $eventWhere .= ' AND COALESCE(NULLIF(e.event_type,""),"Other")=?';
+        $eventParams[] = $eventType;
+    }
+    if ($dateFrom !== '') {
+        $eventWhere .= ' AND date(e.start_at)>=date(?)';
+        $eventParams[] = $dateFrom;
+    }
+    if ($dateTo !== '') {
+        $eventWhere .= ' AND date(e.start_at)<=date(?)';
+        $eventParams[] = $dateTo;
+    }
+
+    $events = all('SELECT e.* FROM events e WHERE '.$eventWhere.' ORDER BY datetime(e.start_at) ASC', $eventParams);
+    $members = all('SELECT id,first_name,last_name,callsign,membership_number,date_joined,joined_before_system,membership_status FROM members ORDER BY last_name,first_name');
+    $types = all('SELECT DISTINCT COALESCE(NULLIF(event_type,""),"Other") event_type FROM events ORDER BY event_type');
+
+    $attendanceRows = [];
+    if ($events) {
+        $eventIds = array_map(fn($event)=>(int)$event['id'], $events);
+        $placeholders = implode(',', array_fill(0, count($eventIds), '?'));
+        foreach (all('SELECT member_id,event_id,MAX(attended) attended,MAX(status) status
+            FROM event_attendance
+            WHERE event_id IN ('.$placeholders.')
+            GROUP BY member_id,event_id', $eventIds) as $row) {
+            $attendanceRows[(int)$row['member_id']][(int)$row['event_id']] = $row;
+        }
+    }
+
+    $eventStats = [];
+    foreach ($events as $event) {
+        $eventId = (int)$event['id'];
+        $attended = 0;
+        foreach ($attendanceRows as $memberAttendance) {
+            if (!empty($memberAttendance[$eventId]['attended'])) $attended++;
+        }
+        $eligible = attendance_event_member_snapshot($event, true);
+        $eventStats[$eventId] = [
+            'attended'=>$attended,
+            'eligible'=>$eligible,
+            'percentage'=>$eligible > 0 ? min(100, round(($attended/$eligible)*100, 1)) : null,
+        ];
+    }
+
+    echo '<section class="attendance-matrix-hero"><div><span class="eyebrow">Attendance reporting</span><h1>Attendance overview</h1><p>Member attendance by completed session, with totals and percentages.</p></div><div class="attendance-matrix-hero-stats"><div><strong>'.e(count($members)).'</strong><span>Members</span></div><div><strong>'.e(count($events)).'</strong><span>Sessions</span></div></div></section>';
+
+    echo '<section class="card attendance-matrix-filter"><form method="get"><input type="hidden" name="route" value="attendance_stats"><div><label>Event type</label><select name="event_type"><option value="">All event types</option>';
+    foreach($types as $typeRow) echo '<option value="'.e($typeRow['event_type']).'" '.($eventType===$typeRow['event_type']?'selected':'').'>'.e($typeRow['event_type']).'</option>';
+    echo '</select></div><div><label>From</label><input type="date" name="date_from" value="'.e($dateFrom).'"></div><div><label>To</label><input type="date" name="date_to" value="'.e($dateTo).'"></div><div class="attendance-matrix-filter-actions"><button>Apply</button><a class="btn secondary" href="?route=attendance_stats">Clear</a><a class="btn secondary" href="?route=attendance">Attendance registers</a></div></form></section>';
+
+    echo '<section class="card attendance-matrix-shell"><div class="attendance-matrix-note"><strong>How percentages work</strong><span>Each member percentage uses completed sessions they were eligible for from their join date. Each session percentage uses the number of members recorded as being in the system at the time of that meeting.</span></div>';
+
+    if (!$events) {
+        echo '<div class="empty-state"><strong>No completed sessions found</strong><span>Change the filters or add attendance to completed programme events.</span></div>';
+    } else {
+        echo '<div class="attendance-matrix-wrap"><table class="attendance-matrix"><thead><tr><th class="attendance-sticky-member">Member</th><th class="attendance-sticky-total">Attended</th><th class="attendance-sticky-percent">%</th>';
+        foreach($events as $event) {
+            echo '<th class="attendance-session-heading"><strong>'.e(uk_date($event['start_at'])).'</strong><span>'.e($event['title']).'</span></th>';
+        }
+        echo '</tr></thead><tbody>';
+
+        foreach($members as $member) {
+            $memberId = (int)$member['id'];
+            $attendedTotal = 0;
+            $eligibleTotal = 0;
+            $cells = '';
+
+            foreach($events as $event) {
+                $eventId = (int)$event['id'];
+                $eligible = attendance_member_was_eligible($member, $event);
+                if (!$eligible) {
+                    $cells .= '<td class="attendance-cell not-eligible"><span>—</span><small>Not joined</small></td>';
+                    continue;
+                }
+
+                $eligibleTotal++;
+                $record = $attendanceRows[$memberId][$eventId] ?? null;
+                $attended = !empty($record['attended']);
+                if ($attended) $attendedTotal++;
+
+                $status = $attended ? 'Yes' : 'No';
+                $class = $attended ? 'yes' : 'no';
+                if (!$attended && (($record['status'] ?? '') === 'did_not_attend')) $status = 'Absent';
+
+                $cells .= '<td class="attendance-cell '.e($class).'"><strong>'.e($status).'</strong></td>';
+            }
+
+            $percentage = $eligibleTotal > 0 ? min(100, round(($attendedTotal/$eligibleTotal)*100, 1)) : null;
+            echo '<tr><td class="attendance-sticky-member"><strong>'.e(trim($member['first_name'].' '.$member['last_name'])).'</strong><small>'.e($member['callsign'] ?: ($member['membership_number'] ? 'Member '.$member['membership_number'] : '')).'</small></td><td class="attendance-sticky-total"><strong>'.e($attendedTotal).'</strong><small>of '.e($eligibleTotal).'</small></td><td class="attendance-sticky-percent"><strong>'.e($percentage===null?'N/A':$percentage.'%').'</strong></td>'.$cells.'</tr>';
+        }
+
+        echo '</tbody><tfoot><tr><th class="attendance-sticky-member">Session attendance</th><th class="attendance-sticky-total">—</th><th class="attendance-sticky-percent">—</th>';
+        foreach($events as $event) {
+            $stats = $eventStats[(int)$event['id']];
+            echo '<th class="attendance-session-total"><strong>'.e($stats['attended']).' / '.e($stats['eligible']).'</strong><span>'.e($stats['percentage']===null?'N/A':$stats['percentage'].'%').'</span></th>';
+        }
+        echo '</tr></tfoot></table></div>';
+    }
+
+    echo '</section>';
+
+    echo '<div class="grid attendance-summary-grid">';
+    $totalAttended = 0;
+    $totalPlaces = 0;
+    foreach($eventStats as $stats){ $totalAttended += $stats['attended']; $totalPlaces += $stats['eligible']; }
+    echo '<div class="card"><h2>Overall member attendance</h2><p><strong>'.e($totalAttended).' attendances</strong> from '.e($totalPlaces).' available member places.</p><p class="muted">'.e($totalPlaces>0?round(($totalAttended/$totalPlaces)*100,1).'%':'N/A').' overall attendance across the selected sessions.</p></div>';
+
+    $guestTotal = 0;
+    if ($events) {
+        $eventIds = array_map(fn($event)=>(int)$event['id'], $events);
+        $placeholders = implode(',', array_fill(0, count($eventIds), '?'));
+        $guestTotal = (int)(first('SELECT COUNT(*) c FROM event_guests WHERE attended=1 AND event_id IN ('.$placeholders.')', $eventIds)['c'] ?? 0);
+    }
+    echo '<div class="card"><h2>Guest attendance</h2><p><strong>'.e($guestTotal).'</strong> guest attendances across the selected sessions.</p><p class="muted">Guests are shown separately and are not included in member percentages.</p></div></div>';
+
     page_footer(); exit;
 }
 
@@ -4524,7 +4970,7 @@ if (route() === 'brickworks_manage') {
             echo '<td class="matrix-cell"><span class="status-pill status-'.e($cls).'">'.e($label).'</span>';
             if($memberComment) echo '<p class="small"><strong>Member note:</strong><br>'.nl2br(e($memberComment)).'</p>';
             if($reviewerComment) echo '<p class="small"><strong>Reviewer:</strong><br>'.nl2br(e($reviewerComment)).'</p>';
-            if($files){ echo '<details><summary>Evidence ('.e(count($files)).')</summary><ul>'; foreach($files as $file) echo '<li><a href="?route=brickworks_evidence&id='.e($file['id']).'">'.e($file['original_filename']).'</a><br><span class="muted small">'.e($file['created_at']).'</span></li>'; echo '</ul></details>'; }
+            if($files){ echo '<details><summary>Evidence ('.e(count($files)).')</summary><ul>'; foreach($files as $file) echo '<li><a href="?route=brickworks_evidence&id='.e($file['id']).'">'.e($file['original_filename']).'</a><br><span class="muted small">'.e(uk_datetime($file['created_at'])).'</span></li>'; echo '</ul></details>'; }
             echo '<form method="post" class="inline-form">'.csrf_field().'<input type="hidden" name="progress_id" value="'.e($pr['id']).'"><label>Status</label><select name="status"><option value="not_completed" '.($status==='not_completed'?'selected':'').'>Not completed</option><option value="pending_approval" '.($status==='pending_approval'?'selected':'').'>In progress / pending approval</option><option value="complete" '.($status==='complete'?'selected':'').'>Complete</option></select><label>Completed date</label><input type="date" name="completed_at" value="'.e($pr['completed_at'] ?: date('Y-m-d')).'"><label>Reviewer comment</label><textarea name="reviewer_comment">'.e($reviewerComment).'</textarea><button>Save</button></form></td>';
         }
         echo '</tr>';
@@ -4581,7 +5027,7 @@ if (route() === 'email_detail') {
     }
 
     page_header('Sent email detail');
-    echo '<section class="email-detail-hero"><div><span class="eyebrow">Sent email record</span><h1>'.e($email['subject']).'</h1><p>Created '.e($email['created_at']).' • Sent '.e($email['sent_at'] ?: 'Not sent').'</p></div><div class="email-detail-stats"><div><strong>'.e(count($recipients)).'</strong><span>Recipients</span></div><div><strong>'.e($sentCount).'</strong><span>Accepted</span></div><div><strong>'.e($openedCount).'</strong><span>Opened</span></div><div><strong>'.e($failedCount).'</strong><span>Issues</span></div></div></section>';
+    echo '<section class="email-detail-hero"><div><span class="eyebrow">Sent email record</span><h1>'.e($email['subject']).'</h1><p>Created '.e(uk_datetime(uk_datetime($email['created_at']))).' • Sent '.e(uk_datetime($email['sent_at'], 'Not sent')).'</p></div><div class="email-detail-stats"><div><strong>'.e(count($recipients)).'</strong><span>Recipients</span></div><div><strong>'.e($sentCount).'</strong><span>Accepted</span></div><div><strong>'.e($openedCount).'</strong><span>Opened</span></div><div><strong>'.e($failedCount).'</strong><span>Issues</span></div></div></section>';
 
     echo '<div class="card email-detail-summary"><div class="toolbar"><h2 style="margin-right:auto">Message details</h2><a class="btn secondary" href="?route=emails">Back to emails</a></div><div class="email-detail-meta"><span>From</span><strong>'.e(trim(($email['from_name'] ?: '').' <'.($email['from_address'] ?: '').'>')).'</strong><span>Reply-To</span><strong>'.e($email['reply_to'] ?: 'Not recorded').'</strong><span>Transport</span><strong>'.e(strtoupper($email['transport_method'] ?: 'Not recorded')).'</strong><span>Status</span><strong>'.e($email['status']).'</strong><span>Sent by user</span><strong>'.e($email['sender_email'] ?: ($email['created_by_user_id'] ? 'User #'.$email['created_by_user_id'] : 'System / unauthenticated process')).'</strong><span>Email type</span><strong>'.e(ucwords(str_replace('_',' ',$email['email_type'] ?: 'member_email'))).'</strong><span>System context</span><strong>'.e($email['system_context'] ?: 'Not applicable').'</strong></div></div>';
 
@@ -4601,7 +5047,7 @@ if (route() === 'email_detail') {
     echo '<div class="card email-recipient-report"><h2>Recipients, reads and delivery issues</h2><p class="muted">“Accepted” means the configured mail service accepted the message. Open/read data is based on the tracking image and can be blocked or preloaded by email apps.</p><div class="email-report-table-wrap"><table><tr><th>Recipient</th><th>Address</th><th>Status</th><th>Sent</th><th>First open</th><th>Open count</th><th>Delivery issue</th><th>Exact copy</th></tr>';
     foreach($recipients as $recipient){
         $copyId='email-copy-'.$recipient['id'];
-        echo '<tr><td>'.e($recipient['recipient_name'] ?: trim(($recipient['first_name'] ?? '').' '.($recipient['last_name'] ?? ''))).'</td><td>'.e($recipient['email_address']).'</td><td>'.e($recipient['status']).'</td><td>'.e($recipient['sent_at'] ?: '').'</td><td>'.e($recipient['opened_at'] ?: 'Not recorded').'</td><td>'.e($recipient['open_count'] ?: 0).'</td><td>'.e($recipient['failure_reason'] ?: '').'</td><td><button type="button" class="secondary email-copy-toggle" data-target="'.e($copyId).'">View exact copy</button></td></tr>';
+        echo '<tr><td>'.e($recipient['recipient_name'] ?: trim(($recipient['first_name'] ?? '').' '.($recipient['last_name'] ?? ''))).'</td><td>'.e($recipient['email_address']).'</td><td>'.e($recipient['status']).'</td><td>'.e(uk_datetime($recipient['sent_at'], '')).'</td><td>'.e(uk_datetime($recipient['opened_at'], 'Not recorded')).'</td><td>'.e($recipient['open_count'] ?: 0).'</td><td>'.e($recipient['failure_reason'] ?: '').'</td><td><button type="button" class="secondary email-copy-toggle" data-target="'.e($copyId).'">View exact copy</button></td></tr>';
         echo '<tr id="'.e($copyId).'" class="email-copy-row" hidden><td colspan="8"><div class="email-sent-preview">'.($recipient['sent_body_html'] ?: $email['body_html']).'</div>';
         if (!empty($recipient['transport_response'])) echo '<p class="muted"><strong>Transport response:</strong> '.e($recipient['transport_response']).'</p>';
         echo '</td></tr>';
@@ -4612,7 +5058,7 @@ if (route() === 'email_detail') {
     if (!$opens) echo '<p class="muted">No open events have been recorded.</p>';
     else {
         echo '<table><tr><th>Recipient</th><th>Opened</th><th>IP</th><th>User agent</th></tr>';
-        foreach($opens as $open) echo '<tr><td>'.e(($open['recipient_name'] ?: '').' <'.$open['email_address'].'>').'</td><td>'.e($open['opened_at']).'</td><td>'.e($open['ip_address'] ?: '').'</td><td>'.e($open['user_agent'] ?: '').'</td></tr>';
+        foreach($opens as $open) echo '<tr><td>'.e(($open['recipient_name'] ?: '').' <'.$open['email_address'].'>').'</td><td>'.e(uk_datetime(uk_datetime($open['opened_at']))).'</td><td>'.e($open['ip_address'] ?: '').'</td><td>'.e($open['user_agent'] ?: '').'</td></tr>';
         echo '</table>';
     }
     echo '</div>';
@@ -5010,7 +5456,7 @@ if (route() === 'email_config') {
 if (route() === 'audit') {
     require_permission('view_audit_logs'); audit('audit.view'); page_header('Audit Logs');
     $rows=all('SELECT a.*,u.email FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_user_id ORDER BY a.created_at DESC LIMIT 250');
-    echo '<div class="card"><h1>Audit logs</h1><p class="muted">Change logs show old and new values where the system captured them. Treat this page as sensitive member data.</p><table><tr><th>Time</th><th>User</th><th>Action</th><th>Entity</th><th>Result</th><th>Reason</th><th>IP</th><th>Details</th></tr>'; foreach($rows as $r) echo '<tr><td>'.e($r['created_at']).'</td><td>'.e($r['email']).'</td><td>'.e($r['action']).'</td><td>'.e($r['entity_type'].' #'.$r['entity_id']).'</td><td>'.e($r['result']).'</td><td>'.e($r['reason']).'</td><td>'.e($r['ip_address']).'</td><td>'.audit_metadata_html($r['metadata']).'</td></tr>'; echo '</table></div>'; page_footer(); exit;
+    echo '<div class="card"><h1>Audit logs</h1><p class="muted">Change logs show old and new values where the system captured them. Treat this page as sensitive member data.</p><table><tr><th>Time</th><th>User</th><th>Action</th><th>Entity</th><th>Result</th><th>Reason</th><th>IP</th><th>Details</th></tr>'; foreach($rows as $r) echo '<tr><td>'.e(uk_datetime($r['created_at'])).'</td><td>'.e($r['email']).'</td><td>'.e($r['action']).'</td><td>'.e($r['entity_type'].' #'.$r['entity_id']).'</td><td>'.e($r['result']).'</td><td>'.e($r['reason']).'</td><td>'.e($r['ip_address']).'</td><td>'.audit_metadata_html($r['metadata']).'</td></tr>'; echo '</table></div>'; page_footer(); exit;
 }
 
 
