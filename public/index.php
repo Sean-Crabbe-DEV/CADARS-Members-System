@@ -131,7 +131,7 @@ function render_physical_membership_card(array $member, bool $printLink=false): 
     $html .= '<div class="physical-card-field physical-card-name"><span>MEMBER NAME</span><strong>' . e($name ?: 'Unnamed member') . '</strong></div>';
     $html .= '<div class="physical-card-fields-row">';
     $html .= '<div class="physical-card-field"><span>MEMBERSHIP NUMBER</span><strong>' . e($number ?: 'Not set') . '</strong></div>';
-    $html .= '<div class="physical-card-field"><span>JOIN DATE</span><strong>' . e($joined) . '</strong></div>';
+    $html .= '<div class="physical-card-field physical-card-join-field"><span>JOIN DATE</span><strong class="membership-card-join-date">' . e($joined) . '</strong></div>';
     $html .= '</div>';
     $html .= '</div>';
 
@@ -2950,6 +2950,19 @@ if (route() === 'assets.css') {
         height:50.98mm!important;
         break-inside:avoid!important;
         page-break-inside:avoid!important;
+    }
+}/* Keep membership-card join date on one line */
+.physical-card-join-field{min-width:0}
+.membership-card-join-date{
+    display:block;
+    font-size:.78em!important;
+    white-space:nowrap!important;
+    letter-spacing:-.01em;
+}
+@media print{
+    .membership-card-join-date{
+        font-size:.70em!important;
+        white-space:nowrap!important;
     }
 }';
     exit;
