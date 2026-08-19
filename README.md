@@ -120,3 +120,7 @@ Brickworks criteria now display as compact clickable rows showing the theme, cri
 ## Physical membership-card export options
 
 Physical card print/PDF output is now 3 mm smaller in width and height than the on-screen card preview: 82.60 × 50.98 mm. The Membership cards page now has separate Print paid members and Print all members buttons. Paid-member export includes members whose latest subscription record has status Paid. The normal on-screen card remains at the original credit-card dimensions.
+
+## Maximum 8 membership cards per A4 sheet
+
+The physical membership-card print/export route now explicitly groups members into batches of 8. Each batch is rendered inside its own print sheet container with a forced page break after the sheet, guaranteeing that no more than 8 cards are exported on one A4 page.

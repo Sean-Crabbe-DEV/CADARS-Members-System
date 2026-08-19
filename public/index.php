@@ -2920,6 +2920,37 @@ if (route() === 'assets.css') {
 @media(max-width:760px){
     .membership-card-export-actions{display:grid;width:100%}
     .membership-card-export-actions .btn{width:100%;box-sizing:border-box}
+}/* Hard limit: maximum 8 physical membership cards per A4 sheet */
+.physical-card-sheet{width:100%}
+@media print{
+    .physical-card-sheet{
+        width:100%!important;
+        break-after:page!important;
+        page-break-after:always!important;
+        break-inside:avoid!important;
+        page-break-inside:avoid!important;
+    }
+    .physical-card-sheet:last-child{
+        break-after:auto!important;
+        page-break-after:auto!important;
+    }
+    .physical-card-sheet .physical-card-grid{
+        display:grid!important;
+        grid-template-columns:82.6mm 82.6mm!important;
+        grid-template-rows:repeat(4,50.98mm)!important;
+        grid-auto-rows:50.98mm!important;
+        gap:8mm 10mm!important;
+        align-content:start!important;
+        justify-content:center!important;
+        padding:0!important;
+        margin:0!important;
+    }
+    .physical-card-sheet .physical-card-item{
+        width:82.6mm!important;
+        height:50.98mm!important;
+        break-inside:avoid!important;
+        page-break-inside:avoid!important;
+    }
 }';
     exit;
 }
@@ -3888,16 +3919,20 @@ if (route() === 'membership_cards_print') {
     $modeLabel = $exportMode === 'paid' ? 'Paid members only' : 'All members';
 
     echo '<section class="card membership-cards-shell print-all-membership-cards">';
-    echo '<div class="membership-card-toolbar no-print"><div><h1>'.e($modeLabel).' - physical membership cards</h1><p class="muted">'.e(count($members)).' cards. Printed cards are 82.60 × 50.98 mm and remain limited to a maximum of 8 per A4 page.</p></div><div class="toolbar"><button type="button" onclick="window.print()">Print / save PDF</button><a class="btn secondary" href="?route=membership_cards">Back to card list</a></div></div>';
+    echo '<div class="membership-card-toolbar no-print"><div><h1>'.e($modeLabel).' - physical membership cards</h1><p class="muted">'.e(count($members)).' cards. Printed cards are 82.60 × 50.98 mm and are grouped into a maximum of 8 cards per A4 sheet.</p></div><div class="toolbar"><button type="button" onclick="window.print()">Print / save PDF</button><a class="btn secondary" href="?route=membership_cards">Back to card list</a></div></div>';
 
     if (!$members) {
         echo '<div class="empty-state no-print"><strong>No members found</strong><span>'.e($exportMode === 'paid' ? 'No members currently have a latest subscription status of Paid.' : 'No physical membership cards are available.').'</span></div>';
     } else {
-        echo '<div class="physical-card-grid">';
-        foreach($members as $member) {
-            echo '<div class="physical-card-item">'.render_physical_membership_card($member, false).'</div>';
+        $sheets = array_chunk($members, 8);
+        foreach($sheets as $sheetIndex=>$sheetMembers) {
+            echo '<div class="physical-card-sheet" data-sheet="'.e($sheetIndex + 1).'">';
+            echo '<div class="physical-card-grid">';
+            foreach($sheetMembers as $member) {
+                echo '<div class="physical-card-item">'.render_physical_membership_card($member, false).'</div>';
+            }
+            echo '</div></div>';
         }
-        echo '</div>';
     }
 
     echo '</section>';
