@@ -92,3 +92,31 @@ Reordered My Profile so subscription/payment history appears before Door tax, wi
 - Added a sent-email detail page showing the exact stored message, recipient-specific copies, attachments, sender/from/reply-to, delivery status, failures, read/open counts and individual open events.
 - Immediate transport failures trigger a delivery-issue notification to the sending user and contact@gw4lwz.co.uk.
 - Note: SMTP acceptance confirms the server accepted the message; later bounces require a provider webhook or mailbox processing integration.
+
+## Master email logs and sent timestamp fix
+
+- New sends now explicitly record sent_at for successful, partially failed and failed send attempts.
+- Legacy records with blank sent_at are backfilled from recipient sent timestamps or the record update timestamp.
+- Recent emails show the date/time sent and the user account that sent the email.
+- Added Admin > Master email logs showing member emails and system-generated emails, including password resets, invitations, configuration tests and delivery-issue notifications.
+- Added reusable send_and_log_system_email() support for future automated reminders and notification emails.
+
+## UK date and time formatting
+
+Added central display helpers: uk_date(), uk_datetime(), uk_time(), uk_month_year() and friendly_datetime(). User-facing dates now use DD-MM-YYYY, date/time values use DD-MM-YYYY HH:MM, and time-only values use 24-hour HH:MM. Database storage and HTML date inputs remain ISO YYYY-MM-DD so sorting and form controls continue to work correctly.
+
+## Attendance and door-tax integration
+
+Completed meeting registers now automatically reconcile door tax whenever attendance is saved. Attending members receive one meeting charge at the configured rate; removing an attendance mark reverses the automatic event charge. Future or in-progress meetings are not charged. Chair, Vice Chair, Secretary and Treasurer users can see balances and per-event charge status in the register and manually sync existing attendance records.
+
+## Attendance matrix and directory administration
+
+The Attendance overview now uses a horizontally scrollable member-by-session matrix. Each member row shows sessions attended and percentage, while every session column shows Yes/No/Absent. The bottom row shows attended members out of the snapshotted membership total at that meeting and the resulting percentage. Admin users can now change another member's directory listing and individual visible fields from the member record; the directory respects those field-level preferences.
+
+## Brickworks criteria accordion
+
+Brickworks criteria now display as compact clickable rows showing the theme, criterion title, description and status only. Evidence guidance, existing comments, reviewer feedback, file upload controls and submission buttons remain hidden until the user opens that criterion. Completed criteria show a compact approved message when expanded.
+
+## Physical membership-card export options
+
+Physical card print/PDF output is now 3 mm smaller in width and height than the on-screen card preview: 82.60 × 50.98 mm. The Membership cards page now has separate Print paid members and Print all members buttons. Paid-member export includes members whose latest subscription record has status Paid. The normal on-screen card remains at the original credit-card dimensions.

@@ -2887,6 +2887,39 @@ if (route() === 'assets.css') {
   .bw-summary-side{justify-items:start}
   .bw-card-summary:after{grid-column:1;justify-self:end;margin-top:-30px}
   .bw-card-details{padding:16px}
+}/* Physical card export sizing - 3mm smaller in width and height */
+.membership-card-export-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+@media print{
+    .physical-card-grid{
+        grid-template-columns:82.6mm 82.6mm!important;
+        grid-auto-rows:50.98mm!important;
+        column-gap:10mm!important;
+        row-gap:8mm!important;
+    }
+    .physical-card-item{
+        width:82.6mm!important;
+        height:50.98mm!important;
+        overflow:hidden!important;
+        break-inside:avoid!important;
+        page-break-inside:avoid!important;
+    }
+    .physical-membership-card{
+        width:82.6mm!important;
+        height:50.98mm!important;
+        transform:none!important;
+        padding:5mm 4.4mm 4.4mm!important;
+        border-radius:5mm!important;
+        break-inside:avoid!important;
+        page-break-inside:avoid!important;
+    }
+    .single-card-stage .physical-membership-card{
+        width:82.6mm!important;
+        height:50.98mm!important;
+    }
+}
+@media(max-width:760px){
+    .membership-card-export-actions{display:grid;width:100%}
+    .membership-card-export-actions .btn{width:100%;box-sizing:border-box}
 }';
     exit;
 }
@@ -3823,18 +3856,47 @@ if (route() === 'membership_card') {
 
 if (route() === 'membership_cards_print') {
     require_permission('view_membership_db');
-    page_header('Print all membership cards');
-    audit('membership_cards.print_all');
+    page_header('Print membership cards');
 
-    $members = all('SELECT * FROM members ORDER BY last_name,first_name');
+    $exportMode = strtolower(trim((string)($_GET['mode'] ?? 'all')));
+    if (!in_array($exportMode, ['all','paid'], true)) $exportMode = 'all';
 
-    echo '<section class="card membership-cards-shell print-all-membership-cards"><div class="membership-card-toolbar no-print"><div><h1>All physical membership cards</h1><p class="muted">'.e(count($members)).' member cards. Printing is limited to a maximum of 8 cards per A4 page.</p></div><div class="toolbar"><button type="button" onclick="window.print()">Print all cards</button><a class="btn secondary" href="?route=membership_cards">Back to card list</a></div></div>';
+    if ($exportMode === 'paid') {
+        $members = all('SELECT m.*
+            FROM members m
+            WHERE (
+                SELECT LOWER(COALESCE(sp.status,""))
+                FROM subscription_payments sp
+                WHERE sp.member_id=m.id
+                ORDER BY sp.subscription_year DESC,
+                         COALESCE(sp.payment_date,"") DESC,
+                         sp.id DESC
+                LIMIT 1
+            )="paid"
+            ORDER BY m.last_name,m.first_name');
+    } else {
+        $members = all('SELECT * FROM members ORDER BY last_name,first_name');
+    }
+
+    audit('membership_cards.print',null,null,'success',null,[
+        'mode'=>$exportMode,
+        'member_count'=>count($members),
+        'print_card_width_mm'=>82.6,
+        'print_card_height_mm'=>50.98
+    ]);
+
+    $modeLabel = $exportMode === 'paid' ? 'Paid members only' : 'All members';
+
+    echo '<section class="card membership-cards-shell print-all-membership-cards">';
+    echo '<div class="membership-card-toolbar no-print"><div><h1>'.e($modeLabel).' - physical membership cards</h1><p class="muted">'.e(count($members)).' cards. Printed cards are 82.60 × 50.98 mm and remain limited to a maximum of 8 per A4 page.</p></div><div class="toolbar"><button type="button" onclick="window.print()">Print / save PDF</button><a class="btn secondary" href="?route=membership_cards">Back to card list</a></div></div>';
 
     if (!$members) {
-        echo '<div class="empty-state no-print"><strong>No members found</strong><span>No physical membership cards are available.</span></div>';
+        echo '<div class="empty-state no-print"><strong>No members found</strong><span>'.e($exportMode === 'paid' ? 'No members currently have a latest subscription status of Paid.' : 'No physical membership cards are available.').'</span></div>';
     } else {
         echo '<div class="physical-card-grid">';
-        foreach($members as $member) echo '<div class="physical-card-item">'.render_physical_membership_card($member, false).'</div>';
+        foreach($members as $member) {
+            echo '<div class="physical-card-item">'.render_physical_membership_card($member, false).'</div>';
+        }
         echo '</div>';
     }
 
@@ -3872,7 +3934,7 @@ if (route() === 'membership_cards') {
     echo '<section class="wallet-hero no-print"><div><span class="eyebrow">Membership database</span><h1>Membership cards</h1><p>Open each member’s physical, Apple Wallet or Android/Google Wallet card.</p></div><div class="wallet-hero-icon">▣</div></section>';
 
     echo '<section class="card membership-card-list-shell">';
-    echo '<div class="membership-card-list-header"><div><h2>Member card links</h2><p class="muted">Choose the card format required for each member.</p></div><a class="btn" href="?route=membership_cards_print" target="_blank">View / print all physical cards</a></div>';
+    echo '<div class="membership-card-list-header"><div><h2>Member card links</h2><p class="muted">Choose the card format required for each member.</p></div><div class="membership-card-export-actions"><a class="btn" href="?route=membership_cards_print&mode=paid" target="_blank">Print paid members</a><a class="btn secondary" href="?route=membership_cards_print&mode=all" target="_blank">Print all members</a></div></div>';
 
     echo '<form method="get" class="membership-card-list-filter"><input type="hidden" name="route" value="membership_cards"><div><label>Search</label><input name="q" value="'.e($q).'" placeholder="Name, callsign or member number"></div><div><label>Status</label><select name="status"><option value="" '.($status===''?'selected':'').'>All statuses</option><option value="current" '.($status==='current'?'selected':'').'>Current members</option>';
     foreach(['active','honorary','life_member','pending','expired','former','suspended'] as $st) echo '<option value="'.e($st).'" '.($status===$st?'selected':'').'>'.e(ucwords(str_replace('_',' ',$st))).'</option>';
