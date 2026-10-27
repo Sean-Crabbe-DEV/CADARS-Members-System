@@ -1,126 +1,59 @@
-# CADARS Members System
+# Chepstow RAYNET iOS Companion — v0.6 (source)
 
-Self-hosted membership system for Chepstow & District Amateur Radio Society.
+A native SwiftUI iPhone/iPad client for **Chepstow RAYNET MIS portal v0.3.4.1** and its bearer-token Mobile API v1. Source is based on the provided **reconstructed** v0.3.4.1 portal archive; it is not verified to match the deployed server byte-for-byte.
 
-## Email sending
+## New in v0.6
 
-The Email system config page supports:
+- Member **My alerts** inbox via `GET /api/v1/my/activations`, with acknowledgements and availability responses (`POST .../respond`). Polls every 60 seconds **only while the view is active**. Includes dashboard unanswered count and an Alerts tab.
+- Controller/admin **Activation control**: issue to selected members or all active members, view response roster, close activations. All actions use the existing server-side role checks.
+- **Exercise** index/detail, published briefing, control updates, structured RAYNET message pads and authorised PDF download (online/in-memory only). Controllers can edit/publish briefs, post updates and add structured messages.
+- **Attendance**: a native controller screen with month/event/individual attendance recording. **IMPORTANT: native attendance requires an optional, separately deployed server add-on** included at `server/optional_mobile_attendance/`. The stock v0.3.4.1 attendance routes are browser-session forms and will NOT work using API bearer tokens.
+- Improved **EA/NRW flood warnings** screen showing per-provider feed state, count, text, official source link and unlocated warning totals where the API supplies them. Optional flood-warning map layers plot only official Point/Polygon/MultiPolygon geometries returned by those sources.
+- Existing operational map, provisional operational boundary, optional live zones, weather warning overlays, MIS pins and NGED power markers remain intact.
+- Fixed query-string URL construction in the client (required by native attendance), added snapshot invalidation for new operations, preserved encrypted-at-rest device-only credentials and offline cache design.
 
-- PHP mail()
-- Resend API
-- SMTP settings stored for future SMTP wiring
+## Existing features retained
 
-For Resend API:
+- Native portal username/password sign-in; bearer token stored in iOS Keychain and validated by `/api/v1/me` on startup, automatic sign-out on HTTP 401.
+- Dashboard with UTC clock, current GPS, approximate OS grid reference, easting/northing, GPS accuracy, optional postcode lookup, key-based what3words lookup and a no-key link to the official what3words app.
+- Event calendar/RSVPs, equipment and availability, profile edits, training/experience, group actions, manuals/PDFs, controller member directory and approvals.
+- Dark navy and teal portal colour palette, RAYNET logo app icon.
+- **Opt-in read-only offline cache, OFF by default**, and deletion on logout or when disabled. Cached feeds may be stale; no offline write queue or PDFs, and offline mode is not an alert-dispatch mechanism.
 
-1. Go to Committee > Emails.
-2. Click Email system config as an admin.
-3. Set Mail method to Resend API.
-4. Enter the Resend API key.
-5. Set the From email to an address/domain allowed in Resend.
-6. Save and send a test email.
+## Deployment: Windows + GitHub Actions + sideloading
 
-Bulk emails with more than one recipient are sent using BCC for member privacy.
+1. Download/extract `Chepstow_RAYNET_iOS_v0.6_GitHub_Update.zip`.
+2. Replace the complete `ChepstowRAYNET/` folder in your cloned `Sean-Crabbe-DEV/Chepstow-RAYNET-IOS` repository; copy `project.yml`, `.github/workflows/build-unsigned-ipa.yml` and `tests/` to the repo root. Don't merge old Swift files — earlier source contained duplicate types.
+3. Remove obsolete `.github/workflows/swift.yml` if it builds a Swift Package instead of the iOS app.
+4. Commit to `main`, run **Build unsigned iOS IPA** in GitHub Actions, then download `ChepstowRAYNET-unsigned-IPA` from a successful run.
+5. Use your existing Windows signer/sideloading method to sign/install the IPA. A normal Apple ID's free provisioning is temporary and may need refreshing.
+6. Test login, member inbox, exercise detail, controller functions (if authorised), alerts and offline-cache toggle on the iPhone.
 
-## Dashboard events update
+The existing server must have the v0.3.4 operations API actually **deployed**. Verify routes with a valid bearer token and use the production API specification: `/api/v1/operations/openapi.json` (the older `/api/v1/openapi.json` does not include the new extension).
 
-Dashboard now shows only the next three events within the next month. User roles and attendance summary have been removed from the dashboard to keep it cleaner.
+## Optional server changes — NOT installed by this ZIP
 
-## Dashboard layout
+**Attendance:** see `server/optional_mobile_attendance/INSTALL.txt` for a separate controller-only attendance API. This is a new add-on, not part of the attached portal. Back up PostgreSQL, check actual deployed source, test in staging, and only then deploy on the live server.
 
-Dashboard order adjusted so Notifications appear in the top dashboard grid and Next events appears below.
+**Operational zones:** `server/mobile-api-operational-zones.patch` is an optional extension to expose verified GeoJSON polygons to the iOS app. The bundled reference boundary is labelled provisional; zones do not exist unless defined and served by the backend. This patch applies cleanly to the supplied reconstructed v0.3.4.1 source with `patch -p0`, but live-source differences may prevent it from applying. Never overwrite the production portal with the reconstructed ZIP.
 
-## Login and password recovery
+## Limitations
 
-The login page has been restyled with a responsive centred sign-in card. Users can now use **Forgot password?** to request a self-service password reset link. Reset links use the existing secure token system and expire after 48 hours.
+- **No Apple APNs push**: background or closed-app mobilisation notifications are NOT implemented by the backend. Follow normal RAYNET radio and phone procedures for urgent alerts.
+- No new API support for PDF **uploads** (web page only), account administration, SMS/email notifications, or direct access to PostgreSQL. Do not put admin credentials or tokens in the repository.
+- what3words addresses cannot be computed locally from GPS using this project without a licensed SDK/service. Optional API key or external official app is still required.
+- The OS grid uses an approximate transformation; not OSTN15 surveying accuracy. External postcode/w3w lookups only occur when requested.
+- No macOS/Xcode SDK exists in this environment. Source syntax and API payload tests pass; **a complete Xcode/iPhone build and the live server API were not verified**.
 
-## User linked member update
+## Validation commands on Swift/Linux
 
-The Users admin page now allows admins to change which member record is linked to an existing user account, or unlink the user from a member record. Changes are audit logged with old and new linked member values.
+```bash
+swiftc -frontend -parse $(find ChepstowRAYNET -name '*.swift')
+swiftc ChepstowRAYNET/Core/MobileModels.swift ChepstowRAYNET/Core/OperationsModels.swift tests/operations-api-smoke.swift -o /tmp/ops  # top-level test source should be copied/renamed main.swift for Linux
+cp tests/operations-api-smoke.swift /tmp/main.swift
+swiftc ChepstowRAYNET/Core/MobileModels.swift ChepstowRAYNET/Core/OperationsModels.swift /tmp/main.swift -o /tmp/ops && /tmp/ops
+swiftc ChepstowRAYNET/Core/BritishNationalGrid.swift tests/main.swift -o /tmp/grid && /tmp/grid
+python -m py_compile server/optional_mobile_attendance/mobile_attendance_api.py
+```
 
-## Wallet settings page
-
-Added Admin > Wallet settings. Admins can upload Apple Wallet pass certificate files, private key, WWDR certificate, certificate password, and Google/Android Wallet issuer/API details including service account JSON. Uploaded credential files are stored under the private storage folder rather than the public web folder.
-
-## SMTP sending and test email
-
-- Implemented SMTP sending with STARTTLS/TLS, SSL/SMTPS, or trusted unencrypted SMTP.
-- Supports SMTP AUTH LOGIN with AUTH PLAIN fallback.
-- SMTP sends support HTML email, BCC envelope recipients, Reply-To, and attachments.
-- Email settings now have a Send test email button which saves the current configuration and sends a test using the selected transport.
-- SMTP/Resend secret fields no longer display saved secrets; leaving them blank retains the existing value.
-
-## Door tax module
-
-Added a Door tax module under the Committee menu. Access is restricted to Chair, Vice Chair, Secretary and Treasurer. The module tracks prepaid door tax balances, payments, manual charges/adjustments, and attendance-based deductions from past events. Members can see their door tax balance and number of meetings covered on their own profile. Member admin pages also show the door tax balance and link to management. Attendance pages link into Door tax so attended events can be charged.
-
-## Physical membership cards
-
-Added a Membership cards page linked from the Committee Members area, Admin menu, member list and Wallet cards page. Cards use the ISO/IEC 7810 ID-1 credit-card dimensions of 85.60 × 53.98 mm and show the club logo, member name, membership number, join date and the same QR verification link used by Wallet cards. Members can open their own card from My Profile. The Wallet settings page now includes a private club logo upload.
-
-## Membership card join date display
-
-Membership cards now leave the join date value blank when the member is marked as having joined before system records, or when no join date is recorded.
-
-## GW4LWZ membership-card branding
-
-- Join date is blank on cards for members marked as joined before system records.
-- Bundled the official GW4LWZ transparent logo as the default card logo.
-- Membership and wallet card headings use GW4LWZ instead of the full club name.
-- A custom logo uploaded through Wallet settings still overrides the bundled logo.
-
-## Membership card layout refinement
-
-Refined the physical membership-card layout to better match the visual design. The QR code now sits properly centred inside the white box, spacing is more balanced, the name and metadata layout is cleaner, and the print-preview/open-card presentation is tidier without changing the card size.
-
-## Membership card print pagination update
-
-Adjusted the physical membership-card print styles so cards are not split across pages and print in batches of up to 8 per A4 sheet. Also tightened the logo/heading spacing so the GW4LWZ title sits closer to the club logo.
-
-## Membership card links page
-
-Changed the Membership cards page to a member list with separate columns for Physical card, Apple Wallet and Android/Google Wallet. Added a top-level View / print all physical cards button, which opens a dedicated print view containing all member cards. Wallet links automatically load the selected member and relevant platform on the Wallet cards page.
-
-## My Profile section order and wallet links
-
-Reordered My Profile so subscription/payment history appears before Door tax, with Door tax immediately below subscriptions. Moved the Membership cards section to the bottom of the page and added personal Physical, Apple Wallet and Android/Google Wallet links. The wallet links use a self-service route that only loads the member linked to the logged-in user.
-
-## Email rendering and delivery report overhaul
-
-- Plain-text textarea line breaks are converted into email-safe HTML so paragraphs do not bunch together.
-- Outgoing messages use an inline-styled GW4LWZ email template and the exact sent HTML is stored.
-- Reply-To now uses only the address configured in Admin > Email settings.
-- Added a sent-email detail page showing the exact stored message, recipient-specific copies, attachments, sender/from/reply-to, delivery status, failures, read/open counts and individual open events.
-- Immediate transport failures trigger a delivery-issue notification to the sending user and contact@gw4lwz.co.uk.
-- Note: SMTP acceptance confirms the server accepted the message; later bounces require a provider webhook or mailbox processing integration.
-
-## Master email logs and sent timestamp fix
-
-- New sends now explicitly record sent_at for successful, partially failed and failed send attempts.
-- Legacy records with blank sent_at are backfilled from recipient sent timestamps or the record update timestamp.
-- Recent emails show the date/time sent and the user account that sent the email.
-- Added Admin > Master email logs showing member emails and system-generated emails, including password resets, invitations, configuration tests and delivery-issue notifications.
-- Added reusable send_and_log_system_email() support for future automated reminders and notification emails.
-
-## UK date and time formatting
-
-Added central display helpers: uk_date(), uk_datetime(), uk_time(), uk_month_year() and friendly_datetime(). User-facing dates now use DD-MM-YYYY, date/time values use DD-MM-YYYY HH:MM, and time-only values use 24-hour HH:MM. Database storage and HTML date inputs remain ISO YYYY-MM-DD so sorting and form controls continue to work correctly.
-
-## Attendance and door-tax integration
-
-Completed meeting registers now automatically reconcile door tax whenever attendance is saved. Attending members receive one meeting charge at the configured rate; removing an attendance mark reverses the automatic event charge. Future or in-progress meetings are not charged. Chair, Vice Chair, Secretary and Treasurer users can see balances and per-event charge status in the register and manually sync existing attendance records.
-
-## Attendance matrix and directory administration
-
-The Attendance overview now uses a horizontally scrollable member-by-session matrix. Each member row shows sessions attended and percentage, while every session column shows Yes/No/Absent. The bottom row shows attended members out of the snapshotted membership total at that meeting and the resulting percentage. Admin users can now change another member's directory listing and individual visible fields from the member record; the directory respects those field-level preferences.
-
-## Brickworks criteria accordion
-
-Brickworks criteria now display as compact clickable rows showing the theme, criterion title, description and status only. Evidence guidance, existing comments, reviewer feedback, file upload controls and submission buttons remain hidden until the user opens that criterion. Completed criteria show a compact approved message when expanded.
-
-## Physical membership-card export options
-
-Physical card print/PDF output is now 3 mm smaller in width and height than the on-screen card preview: 82.60 × 50.98 mm. The Membership cards page now has separate Print paid members and Print all members buttons. Paid-member export includes members whose latest subscription record has status Paid. The normal on-screen card remains at the original credit-card dimensions.
-
-## Maximum 8 membership cards per A4 sheet
-
-The physical membership-card print/export route now explicitly groups members into batches of 8. Each batch is rendered inside its own print sheet container with a forced page break after the sheet, guaranteeing that no more than 8 cards are exported on one A4 page.
+See `CHANGELOG_v0.6.md` for the source-derived endpoint comparison.

@@ -1,0 +1,47 @@
+name: ChepstowRAYNET
+options:
+  bundleIdPrefix: uk.org.chepstowraynet
+  deploymentTarget:
+    iOS: '17.0'
+settings:
+  base:
+    SWIFT_VERSION: '5.9'
+    TARGETED_DEVICE_FAMILY: '1,2'
+    GENERATE_INFOPLIST_FILE: YES
+    INFOPLIST_KEY_CFBundleDisplayName: Chepstow RAYNET
+    INFOPLIST_KEY_UILaunchScreen_Generation: YES
+    INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: Your position is used on-device to display GPS, British National Grid and the operational map. External postcode and what3words lookups are opt-in.
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    CODE_SIGN_STYLE: Automatic
+targets:
+  ChepstowRAYNET:
+    type: application
+    platform: iOS
+    sources:
+      - ChepstowRAYNET/App/ChepstowRAYNETApp.swift
+      - ChepstowRAYNET/Core/Brand.swift
+      - ChepstowRAYNET/Core/BritishNationalGrid.swift
+      - ChepstowRAYNET/Core/KeychainStore.swift
+      - ChepstowRAYNET/Core/LocationLookupService.swift
+      - ChepstowRAYNET/Core/LocationService.swift
+      - ChepstowRAYNET/Core/MobileModels.swift
+      - ChepstowRAYNET/Core/OfflineCache.swift
+      - ChepstowRAYNET/Core/OperationalGeoJSON.swift
+      - ChepstowRAYNET/Core/OperationsModels.swift
+      - ChepstowRAYNET/Core/RaynetAPI.swift
+      - ChepstowRAYNET/Features/DashboardView.swift
+      - ChepstowRAYNET/Features/EventsView.swift
+      - ChepstowRAYNET/Features/MapAndAlertsView.swift
+      - ChepstowRAYNET/Features/OperationsView.swift
+      - ChepstowRAYNET/Features/ActivationsView.swift
+      - ChepstowRAYNET/Features/ExercisesView.swift
+      - ChepstowRAYNET/Features/AttendanceView.swift
+      - ChepstowRAYNET/Features/RecordsView.swift
+      - ChepstowRAYNET/Features/RootView.swift
+      - ChepstowRAYNET/Features/SettingsView.swift
+      - ChepstowRAYNET/Features/TeamAndManualsView.swift
+      - ChepstowRAYNET/Assets.xcassets
+      - ChepstowRAYNET/Resources/operational_zones.default.json
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: uk.org.chepstowraynet.companion
